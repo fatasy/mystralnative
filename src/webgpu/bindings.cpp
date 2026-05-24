@@ -1279,6 +1279,20 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuDevice, void
                                 flipY = g_engine->toBoolean(flipYProp);
                             }
 
+                            // Parse destination.premultipliedAlpha (default false per WebGPU spec).
+                            // PixiJS sets this true so its NORMAL blend (ONE, ONE_MINUS_SRC_ALPHA)
+                            // produces correct results. Our PNG decoder returns straight alpha, so
+                            // when the destination requests premultiplied we must multiply RGB by
+                            // A/255 on the fly. Without this, pixels with 0<a<255 and color>0 render
+                            // too bright / with color halos.
+                            bool premultipliedAlpha = false;
+                            {
+                                auto premulProp = g_engine->getProperty(args[1], "premultipliedAlpha");
+                                if (!g_engine->isUndefined(premulProp)) {
+                                    premultipliedAlpha = g_engine->toBoolean(premulProp);
+                                }
+                            }
+
                             int imgWidth = 0;
                             int imgHeight = 0;
                             size_t dataSize = 0;
@@ -1398,21 +1412,37 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuDevice, void
                                 if (!g_engine->isUndefined(heightVal)) height = (uint32_t)g_engine->toNumber(heightVal);
                             }
 
-                            // Handle flipY by creating a flipped copy of the data
-                            std::vector<uint8_t> flippedData;
+                            // Handle flipY and/or premultipliedAlpha by writing into a staging copy.
+                            // RGBA8 only (matches the hardcoded bytesPerRow below).
+                            std::vector<uint8_t> stagingData;
                             void* uploadDataPtr = dataPtr;
-                            if (flipY && dataPtr && imgHeight > 0) {
-                                size_t bytesPerRow = imgWidth * 4;  // RGBA
-                                flippedData.resize(dataSize);
+                            if ((flipY || premultipliedAlpha) && dataPtr && imgHeight > 0 && imgWidth > 0) {
+                                size_t bytesPerRow = (size_t)imgWidth * 4;
+                                stagingData.resize(dataSize);
                                 const uint8_t* srcData = static_cast<const uint8_t*>(dataPtr);
                                 for (int y = 0; y < imgHeight; y++) {
-                                    // Copy row (imgHeight - 1 - y) to row y
-                                    const uint8_t* srcRow = srcData + (imgHeight - 1 - y) * bytesPerRow;
-                                    uint8_t* dstRow = flippedData.data() + y * bytesPerRow;
-                                    std::memcpy(dstRow, srcRow, bytesPerRow);
+                                    const uint8_t* srcRow = srcData + (flipY ? (imgHeight - 1 - y) : y) * bytesPerRow;
+                                    uint8_t* dstRow = stagingData.data() + (size_t)y * bytesPerRow;
+                                    if (premultipliedAlpha) {
+                                        for (int x = 0; x < imgWidth; x++) {
+                                            uint32_t a = srcRow[x * 4 + 3];
+                                            // (v * a + 127) / 255 rounds correctly without a divide instruction
+                                            dstRow[x * 4 + 0] = (uint8_t)((srcRow[x * 4 + 0] * a + 127) / 255);
+                                            dstRow[x * 4 + 1] = (uint8_t)((srcRow[x * 4 + 1] * a + 127) / 255);
+                                            dstRow[x * 4 + 2] = (uint8_t)((srcRow[x * 4 + 2] * a + 127) / 255);
+                                            dstRow[x * 4 + 3] = (uint8_t)a;
+                                        }
+                                    } else {
+                                        std::memcpy(dstRow, srcRow, bytesPerRow);
+                                    }
                                 }
-                                uploadDataPtr = flippedData.data();
-                                if (g_verboseLogging) std::cout << "[WebGPU] copyExternalImageToTexture: flipY applied" << std::endl;
+                                uploadDataPtr = stagingData.data();
+                                if (g_verboseLogging) {
+                                    std::cout << "[WebGPU] copyExternalImageToTexture: "
+                                              << (flipY ? "flipY " : "")
+                                              << (premultipliedAlpha ? "premultiplyAlpha" : "")
+                                              << std::endl;
+                                }
                             }
 
                             // Use writeTexture internally (same effect as copyExternalImageToTexture)

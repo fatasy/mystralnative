@@ -78,6 +78,7 @@ echo ""
 echo "--- PixiJS Tests ---"
 run_test "pixi-test" "examples/pixi-test.js" 60
 run_test "pixi-hello" "examples/pixi-hello.js" 60
+run_test "pixi-alpha-test" "examples/pixi-alpha-test.js" 60
 
 echo ""
 echo "--- Three.js Tests ---"

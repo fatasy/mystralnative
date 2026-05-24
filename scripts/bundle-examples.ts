@@ -19,6 +19,7 @@ const OUTPUT_DIR = join(import.meta.dir, "../examples");
 
 // Separate source directories for different example types
 const PIXI_TEST_DIR = join(import.meta.dir, "../examples/internal/pixi-test");
+const PIXI_ALPHA_TEST_DIR = join(import.meta.dir, "../examples/internal/pixi-alpha-test");
 const THREEJS_RT_DIR = join(import.meta.dir, "../examples/internal/threejs-rt");
 
 // List of example files to bundle (source -> output name)
@@ -27,6 +28,7 @@ const EXAMPLES: Array<{ source: string; output: string; dir?: string }> = [
   { source: "daynight-demo.ts", output: "daynight.js" },
   { source: "sponza-native.ts", output: "sponza.js" },
   { source: "main.ts", output: "pixi-test.js", dir: PIXI_TEST_DIR },
+  { source: "main.ts", output: "pixi-alpha-test.js", dir: PIXI_ALPHA_TEST_DIR },
   { source: "threejs-rt-shadows.ts", output: "threejs-rt-shadows.js", dir: THREEJS_RT_DIR },
   { source: "threejs-rt-hardware.ts", output: "threejs-rt-hardware.js", dir: THREEJS_RT_DIR },
 ];
