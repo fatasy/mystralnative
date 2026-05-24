@@ -1767,6 +1767,84 @@ if (typeof TextEncoder === 'undefined') {
     globalThis.TextEncoder = TextEncoder;
 }
 
+// AbortController / AbortSignal polyfill (Web API standard)
+// Three.js' FileLoader/GLTFLoader (r168+) construct an AbortController to
+// manage fetch cancellation, so these globals must exist or loading throws
+// "ReferenceError: AbortController is not defined". MystralNative's native
+// fetch cannot cancel an in-flight request, but it honors an aborted signal
+// by rejecting the fetch promise (see fetch() below).
+if (typeof AbortSignal === 'undefined') {
+    class AbortSignal {
+        constructor() {
+            this.aborted = false;
+            this.reason = undefined;
+            this.onabort = null;
+            this._listeners = [];
+        }
+        addEventListener(type, listener) {
+            if (type === 'abort' && typeof listener === 'function') {
+                this._listeners.push(listener);
+            }
+        }
+        removeEventListener(type, listener) {
+            if (type === 'abort') {
+                this._listeners = this._listeners.filter(function (l) { return l !== listener; });
+            }
+        }
+        dispatchEvent(event) {
+            if (event && event.type === 'abort') {
+                if (typeof this.onabort === 'function') this.onabort(event);
+                const listeners = this._listeners.slice();
+                for (let i = 0; i < listeners.length; i++) listeners[i](event);
+            }
+            return true;
+        }
+        throwIfAborted() {
+            if (this.aborted) throw (this.reason !== undefined ? this.reason : new Error('AbortError'));
+        }
+        _fireAbort(reason) {
+            if (this.aborted) return;
+            this.aborted = true;
+            this.reason = (reason !== undefined ? reason : new Error('AbortError'));
+            this.dispatchEvent({ type: 'abort', target: this });
+        }
+        static abort(reason) {
+            const signal = new AbortSignal();
+            signal._fireAbort(reason);
+            return signal;
+        }
+        static timeout(ms) {
+            const signal = new AbortSignal();
+            setTimeout(function () { signal._fireAbort(new Error('TimeoutError')); }, ms);
+            return signal;
+        }
+        static any(signals) {
+            const result = new AbortSignal();
+            const list = Array.from(signals || []);
+            for (let i = 0; i < list.length; i++) {
+                const s = list[i];
+                if (!s) continue;
+                if (s.aborted) { result._fireAbort(s.reason); return result; }
+                s.addEventListener('abort', function () { result._fireAbort(s.reason); });
+            }
+            return result;
+        }
+    }
+    globalThis.AbortSignal = AbortSignal;
+}
+
+if (typeof AbortController === 'undefined') {
+    class AbortController {
+        constructor() {
+            this.signal = new AbortSignal();
+        }
+        abort(reason) {
+            this.signal._fireAbort(reason);
+        }
+    }
+    globalThis.AbortController = AbortController;
+}
+
 // Blob class (Web API standard)
 if (typeof Blob === 'undefined') {
     class Blob {
@@ -1914,13 +1992,76 @@ class Response {
     }
 }
 
+// Request class (Web API standard) - Three.js' FileLoader (r168+) wraps the
+// URL in a Request (with headers/credentials/signal) before calling fetch().
+class Request {
+    constructor(input, init = {}) {
+        if (input && typeof input === 'object' && typeof input.url === 'string') {
+            this.url = input.url;
+            this.method = init.method || input.method || 'GET';
+            this.headers = new Headers(init.headers || input.headers || {});
+            this.credentials = init.credentials || input.credentials || 'same-origin';
+            this.signal = init.signal || input.signal || null;
+            this.body = init.body !== undefined ? init.body : (input.body != null ? input.body : null);
+        } else {
+            this.url = String(input);
+            this.method = (init.method || 'GET');
+            this.headers = new Headers(init.headers || {});
+            this.credentials = init.credentials || 'same-origin';
+            this.signal = init.signal || null;
+            this.body = init.body !== undefined ? init.body : null;
+        }
+        this.mode = init.mode || 'cors';
+    }
+}
+globalThis.Request = Request;
+
 // Fetch function - supports file://, http://, and https://
 // HTTP requests are now async via libuv (non-blocking)
-async function fetch(url, options = {}) {
+// Accepts either a URL string or a Request object (Three.js passes a Request).
+async function fetch(input, options = {}) {
+    let url;
+    if (input && typeof input === 'object' && typeof input.url === 'string') {
+        // Unwrap a Request object: pull url + per-request fields unless overridden.
+        url = input.url;
+        if (options.signal === undefined && input.signal) options.signal = input.signal;
+        if (options.method === undefined && input.method) options.method = input.method;
+        if (options.headers === undefined && input.headers) options.headers = input.headers;
+        if (options.body === undefined && input.body != null) options.body = input.body;
+    } else {
+        url = String(input);
+    }
+
+    // AbortController support: reject up-front if the signal is already aborted.
+    // The native request itself cannot be cancelled mid-flight, but a late abort
+    // rejects the promise (the in-flight native op simply completes and is ignored).
+    const signal = options && options.signal;
+    const abortError = () => (signal && signal.reason !== undefined ? signal.reason : new Error('AbortError'));
+    if (signal && signal.aborted) {
+        return Promise.reject(abortError());
+    }
+
+    // blob: URLs - created via URL.createObjectURL(). Three.js GLTFLoader uses
+    // these for embedded (GLB) and external textures, fetched by ImageBitmapLoader.
+    if (url.startsWith('blob:')) {
+        const blob = (typeof URL !== 'undefined' && URL._getBlobData) ? URL._getBlobData(url) : null;
+        if (!blob) {
+            return new Response(new ArrayBuffer(0), { ok: false, status: 404, statusText: 'Not Found', url });
+        }
+        let data = blob._data;
+        if (data instanceof Uint8Array) data = data.buffer;
+        if (!(data instanceof ArrayBuffer)) data = new ArrayBuffer(0);
+        return new Response(data, {
+            ok: true, status: 200, statusText: 'OK', url,
+            headers: { 'content-type': blob.type || '' }
+        });
+    }
+
     // Check URL type
     if (url.startsWith('http://') || url.startsWith('https://')) {
         // HTTP/HTTPS request via async libcurl + libuv (non-blocking)
         return new Promise((resolve, reject) => {
+            if (signal) signal.addEventListener('abort', () => reject(abortError()));
             __httpRequestAsync(url, options, (result) => {
                 if (result.error) {
                     reject(new Error('Fetch error: ' + result.error));
@@ -1949,6 +2090,7 @@ async function fetch(url, options = {}) {
 
     // Use async file reading to avoid blocking the render loop
     return new Promise((resolve, reject) => {
+        if (signal) signal.addEventListener('abort', () => reject(abortError()));
         __readFileAsync(path, (data, error) => {
             if (error) {
                 reject(new Error('File read error: ' + error));

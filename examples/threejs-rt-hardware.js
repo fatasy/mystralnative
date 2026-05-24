@@ -32663,6 +32663,14 @@ function buildBVH(vertices, indices, options) {
   const maxLeafSize = options?.maxLeafSize ?? 4;
   const triangles = [];
   const triangleCount = Math.floor(indices.length / 3);
+  if (triangleCount === 0) {
+    return {
+      nodes: new Float32Array(0),
+      triangles: new Float32Array(0),
+      nodeCount: 0,
+      triangleCount: 0
+    };
+  }
   for (let i = 0;i < triangleCount; i++) {
     const i0 = indices[i * 3 + 0];
     const i1 = indices[i * 3 + 1];
@@ -32725,8 +32733,9 @@ function buildNode(triangles, nodes, orderedTriangles, maxLeafSize) {
     const { left, right } = splitTriangles(triangles);
     const leftChild = buildNode(left, nodes, orderedTriangles, maxLeafSize);
     node.leftOrFirst = leftChild;
+    const rightChild = nodes.length;
     buildNode(right, nodes, orderedTriangles, maxLeafSize);
-    node.rightOrCount = 0;
+    node.rightOrCount = rightChild | 2147483648;
   }
   return nodeIndex;
 }
@@ -32807,6 +32816,1665 @@ function packTrianglesFromList(triangles) {
   return packed;
 }
 
+// ../../src/raytracing/GPURadixSort.ts
+var WORKGROUP_SIZE = 256;
+var RADIX_BITS = 8;
+var RADIX_SIZE = 1 << RADIX_BITS;
+var NUM_PASSES = 32 / RADIX_BITS;
+
+class GPURadixSort {
+  device;
+  initialized = false;
+  histogramPipeline = null;
+  prefixSumPipeline = null;
+  scatterPipeline = null;
+  histogramLayout = null;
+  prefixSumLayout = null;
+  scatterLayout = null;
+  constructor(device) {
+    this.device = device;
+  }
+  async init() {
+    if (this.initialized)
+      return;
+    await Promise.all([
+      this.createHistogramPipeline(),
+      this.createPrefixSumPipeline(),
+      this.createScatterPipeline()
+    ]);
+    this.initialized = true;
+  }
+  async createHistogramPipeline() {
+    const shaderCode = `
+      @group(0) @binding(0) var<storage, read> keys: array<u32>;
+      @group(0) @binding(1) var<storage, read_write> histogram: array<atomic<u32>>;
+      @group(0) @binding(2) var<uniform> params: vec4u; // x = count, y = bit_offset
+
+      @compute @workgroup_size(${WORKGROUP_SIZE})
+      fn main(@builtin(global_invocation_id) gid: vec3u) {
+        let count = params.x;
+        let bit_offset = params.y;
+        let idx = gid.x;
+
+        if (idx >= count) {
+          return;
+        }
+
+        let key = keys[idx];
+        let digit = (key >> bit_offset) & ${RADIX_SIZE - 1}u;
+        atomicAdd(&histogram[digit], 1u);
+      }
+    `;
+    this.histogramLayout = this.device.createBindGroupLayout({
+      label: "Radix Histogram Layout",
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+        { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
+        { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: "uniform" } }
+      ]
+    });
+    const shaderModule = this.device.createShaderModule({
+      label: "Radix Histogram Shader",
+      code: shaderCode
+    });
+    this.histogramPipeline = this.device.createComputePipeline({
+      label: "Radix Histogram Pipeline",
+      layout: this.device.createPipelineLayout({ bindGroupLayouts: [this.histogramLayout] }),
+      compute: { module: shaderModule, entryPoint: "main" }
+    });
+  }
+  async createPrefixSumPipeline() {
+    const shaderCode = `
+      @group(0) @binding(0) var<storage, read> histogram: array<u32>;
+      @group(0) @binding(1) var<storage, read_write> prefix_sum: array<u32>;
+
+      var<workgroup> temp: array<u32, ${RADIX_SIZE}>;
+
+      @compute @workgroup_size(${RADIX_SIZE / 2})
+      fn main(@builtin(local_invocation_id) lid: vec3u) {
+        let n = ${RADIX_SIZE}u;
+        let tid = lid.x;
+
+        // Load histogram into shared memory
+        temp[tid * 2u] = histogram[tid * 2u];
+        temp[tid * 2u + 1u] = histogram[tid * 2u + 1u];
+
+        // Up-sweep (reduce) phase
+        var offset = 1u;
+        for (var d = n >> 1u; d > 0u; d >>= 1u) {
+          workgroupBarrier();
+          if (tid < d) {
+            let ai = offset * (2u * tid + 1u) - 1u;
+            let bi = offset * (2u * tid + 2u) - 1u;
+            temp[bi] += temp[ai];
+          }
+          offset *= 2u;
+        }
+
+        // Clear last element for exclusive scan
+        if (tid == 0u) {
+          temp[n - 1u] = 0u;
+        }
+
+        // Down-sweep phase
+        for (var d = 1u; d < n; d *= 2u) {
+          offset >>= 1u;
+          workgroupBarrier();
+          if (tid < d) {
+            let ai = offset * (2u * tid + 1u) - 1u;
+            let bi = offset * (2u * tid + 2u) - 1u;
+            let t = temp[ai];
+            temp[ai] = temp[bi];
+            temp[bi] += t;
+          }
+        }
+
+        workgroupBarrier();
+
+        // Write results
+        prefix_sum[tid * 2u] = temp[tid * 2u];
+        prefix_sum[tid * 2u + 1u] = temp[tid * 2u + 1u];
+      }
+    `;
+    this.prefixSumLayout = this.device.createBindGroupLayout({
+      label: "Radix Prefix Sum Layout",
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+        { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } }
+      ]
+    });
+    const shaderModule = this.device.createShaderModule({
+      label: "Radix Prefix Sum Shader",
+      code: shaderCode
+    });
+    this.prefixSumPipeline = this.device.createComputePipeline({
+      label: "Radix Prefix Sum Pipeline",
+      layout: this.device.createPipelineLayout({ bindGroupLayouts: [this.prefixSumLayout] }),
+      compute: { module: shaderModule, entryPoint: "main" }
+    });
+  }
+  async createScatterPipeline() {
+    const shaderCode = `
+      @group(0) @binding(0) var<storage, read> keys_in: array<u32>;
+      @group(0) @binding(1) var<storage, read> values_in: array<u32>;
+      @group(0) @binding(2) var<storage, read_write> keys_out: array<u32>;
+      @group(0) @binding(3) var<storage, read_write> values_out: array<u32>;
+      @group(0) @binding(4) var<storage, read> global_offsets: array<u32>;
+      @group(0) @binding(5) var<uniform> params: vec4u; // x = count, y = bit_offset
+
+      @compute @workgroup_size(${WORKGROUP_SIZE})
+      fn main(@builtin(global_invocation_id) gid: vec3u) {
+        let count = params.x;
+        let bit_offset = params.y;
+        let idx = gid.x;
+
+        if (idx >= count) {
+          return;
+        }
+
+        let key = keys_in[idx];
+        let value = values_in[idx];
+        let digit = (key >> bit_offset) & ${RADIX_SIZE - 1}u;
+
+        // Get global offset for this digit (from prefix sum)
+        let global_offset = global_offsets[digit];
+
+        // STABLE: Count how many elements BEFORE this one have the same digit
+        // This preserves input order for elements with the same digit
+        var local_rank = 0u;
+        for (var i = 0u; i < idx; i++) {
+          let other_key = keys_in[i];
+          let other_digit = (other_key >> bit_offset) & ${RADIX_SIZE - 1}u;
+          if (other_digit == digit) {
+            local_rank++;
+          }
+        }
+
+        // Write to output at the stable position
+        let out_idx = global_offset + local_rank;
+        keys_out[out_idx] = key;
+        values_out[out_idx] = value;
+      }
+    `;
+    this.scatterLayout = this.device.createBindGroupLayout({
+      label: "Radix Scatter Layout",
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+        { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+        { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
+        { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
+        { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+        { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: "uniform" } }
+      ]
+    });
+    const shaderModule = this.device.createShaderModule({
+      label: "Radix Scatter Shader",
+      code: shaderCode
+    });
+    this.scatterPipeline = this.device.createComputePipeline({
+      label: "Radix Scatter Pipeline",
+      layout: this.device.createPipelineLayout({ bindGroupLayouts: [this.scatterLayout] }),
+      compute: { module: shaderModule, entryPoint: "main" }
+    });
+  }
+  async sort(keysBuffer, valuesBuffer, count) {
+    if (!this.initialized) {
+      await this.init();
+    }
+    const numWorkgroups = Math.ceil(count / WORKGROUP_SIZE);
+    const keysBuffer2 = this.device.createBuffer({
+      label: "Radix Keys 2",
+      size: count * 4,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC
+    });
+    const valuesBuffer2 = this.device.createBuffer({
+      label: "Radix Values 2",
+      size: count * 4,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC
+    });
+    const histogramBuffer = this.device.createBuffer({
+      label: "Radix Histogram",
+      size: RADIX_SIZE * 4,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC
+    });
+    const prefixSumBuffer = this.device.createBuffer({
+      label: "Radix Prefix Sum",
+      size: RADIX_SIZE * 4,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC
+    });
+    const paramsBuffer = this.device.createBuffer({
+      label: "Radix Params",
+      size: 16,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+    });
+    let currentKeys = keysBuffer;
+    let currentValues = valuesBuffer;
+    let nextKeys = keysBuffer2;
+    let nextValues = valuesBuffer2;
+    for (let pass = 0;pass < NUM_PASSES; pass++) {
+      const bitOffset = pass * RADIX_BITS;
+      const encoder = this.device.createCommandEncoder({ label: `Radix Sort Pass ${pass}` });
+      encoder.clearBuffer(histogramBuffer);
+      this.device.queue.writeBuffer(paramsBuffer, 0, new Uint32Array([count, bitOffset, 0, 0]));
+      const histogramBindGroup = this.device.createBindGroup({
+        layout: this.histogramLayout,
+        entries: [
+          { binding: 0, resource: { buffer: currentKeys } },
+          { binding: 1, resource: { buffer: histogramBuffer } },
+          { binding: 2, resource: { buffer: paramsBuffer } }
+        ]
+      });
+      const histPass = encoder.beginComputePass({ label: "Histogram" });
+      histPass.setPipeline(this.histogramPipeline);
+      histPass.setBindGroup(0, histogramBindGroup);
+      histPass.dispatchWorkgroups(numWorkgroups);
+      histPass.end();
+      const prefixSumBindGroup = this.device.createBindGroup({
+        layout: this.prefixSumLayout,
+        entries: [
+          { binding: 0, resource: { buffer: histogramBuffer } },
+          { binding: 1, resource: { buffer: prefixSumBuffer } }
+        ]
+      });
+      const prefixPass = encoder.beginComputePass({ label: "Prefix Sum" });
+      prefixPass.setPipeline(this.prefixSumPipeline);
+      prefixPass.setBindGroup(0, prefixSumBindGroup);
+      prefixPass.dispatchWorkgroups(1);
+      prefixPass.end();
+      const scatterBindGroup = this.device.createBindGroup({
+        layout: this.scatterLayout,
+        entries: [
+          { binding: 0, resource: { buffer: currentKeys } },
+          { binding: 1, resource: { buffer: currentValues } },
+          { binding: 2, resource: { buffer: nextKeys } },
+          { binding: 3, resource: { buffer: nextValues } },
+          { binding: 4, resource: { buffer: prefixSumBuffer } },
+          { binding: 5, resource: { buffer: paramsBuffer } }
+        ]
+      });
+      const scatterPass = encoder.beginComputePass({ label: "Scatter" });
+      scatterPass.setPipeline(this.scatterPipeline);
+      scatterPass.setBindGroup(0, scatterBindGroup);
+      scatterPass.dispatchWorkgroups(numWorkgroups);
+      scatterPass.end();
+      this.device.queue.submit([encoder.finish()]);
+      await this.device.queue.onSubmittedWorkDone();
+      const debugReadback = this.device.createBuffer({
+        size: count * 4,
+        usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST
+      });
+      const debugEncoder = this.device.createCommandEncoder();
+      debugEncoder.copyBufferToBuffer(nextKeys, 0, debugReadback, 0, count * 4);
+      this.device.queue.submit([debugEncoder.finish()]);
+      await debugReadback.mapAsync(GPUMapMode.READ);
+      const passKeys = new Uint32Array(debugReadback.getMappedRange());
+      const bitMask = (1 << (pass + 1) * RADIX_BITS) - 1;
+      let sortErrors = 0;
+      for (let i = 1;i < count; i++) {
+        const prev = passKeys[i - 1] & bitMask;
+        const curr = passKeys[i] & bitMask;
+        if (curr < prev)
+          sortErrors++;
+      }
+      if (sortErrors > 0) {
+        console.error(`[RadixSort] Pass ${pass} (bits ${bitOffset}-${bitOffset + 7}): ${sortErrors} sort errors!`);
+        console.error(`[RadixSort] First 10 keys after pass ${pass}: ${Array.from(passKeys.slice(0, 10)).map((x) => x.toString(16)).join(", ")}`);
+      }
+      debugReadback.unmap();
+      debugReadback.destroy();
+      [currentKeys, nextKeys] = [nextKeys, currentKeys];
+      [currentValues, nextValues] = [nextValues, currentValues];
+    }
+    paramsBuffer.destroy();
+    histogramBuffer.destroy();
+    prefixSumBuffer.destroy();
+    if (NUM_PASSES % 2 === 0) {
+      keysBuffer2.destroy();
+      valuesBuffer2.destroy();
+      return { sortedKeys: keysBuffer, sortedValues: valuesBuffer };
+    } else {
+      return { sortedKeys: keysBuffer2, sortedValues: valuesBuffer2 };
+    }
+  }
+  destroy() {
+    this.initialized = false;
+  }
+}
+
+// ../../src/raytracing/GPUBVHBuilder.ts
+var WORKGROUP_SIZE2 = 256;
+
+class GPUBVHBuilder {
+  device;
+  boundsReducePipeline = null;
+  boundsFinalizePipeline = null;
+  mortonCodesPipeline = null;
+  hierarchyPipeline = null;
+  aabbLeafPipeline = null;
+  aabbPipeline = null;
+  boundsReduceLayout = null;
+  boundsFinalizeLayout = null;
+  mortonCodesLayout = null;
+  hierarchyLayout = null;
+  aabbLeafLayout = null;
+  aabbLayout = null;
+  radixSort;
+  initialized = false;
+  constructor(device) {
+    this.device = device;
+    this.radixSort = new GPURadixSort(device);
+  }
+  async init() {
+    if (this.initialized)
+      return;
+    console.log("[GPUBVHBuilder] Initializing compute pipelines...");
+    await Promise.all([
+      this.createBoundsReducePipeline(),
+      this.createMortonCodesPipeline(),
+      this.radixSort.init(),
+      this.createHierarchyPipeline(),
+      this.createAABBPipeline()
+    ]);
+    this.initialized = true;
+    console.log("[GPUBVHBuilder] Initialization complete");
+  }
+  async build(input) {
+    if (!this.initialized) {
+      await this.init();
+    }
+    const startTime = performance.now();
+    const triangleCount = Math.floor(input.indices.length / 3);
+    if (triangleCount === 0) {
+      throw new Error("No triangles to build BVH from");
+    }
+    console.log(`[GPUBVHBuilder] Building BVH for ${triangleCount} triangles`);
+    const leafCount = triangleCount;
+    const internalNodeCount = Math.max(1, leafCount - 1);
+    const totalNodeCount = leafCount + internalNodeCount;
+    const { centroidsBuffer, triangleDataBuffer } = this.uploadTriangleData(input);
+    const { boundsBuffer, atomicBoundsBuffer, paramsBuffer: boundsParamsBuffer, encoder: boundsEncoder } = this.computeSceneBounds(centroidsBuffer, triangleCount);
+    this.device.queue.submit([boundsEncoder.finish()]);
+    boundsParamsBuffer.destroy();
+    const { mortonCodesBuffer, indicesBuffer } = await this.generateMortonCodes(centroidsBuffer, boundsBuffer, triangleCount);
+    const { sortedIndicesBuffer, indicesBufferReused } = await this.radixSortGPU(mortonCodesBuffer, indicesBuffer, triangleCount);
+    await this.device.queue.onSubmittedWorkDone();
+    console.log("[GPUBVHBuilder] Radix sort complete");
+    const mortonReadback = this.device.createBuffer({
+      size: triangleCount * 4,
+      usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST
+    });
+    const mortonEncoder = this.device.createCommandEncoder();
+    mortonEncoder.copyBufferToBuffer(mortonCodesBuffer, 0, mortonReadback, 0, triangleCount * 4);
+    this.device.queue.submit([mortonEncoder.finish()]);
+    await mortonReadback.mapAsync(GPUMapMode.READ);
+    const mortonData = new Uint32Array(mortonReadback.getMappedRange());
+    let sortErrors = 0;
+    let duplicateCount = 0;
+    for (let i = 1;i < triangleCount; i++) {
+      if (mortonData[i] < mortonData[i - 1])
+        sortErrors++;
+      if (mortonData[i] === mortonData[i - 1])
+        duplicateCount++;
+    }
+    const uniqueCount = triangleCount - duplicateCount;
+    console.log(`[GPUBVHBuilder] Morton codes: ${sortErrors} sort errors, ${duplicateCount} duplicates, ${uniqueCount} unique values`);
+    if (sortErrors > 0) {
+      console.error(`[GPUBVHBuilder] RADIX SORT BUG: Morton codes not sorted! First 10: ${Array.from(mortonData.slice(0, 10)).map((x) => x.toString(16)).join(", ")}`);
+    }
+    if (duplicateCount > 5) {
+      let runLengths = [];
+      let currentRun = 1;
+      for (let i = 1;i < triangleCount; i++) {
+        if (mortonData[i] === mortonData[i - 1]) {
+          currentRun++;
+        } else {
+          if (currentRun > 1)
+            runLengths.push(currentRun);
+          currentRun = 1;
+        }
+      }
+      if (currentRun > 1)
+        runLengths.push(currentRun);
+      console.log(`[GPUBVHBuilder] Duplicate run lengths: ${runLengths.slice(0, 10).join(", ")}${runLengths.length > 10 ? "..." : ""}`);
+    }
+    mortonReadback.unmap();
+    mortonReadback.destroy();
+    const { nodesBuffer, parentBuffer } = await this.buildHierarchy(mortonCodesBuffer, sortedIndicesBuffer, triangleCount, internalNodeCount);
+    await this.device.queue.onSubmittedWorkDone();
+    console.log("[GPUBVHBuilder] Hierarchy complete");
+    const hierDebugSize = (internalNodeCount + 5) * 32;
+    const hierDebugReadback = this.device.createBuffer({
+      size: hierDebugSize,
+      usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST
+    });
+    const hierDebugEncoder = this.device.createCommandEncoder();
+    hierDebugEncoder.copyBufferToBuffer(nodesBuffer, 0, hierDebugReadback, 0, hierDebugSize);
+    this.device.queue.submit([hierDebugEncoder.finish()]);
+    await hierDebugReadback.mapAsync(GPUMapMode.READ);
+    const hierDebugData = new Float32Array(hierDebugReadback.getMappedRange());
+    const hierDebugView = new DataView(hierDebugData.buffer);
+    const rootLeft = hierDebugView.getUint32(12, true);
+    const rootRightRaw = hierDebugView.getUint32(28, true);
+    const rootRight = rootRightRaw & 2147483647;
+    const rootIsInternal = (rootRightRaw & 2147483648) !== 0;
+    console.log(`[GPUBVHBuilder] After hierarchy - Root node: left=${rootLeft}, right=${rootRight}, internal=${rootIsInternal}`);
+    console.log(`[GPUBVHBuilder] After hierarchy - Root AABB (should be zeros): [(${hierDebugData[0]}, ${hierDebugData[1]}, ${hierDebugData[2]}) - (${hierDebugData[4]}, ${hierDebugData[5]}, ${hierDebugData[6]})]`);
+    let bottomLevelNodes = [];
+    const hierChildParentMap = new Map;
+    for (let i = 0;i < internalNodeCount; i++) {
+      const offset = i * 8;
+      const leftChild = hierDebugView.getUint32((offset + 3) * 4, true);
+      const rightRaw = hierDebugView.getUint32((offset + 7) * 4, true);
+      const rightChild = rightRaw & 2147483647;
+      if (!hierChildParentMap.has(leftChild))
+        hierChildParentMap.set(leftChild, []);
+      hierChildParentMap.get(leftChild).push(i);
+      if (!hierChildParentMap.has(rightChild))
+        hierChildParentMap.set(rightChild, []);
+      hierChildParentMap.get(rightChild).push(i);
+      if (leftChild >= internalNodeCount || rightChild >= internalNodeCount) {
+        bottomLevelNodes.push(i);
+      }
+    }
+    console.log(`[GPUBVHBuilder] Bottom-level internal nodes (with leaf children): ${bottomLevelNodes.slice(0, 10).join(", ")}${bottomLevelNodes.length > 10 ? "..." : ""} (${bottomLevelNodes.length} total)`);
+    const hierMultiParentNodes = [];
+    for (const [child, parents] of hierChildParentMap) {
+      if (parents.length > 1) {
+        hierMultiParentNodes.push([child, parents]);
+      }
+    }
+    if (hierMultiParentNodes.length > 0) {
+      console.error(`[GPUBVHBuilder] HIERARCHY BUG DETECTED: ${hierMultiParentNodes.length} nodes have multiple parents!`);
+      for (const [child, parents] of hierMultiParentNodes.slice(0, 10)) {
+        const isLeaf = child >= internalNodeCount;
+        console.error(`[GPUBVHBuilder]   Node ${child} (${isLeaf ? "leaf" : "internal"}) claimed by parents: ${parents.join(", ")}`);
+      }
+    } else {
+      console.log(`[GPUBVHBuilder] Hierarchy check: all nodes have exactly one parent (OK)`);
+    }
+    if (bottomLevelNodes.length > 0) {
+      const nodeIdx = bottomLevelNodes[0];
+      const offset = nodeIdx * 8;
+      const leftChild = hierDebugView.getUint32((offset + 3) * 4, true);
+      const rightRaw = hierDebugView.getUint32((offset + 7) * 4, true);
+      const rightChild = rightRaw & 2147483647;
+      console.log(`[GPUBVHBuilder] Node ${nodeIdx} children: left=${leftChild}, right=${rightChild}`);
+      if (leftChild < internalNodeCount + 5) {
+        const lOffset = leftChild * 8;
+        const lMin = [hierDebugData[lOffset], hierDebugData[lOffset + 1], hierDebugData[lOffset + 2]];
+        const lMax = [hierDebugData[lOffset + 4], hierDebugData[lOffset + 5], hierDebugData[lOffset + 6]];
+        const lValid = lMax[0] >= lMin[0] && lMax[1] >= lMin[1] && lMax[2] >= lMin[2] && (lMin[0] !== 0 || lMin[1] !== 0 || lMin[2] !== 0 || lMax[0] !== 0 || lMax[1] !== 0 || lMax[2] !== 0);
+        console.log(`[GPUBVHBuilder] Left child ${leftChild} AABB: [(${lMin[0].toFixed(2)}, ${lMin[1].toFixed(2)}, ${lMin[2].toFixed(2)}) - (${lMax[0].toFixed(2)}, ${lMax[1].toFixed(2)}, ${lMax[2].toFixed(2)})], valid=${lValid}`);
+      }
+    }
+    hierDebugReadback.unmap();
+    hierDebugReadback.destroy();
+    await this.computeAABBs(nodesBuffer, parentBuffer, triangleDataBuffer, sortedIndicesBuffer, triangleCount, internalNodeCount);
+    const result = await this.readbackResults(nodesBuffer, triangleDataBuffer, sortedIndicesBuffer, input, totalNodeCount, triangleCount);
+    centroidsBuffer.destroy();
+    triangleDataBuffer.destroy();
+    boundsBuffer.destroy();
+    atomicBoundsBuffer.destroy();
+    mortonCodesBuffer.destroy();
+    if (!indicesBufferReused) {
+      indicesBuffer.destroy();
+    }
+    sortedIndicesBuffer.destroy();
+    nodesBuffer.destroy();
+    parentBuffer.destroy();
+    const buildTimeMs = performance.now() - startTime;
+    console.log(`[GPUBVHBuilder] Build complete in ${buildTimeMs.toFixed(2)}ms`);
+    return {
+      ...result,
+      buildTimeMs,
+      usedGPU: true
+    };
+  }
+  uploadTriangleData(input) {
+    const triangleCount = Math.floor(input.indices.length / 3);
+    const { vertices, indices, uvs, materialIndices } = input;
+    const centroids = new Float32Array(triangleCount * 4);
+    const triangleData = new Float32Array(triangleCount * 20);
+    const triangleDataView = new DataView(triangleData.buffer);
+    for (let i = 0;i < triangleCount; i++) {
+      const i0 = indices[i * 3 + 0];
+      const i1 = indices[i * 3 + 1];
+      const i2 = indices[i * 3 + 2];
+      const v0x = vertices[i0 * 3 + 0];
+      const v0y = vertices[i0 * 3 + 1];
+      const v0z = vertices[i0 * 3 + 2];
+      const v1x = vertices[i1 * 3 + 0];
+      const v1y = vertices[i1 * 3 + 1];
+      const v1z = vertices[i1 * 3 + 2];
+      const v2x = vertices[i2 * 3 + 0];
+      const v2y = vertices[i2 * 3 + 1];
+      const v2z = vertices[i2 * 3 + 2];
+      centroids[i * 4 + 0] = (v0x + v1x + v2x) / 3;
+      centroids[i * 4 + 1] = (v0y + v1y + v2y) / 3;
+      centroids[i * 4 + 2] = (v0z + v1z + v2z) / 3;
+      centroids[i * 4 + 3] = 0;
+      const offset = i * 20;
+      triangleData[offset + 0] = v0x;
+      triangleData[offset + 1] = v0y;
+      triangleData[offset + 2] = v0z;
+      triangleDataView.setUint32((offset + 3) * 4, materialIndices?.[i] ?? 0, true);
+      triangleData[offset + 4] = v1x;
+      triangleData[offset + 5] = v1y;
+      triangleData[offset + 6] = v1z;
+      triangleData[offset + 7] = 0;
+      triangleData[offset + 8] = v2x;
+      triangleData[offset + 9] = v2y;
+      triangleData[offset + 10] = v2z;
+      triangleData[offset + 11] = 0;
+      if (uvs && uvs.length > 0) {
+        triangleData[offset + 12] = uvs[i0 * 2 + 0] ?? 0;
+        triangleData[offset + 13] = uvs[i0 * 2 + 1] ?? 0;
+        triangleData[offset + 14] = uvs[i1 * 2 + 0] ?? 0;
+        triangleData[offset + 15] = uvs[i1 * 2 + 1] ?? 0;
+        triangleData[offset + 16] = uvs[i2 * 2 + 0] ?? 0;
+        triangleData[offset + 17] = uvs[i2 * 2 + 1] ?? 0;
+      }
+      triangleData[offset + 18] = 0;
+      triangleData[offset + 19] = 0;
+    }
+    const centroidsBuffer = this.device.createBuffer({
+      label: "LBVH Centroids",
+      size: centroids.byteLength,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+      mappedAtCreation: true
+    });
+    new Float32Array(centroidsBuffer.getMappedRange()).set(centroids);
+    centroidsBuffer.unmap();
+    const triangleDataBuffer = this.device.createBuffer({
+      label: "LBVH Triangle Data",
+      size: triangleData.byteLength,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+      mappedAtCreation: true
+    });
+    new Float32Array(triangleDataBuffer.getMappedRange()).set(triangleData);
+    triangleDataBuffer.unmap();
+    return { centroidsBuffer, triangleDataBuffer };
+  }
+  async createBoundsReducePipeline() {
+    const boundsReduceShader = `
+      @group(0) @binding(0) var<storage, read> centroids: array<vec4f>;
+      @group(0) @binding(1) var<storage, read_write> atomic_bounds: array<atomic<u32>>;
+      @group(0) @binding(2) var<uniform> params: vec4u; // x = count
+
+      // Convert float to sortable uint (works for all floats including negatives)
+      // IEEE 754: sign bit | exponent | mantissa
+      // For positive floats: flip only sign bit (they sort naturally)
+      // For negative floats: flip all bits (reverses order and puts them before positives)
+      fn float_to_sortable_uint(f: f32) -> u32 {
+        let bits = bitcast<u32>(f);
+        // If negative (sign bit set), flip all bits; otherwise flip only sign bit
+        let mask = select(0x80000000u, 0xFFFFFFFFu, (bits & 0x80000000u) != 0u);
+        return bits ^ mask;
+      }
+
+      @compute @workgroup_size(${WORKGROUP_SIZE2})
+      fn main(@builtin(global_invocation_id) gid: vec3u) {
+        let idx = gid.x;
+        if (idx >= params.x) { return; }
+
+        let c = centroids[idx].xyz;
+
+        // Atomic min for min bounds (indices 0,1,2)
+        atomicMin(&atomic_bounds[0], float_to_sortable_uint(c.x));
+        atomicMin(&atomic_bounds[1], float_to_sortable_uint(c.y));
+        atomicMin(&atomic_bounds[2], float_to_sortable_uint(c.z));
+
+        // Atomic max for max bounds (indices 3,4,5)
+        atomicMax(&atomic_bounds[3], float_to_sortable_uint(c.x));
+        atomicMax(&atomic_bounds[4], float_to_sortable_uint(c.y));
+        atomicMax(&atomic_bounds[5], float_to_sortable_uint(c.z));
+      }
+    `;
+    this.boundsReduceLayout = this.device.createBindGroupLayout({
+      label: "Bounds Reduce Layout",
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+        { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
+        { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: "uniform" } }
+      ]
+    });
+    const shaderModule = this.device.createShaderModule({
+      label: "Bounds Reduce Shader",
+      code: boundsReduceShader
+    });
+    this.boundsReducePipeline = this.device.createComputePipeline({
+      label: "Bounds Reduce Pipeline",
+      layout: this.device.createPipelineLayout({
+        bindGroupLayouts: [this.boundsReduceLayout]
+      }),
+      compute: {
+        module: shaderModule,
+        entryPoint: "main"
+      }
+    });
+    const boundsFinalizeShader = `
+      struct Bounds {
+        min_val: vec3f,
+        _pad0: f32,
+        max_val: vec3f,
+        _pad1: f32,
+      }
+
+      @group(0) @binding(0) var<storage, read> atomic_bounds: array<u32>;
+      @group(0) @binding(1) var<storage, read_write> float_bounds: Bounds;
+
+      // Convert sortable uint back to float
+      fn sortable_uint_to_float(u: u32) -> f32 {
+        // If sign bit is now clear (was negative), flip all bits; otherwise flip only sign bit
+        let mask = select(0x80000000u, 0xFFFFFFFFu, (u & 0x80000000u) == 0u);
+        return bitcast<f32>(u ^ mask);
+      }
+
+      @compute @workgroup_size(1)
+      fn main() {
+        // Convert 6 values: min.xyz, max.xyz
+        float_bounds.min_val = vec3f(
+          sortable_uint_to_float(atomic_bounds[0]),
+          sortable_uint_to_float(atomic_bounds[1]),
+          sortable_uint_to_float(atomic_bounds[2])
+        );
+        float_bounds.max_val = vec3f(
+          sortable_uint_to_float(atomic_bounds[3]),
+          sortable_uint_to_float(atomic_bounds[4]),
+          sortable_uint_to_float(atomic_bounds[5])
+        );
+      }
+    `;
+    this.boundsFinalizeLayout = this.device.createBindGroupLayout({
+      label: "Bounds Finalize Layout",
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+        { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } }
+      ]
+    });
+    const finalizeModule = this.device.createShaderModule({
+      label: "Bounds Finalize Shader",
+      code: boundsFinalizeShader
+    });
+    this.boundsFinalizePipeline = this.device.createComputePipeline({
+      label: "Bounds Finalize Pipeline",
+      layout: this.device.createPipelineLayout({
+        bindGroupLayouts: [this.boundsFinalizeLayout]
+      }),
+      compute: {
+        module: finalizeModule,
+        entryPoint: "main"
+      }
+    });
+  }
+  computeSceneBounds(centroidsBuffer, triangleCount) {
+    const atomicBoundsBuffer = this.device.createBuffer({
+      label: "Atomic Bounds",
+      size: 32,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
+    });
+    const initData = new Uint32Array([
+      4294967295,
+      4294967295,
+      4294967295,
+      0,
+      0,
+      0,
+      0,
+      0
+    ]);
+    this.device.queue.writeBuffer(atomicBoundsBuffer, 0, initData);
+    const boundsBuffer = this.device.createBuffer({
+      label: "Scene Bounds",
+      size: 32,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC
+    });
+    const paramsBuffer = this.device.createBuffer({
+      label: "Bounds Params",
+      size: 16,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+    });
+    this.device.queue.writeBuffer(paramsBuffer, 0, new Uint32Array([triangleCount, 0, 0, 0]));
+    const reduceBindGroup = this.device.createBindGroup({
+      layout: this.boundsReduceLayout,
+      entries: [
+        { binding: 0, resource: { buffer: centroidsBuffer } },
+        { binding: 1, resource: { buffer: atomicBoundsBuffer } },
+        { binding: 2, resource: { buffer: paramsBuffer } }
+      ]
+    });
+    const finalizeBindGroup = this.device.createBindGroup({
+      layout: this.boundsFinalizeLayout,
+      entries: [
+        { binding: 0, resource: { buffer: atomicBoundsBuffer } },
+        { binding: 1, resource: { buffer: boundsBuffer } }
+      ]
+    });
+    const encoder = this.device.createCommandEncoder({ label: "Bounds Computation" });
+    const reducePass = encoder.beginComputePass({ label: "Bounds Reduce" });
+    reducePass.setPipeline(this.boundsReducePipeline);
+    reducePass.setBindGroup(0, reduceBindGroup);
+    reducePass.dispatchWorkgroups(Math.ceil(triangleCount / WORKGROUP_SIZE2));
+    reducePass.end();
+    const finalizePass = encoder.beginComputePass({ label: "Bounds Finalize" });
+    finalizePass.setPipeline(this.boundsFinalizePipeline);
+    finalizePass.setBindGroup(0, finalizeBindGroup);
+    finalizePass.dispatchWorkgroups(1);
+    finalizePass.end();
+    return { boundsBuffer, atomicBoundsBuffer, paramsBuffer, encoder };
+  }
+  async createMortonCodesPipeline() {
+    const shaderCode = `
+      struct Bounds {
+        min_val: vec3f,
+        _pad0: f32,
+        max_val: vec3f,
+        _pad1: f32,
+      }
+
+      @group(0) @binding(0) var<storage, read> centroids: array<vec4f>;
+      @group(0) @binding(1) var<storage, read> bounds: Bounds;
+      @group(0) @binding(2) var<storage, read_write> morton_codes: array<u32>;
+      @group(0) @binding(3) var<storage, read_write> indices: array<u32>;
+      @group(0) @binding(4) var<uniform> params: vec4u; // x = triangle count
+
+      // Expand a 10-bit integer into 30 bits by spacing bits out with zeros
+      fn expand_bits(v: u32) -> u32 {
+        var x = v & 0x000003ffu;
+        x = (x | (x << 16u)) & 0x030000ffu;
+        x = (x | (x << 8u)) & 0x0300f00fu;
+        x = (x | (x << 4u)) & 0x030c30c3u;
+        x = (x | (x << 2u)) & 0x09249249u;
+        return x;
+      }
+
+      // Calculate 30-bit Morton code for a point in [0,1]^3
+      fn morton_code_3d(pos: vec3f) -> u32 {
+        // Clamp and scale to [0, 1023]
+        let x = u32(clamp(pos.x * 1024.0, 0.0, 1023.0));
+        let y = u32(clamp(pos.y * 1024.0, 0.0, 1023.0));
+        let z = u32(clamp(pos.z * 1024.0, 0.0, 1023.0));
+
+        // Interleave bits
+        return expand_bits(x) | (expand_bits(y) << 1u) | (expand_bits(z) << 2u);
+      }
+
+      @compute @workgroup_size(${WORKGROUP_SIZE2})
+      fn main(@builtin(global_invocation_id) gid: vec3u) {
+        let idx = gid.x;
+        let triangle_count = params.x;
+
+        if (idx >= triangle_count) {
+          return;
+        }
+
+        // Normalize centroid to [0, 1]^3
+        let centroid = centroids[idx].xyz;
+        let extent = bounds.max_val - bounds.min_val;
+        let safe_extent = max(extent, vec3f(0.0001, 0.0001, 0.0001));
+        let normalized = (centroid - bounds.min_val) / safe_extent;
+
+        // Generate Morton code
+        morton_codes[idx] = morton_code_3d(normalized);
+        indices[idx] = idx;
+      }
+    `;
+    this.mortonCodesLayout = this.device.createBindGroupLayout({
+      label: "Morton Codes Layout",
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+        { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+        { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
+        { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
+        { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: "uniform" } }
+      ]
+    });
+    const shaderModule = this.device.createShaderModule({
+      label: "Morton Codes Shader",
+      code: shaderCode
+    });
+    this.mortonCodesPipeline = this.device.createComputePipeline({
+      label: "Morton Codes Pipeline",
+      layout: this.device.createPipelineLayout({
+        bindGroupLayouts: [this.mortonCodesLayout]
+      }),
+      compute: {
+        module: shaderModule,
+        entryPoint: "main"
+      }
+    });
+  }
+  async generateMortonCodes(centroidsBuffer, boundsBuffer, triangleCount) {
+    const mortonCodesBuffer = this.device.createBuffer({
+      label: "Morton Codes",
+      size: triangleCount * 4,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST
+    });
+    const indicesBuffer = this.device.createBuffer({
+      label: "Triangle Indices",
+      size: triangleCount * 4,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST
+    });
+    const paramsBuffer = this.device.createBuffer({
+      label: "Morton Params",
+      size: 16,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+    });
+    this.device.queue.writeBuffer(paramsBuffer, 0, new Uint32Array([triangleCount, 0, 0, 0]));
+    const bindGroup = this.device.createBindGroup({
+      layout: this.mortonCodesLayout,
+      entries: [
+        { binding: 0, resource: { buffer: centroidsBuffer } },
+        { binding: 1, resource: { buffer: boundsBuffer } },
+        { binding: 2, resource: { buffer: mortonCodesBuffer } },
+        { binding: 3, resource: { buffer: indicesBuffer } },
+        { binding: 4, resource: { buffer: paramsBuffer } }
+      ]
+    });
+    const encoder = this.device.createCommandEncoder();
+    const pass = encoder.beginComputePass();
+    pass.setPipeline(this.mortonCodesPipeline);
+    pass.setBindGroup(0, bindGroup);
+    pass.dispatchWorkgroups(Math.ceil(triangleCount / WORKGROUP_SIZE2));
+    pass.end();
+    this.device.queue.submit([encoder.finish()]);
+    paramsBuffer.destroy();
+    return { mortonCodesBuffer, indicesBuffer };
+  }
+  async radixSortGPU(mortonCodesBuffer, indicesBuffer, triangleCount) {
+    const { sortedKeys, sortedValues } = await this.radixSort.sort(mortonCodesBuffer, indicesBuffer, triangleCount);
+    const indicesBufferReused = sortedValues === indicesBuffer;
+    if (sortedKeys !== mortonCodesBuffer) {
+      const encoder = this.device.createCommandEncoder();
+      encoder.copyBufferToBuffer(sortedKeys, 0, mortonCodesBuffer, 0, triangleCount * 4);
+      this.device.queue.submit([encoder.finish()]);
+      sortedKeys.destroy();
+    }
+    return { sortedIndicesBuffer: sortedValues, indicesBufferReused };
+  }
+  async createHierarchyPipeline() {
+    const shaderCode = `
+      struct BVHNode {
+        min_val: vec3f,
+        left_or_first: u32,
+        max_val: vec3f,
+        right_or_count: u32,
+      }
+
+      @group(0) @binding(0) var<storage, read> morton_codes: array<u32>;
+      @group(0) @binding(1) var<storage, read_write> nodes: array<BVHNode>;
+      @group(0) @binding(2) var<storage, read_write> parents: array<atomic<i32>>;
+      @group(0) @binding(3) var<uniform> params: vec4u; // x = leaf_count, y = internal_count
+
+      // Count leading zeros of XOR (common prefix length)
+      fn common_prefix(i: u32, j: u32, n: u32) -> i32 {
+        if (j >= n) {
+          return -1;
+        }
+
+        let mi = morton_codes[i];
+        let mj = morton_codes[j];
+
+        if (mi == mj) {
+          // If Morton codes are the same, use index as tiebreaker
+          return i32(countLeadingZeros(i ^ j)) + 32;
+        }
+
+        return i32(countLeadingZeros(mi ^ mj));
+      }
+
+      // Find split position using binary search
+      fn find_split(first: u32, last: u32, n: u32) -> u32 {
+        let first_code = morton_codes[first];
+        let last_code = morton_codes[last];
+
+        // If all codes are the same, split in the middle
+        if (first_code == last_code) {
+          return (first + last) >> 1u;
+        }
+
+        let common_prefix_len = countLeadingZeros(first_code ^ last_code);
+
+        // Binary search for split
+        var split = first;
+        var step = last - first;
+
+        loop {
+          step = (step + 1u) >> 1u;
+          let new_split = split + step;
+
+          if (new_split < last) {
+            let split_code = morton_codes[new_split];
+            let split_prefix = countLeadingZeros(first_code ^ split_code);
+
+            if (split_prefix > common_prefix_len) {
+              split = new_split;
+            }
+          }
+
+          if (step <= 1u) {
+            break;
+          }
+        }
+
+        return split;
+      }
+
+      @compute @workgroup_size(${WORKGROUP_SIZE2})
+      fn main(@builtin(global_invocation_id) gid: vec3u) {
+        let idx = gid.x;
+        let leaf_count = params.x;
+        let internal_count = params.y;
+
+        if (idx >= internal_count) {
+          return;
+        }
+
+        let n = leaf_count;
+
+        // Determine direction of the range
+        let d_left = common_prefix(idx, idx - 1u, n);
+        let d_right = common_prefix(idx, idx + 1u, n);
+        let d = select(-1, 1, d_right > d_left);
+
+        // Compute upper bound for range length
+        let delta_min = min(d_left, d_right);
+        var l_max = 2u;
+
+        loop {
+          let new_idx = i32(idx) + i32(l_max) * d;
+          if (new_idx < 0 || u32(new_idx) >= n) {
+            break;
+          }
+          if (common_prefix(idx, u32(new_idx), n) <= delta_min) {
+            break;
+          }
+          l_max = l_max << 1u;
+        }
+
+        // Binary search for actual range length
+        var l = 0u;
+        var t = l_max >> 1u;
+
+        loop {
+          if (t == 0u) {
+            break;
+          }
+
+          let new_idx = i32(idx) + i32(l + t) * d;
+          if (new_idx >= 0 && u32(new_idx) < n) {
+            if (common_prefix(idx, u32(new_idx), n) > delta_min) {
+              l = l + t;
+            }
+          }
+          t = t >> 1u;
+        }
+
+        // Determine range [first, last]
+        let j = i32(idx) + i32(l) * d;
+        let first = min(idx, u32(max(0, j)));
+        let last = max(idx, u32(max(0, j)));
+
+        // Find split position
+        let split = find_split(first, last, n);
+
+        // Create child nodes
+        // Left child: internal node at split, or leaf at split + internal_count
+        var left_child: u32;
+        if (split == first) {
+          left_child = split + internal_count; // Leaf
+        } else {
+          left_child = split; // Internal
+        }
+
+        // Right child: internal node at split+1, or leaf at split+1 + internal_count
+        var right_child: u32;
+        if (split + 1u == last) {
+          right_child = split + 1u + internal_count; // Leaf
+        } else {
+          right_child = split + 1u; // Internal
+        }
+
+        // Store children in node
+        nodes[idx].left_or_first = left_child;
+        nodes[idx].right_or_count = right_child | 0x80000000u; // Mark as internal
+
+        // Set parent pointers
+        atomicStore(&parents[left_child], i32(idx));
+        atomicStore(&parents[right_child], i32(idx));
+      }
+    `;
+    this.hierarchyLayout = this.device.createBindGroupLayout({
+      label: "Hierarchy Layout",
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+        { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
+        { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
+        { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: "uniform" } }
+      ]
+    });
+    const shaderModule = this.device.createShaderModule({
+      label: "Hierarchy Shader",
+      code: shaderCode
+    });
+    this.hierarchyPipeline = this.device.createComputePipeline({
+      label: "Hierarchy Pipeline",
+      layout: this.device.createPipelineLayout({
+        bindGroupLayouts: [this.hierarchyLayout]
+      }),
+      compute: {
+        module: shaderModule,
+        entryPoint: "main"
+      }
+    });
+  }
+  async buildHierarchy(mortonCodesBuffer, sortedIndicesBuffer, triangleCount, internalNodeCount) {
+    const totalNodes = internalNodeCount + triangleCount;
+    const nodesBuffer = this.device.createBuffer({
+      label: "BVH Nodes",
+      size: totalNodes * 32,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+      mappedAtCreation: true
+    });
+    new Float32Array(nodesBuffer.getMappedRange()).fill(0);
+    nodesBuffer.unmap();
+    const parentBuffer = this.device.createBuffer({
+      label: "BVH Parents",
+      size: totalNodes * 4,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST
+    });
+    const initParents = new Int32Array(totalNodes);
+    initParents.fill(-1);
+    this.device.queue.writeBuffer(parentBuffer, 0, initParents);
+    const paramsBuffer = this.device.createBuffer({
+      label: "Hierarchy Params",
+      size: 16,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+    });
+    this.device.queue.writeBuffer(paramsBuffer, 0, new Uint32Array([triangleCount, internalNodeCount, 0, 0]));
+    const bindGroup = this.device.createBindGroup({
+      layout: this.hierarchyLayout,
+      entries: [
+        { binding: 0, resource: { buffer: mortonCodesBuffer } },
+        { binding: 1, resource: { buffer: nodesBuffer } },
+        { binding: 2, resource: { buffer: parentBuffer } },
+        { binding: 3, resource: { buffer: paramsBuffer } }
+      ]
+    });
+    const encoder = this.device.createCommandEncoder();
+    const pass = encoder.beginComputePass();
+    pass.setPipeline(this.hierarchyPipeline);
+    pass.setBindGroup(0, bindGroup);
+    pass.dispatchWorkgroups(Math.ceil(internalNodeCount / WORKGROUP_SIZE2));
+    pass.end();
+    this.device.queue.submit([encoder.finish()]);
+    paramsBuffer.destroy();
+    return { nodesBuffer, parentBuffer };
+  }
+  async createAABBPipeline() {
+    const leafShaderCode = `
+      struct BVHNode {
+        min_val: vec3f,
+        left_or_first: u32,
+        max_val: vec3f,
+        right_or_count: u32,
+      }
+
+      struct Triangle {
+        v0: vec3f,
+        material_index: u32,
+        v1: vec3f,
+        _pad1: f32,
+        v2: vec3f,
+        _pad2: f32,
+        uv0: vec2f,
+        uv1: vec2f,
+        uv2: vec2f,
+        _pad3: vec2f,
+      }
+
+      @group(0) @binding(0) var<storage, read_write> nodes: array<BVHNode>;
+      @group(0) @binding(1) var<storage, read> triangles: array<Triangle>;
+      @group(0) @binding(2) var<storage, read> sorted_indices: array<u32>;
+      @group(0) @binding(3) var<uniform> params: vec4u; // x = leaf_count, y = internal_count
+
+      @compute @workgroup_size(${WORKGROUP_SIZE2})
+      fn main(@builtin(global_invocation_id) gid: vec3u) {
+        let leaf_idx = gid.x;
+        let leaf_count = params.x;
+        let internal_count = params.y;
+
+        if (leaf_idx >= leaf_count) {
+          return;
+        }
+
+        // Get original triangle index
+        let tri_idx = sorted_indices[leaf_idx];
+        let tri = triangles[tri_idx];
+
+        // Compute leaf AABB
+        let aabb_min = min(min(tri.v0, tri.v1), tri.v2);
+        let aabb_max = max(max(tri.v0, tri.v1), tri.v2);
+
+        // Store leaf node (leaves start at internal_count)
+        let node_idx = leaf_idx + internal_count;
+        nodes[node_idx].min_val = aabb_min;
+        nodes[node_idx].max_val = aabb_max;
+        // Store leaf_idx as index into reordered triangle array (not original tri_idx)
+        nodes[node_idx].left_or_first = leaf_idx;
+        nodes[node_idx].right_or_count = 1u; // Count = 1 for LBVH leaves
+      }
+    `;
+    const internalShaderCode = `
+      struct BVHNode {
+        min_val: vec3f,
+        left_or_first: u32,
+        max_val: vec3f,
+        right_or_count: u32,
+      }
+
+      @group(0) @binding(0) var<storage, read_write> nodes: array<BVHNode>;
+      @group(0) @binding(1) var<storage, read_write> computed: array<atomic<u32>>;
+      @group(0) @binding(2) var<uniform> params: vec4u; // x = internal_count
+
+      fn is_valid_leaf_aabb(node_idx: u32) -> bool {
+        let min_val = nodes[node_idx].min_val;
+        let max_val = nodes[node_idx].max_val;
+        // Check if AABB has non-zero extent (was computed)
+        return max_val.x >= min_val.x && max_val.y >= min_val.y && max_val.z >= min_val.z &&
+               (max_val.x != 0.0 || max_val.y != 0.0 || max_val.z != 0.0 ||
+                min_val.x != 0.0 || min_val.y != 0.0 || min_val.z != 0.0);
+      }
+
+      // Check if a child node is ready
+      // - Leaf nodes (>= internal_count): check AABB validity
+      // - Internal nodes (< internal_count): check computed flag from PREVIOUS pass
+      fn is_child_ready(child_idx: u32, internal_count: u32) -> bool {
+        if (child_idx >= internal_count) {
+          // Leaf node - always ready after leaf pass (check AABB validity)
+          return is_valid_leaf_aabb(child_idx);
+        } else {
+          // Internal node - must have been computed in a PREVIOUS pass
+          // Using computed flag ensures we don't read data written in current pass
+          return atomicLoad(&computed[child_idx]) != 0u;
+        }
+      }
+
+      @compute @workgroup_size(${WORKGROUP_SIZE2})
+      fn main(@builtin(global_invocation_id) gid: vec3u) {
+        let internal_idx = gid.x;
+        let internal_count = params.x;
+
+        if (internal_idx >= internal_count) {
+          return;
+        }
+
+        // Check if this internal node was already computed
+        if (atomicLoad(&computed[internal_idx]) != 0u) {
+          return;
+        }
+
+        // Get children
+        let left_child = nodes[internal_idx].left_or_first;
+        let right_child = nodes[internal_idx].right_or_count & 0x7FFFFFFFu;
+
+        // Check if both children are ready (computed in previous passes or are leaves)
+        if (!is_child_ready(left_child, internal_count) || !is_child_ready(right_child, internal_count)) {
+          return; // Children not ready yet, will be computed in next pass
+        }
+
+        // Both children ready - compute this node's AABB
+        let aabb_min = min(nodes[left_child].min_val, nodes[right_child].min_val);
+        let aabb_max = max(nodes[left_child].max_val, nodes[right_child].max_val);
+
+        nodes[internal_idx].min_val = aabb_min;
+        nodes[internal_idx].max_val = aabb_max;
+
+        // Mark as computed
+        atomicStore(&computed[internal_idx], 1u);
+      }
+    `;
+    this.aabbLeafLayout = this.device.createBindGroupLayout({
+      label: "AABB Leaf Layout",
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
+        { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+        { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+        { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: "uniform" } }
+      ]
+    });
+    const leafShaderModule = this.device.createShaderModule({
+      label: "AABB Leaf Shader",
+      code: leafShaderCode
+    });
+    this.aabbLeafPipeline = this.device.createComputePipeline({
+      label: "AABB Leaf Pipeline",
+      layout: this.device.createPipelineLayout({
+        bindGroupLayouts: [this.aabbLeafLayout]
+      }),
+      compute: {
+        module: leafShaderModule,
+        entryPoint: "main"
+      }
+    });
+    this.aabbLayout = this.device.createBindGroupLayout({
+      label: "AABB Internal Layout",
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
+        { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
+        { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: "uniform" } }
+      ]
+    });
+    const internalShaderModule = this.device.createShaderModule({
+      label: "AABB Internal Shader",
+      code: internalShaderCode
+    });
+    this.aabbPipeline = this.device.createComputePipeline({
+      label: "AABB Internal Pipeline",
+      layout: this.device.createPipelineLayout({
+        bindGroupLayouts: [this.aabbLayout]
+      }),
+      compute: {
+        module: internalShaderModule,
+        entryPoint: "main"
+      }
+    });
+  }
+  async computeAABBs(nodesBuffer, _parentBuffer, triangleDataBuffer, sortedIndicesBuffer, triangleCount, internalNodeCount) {
+    const computedBufferSize = Math.max(16, internalNodeCount * 4);
+    const computedBuffer = this.device.createBuffer({
+      label: "AABB Computed Flags",
+      size: computedBufferSize,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+      mappedAtCreation: true
+    });
+    new Uint32Array(computedBuffer.getMappedRange()).fill(0);
+    computedBuffer.unmap();
+    const leafParamsBuffer = this.device.createBuffer({
+      label: "AABB Leaf Params",
+      size: 16,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+    });
+    this.device.queue.writeBuffer(leafParamsBuffer, 0, new Uint32Array([triangleCount, internalNodeCount, 0, 0]));
+    const internalParamsBuffer = this.device.createBuffer({
+      label: "AABB Internal Params",
+      size: 16,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+    });
+    this.device.queue.writeBuffer(internalParamsBuffer, 0, new Uint32Array([internalNodeCount, 0, 0, 0]));
+    const leafWorkgroups = Math.ceil(triangleCount / WORKGROUP_SIZE2);
+    const internalWorkgroups = Math.ceil(internalNodeCount / WORKGROUP_SIZE2);
+    const leafBindGroup = this.device.createBindGroup({
+      layout: this.aabbLeafLayout,
+      entries: [
+        { binding: 0, resource: { buffer: nodesBuffer } },
+        { binding: 1, resource: { buffer: triangleDataBuffer } },
+        { binding: 2, resource: { buffer: sortedIndicesBuffer } },
+        { binding: 3, resource: { buffer: leafParamsBuffer } }
+      ]
+    });
+    const leafEncoder = this.device.createCommandEncoder({ label: "AABB Leaf" });
+    const leafPass = leafEncoder.beginComputePass({ label: "AABB Leaf" });
+    leafPass.setPipeline(this.aabbLeafPipeline);
+    leafPass.setBindGroup(0, leafBindGroup);
+    leafPass.dispatchWorkgroups(leafWorkgroups);
+    leafPass.end();
+    this.device.queue.submit([leafEncoder.finish()]);
+    await this.device.queue.onSubmittedWorkDone();
+    console.log("[GPUBVHBuilder] Leaf AABBs complete");
+    const leafDebugSize = triangleCount * 32;
+    const debugReadback = this.device.createBuffer({
+      size: leafDebugSize,
+      usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST
+    });
+    const debugEncoder = this.device.createCommandEncoder();
+    debugEncoder.copyBufferToBuffer(nodesBuffer, internalNodeCount * 32, debugReadback, 0, leafDebugSize);
+    this.device.queue.submit([debugEncoder.finish()]);
+    await debugReadback.mapAsync(GPUMapMode.READ);
+    const debugData = new Float32Array(debugReadback.getMappedRange());
+    const debugView = new DataView(debugData.buffer);
+    let validLeafCount = 0;
+    for (let i = 0;i < triangleCount; i++) {
+      const offset = i * 8;
+      const minX = debugData[offset], minY = debugData[offset + 1], minZ = debugData[offset + 2];
+      const maxX = debugData[offset + 4], maxY = debugData[offset + 5], maxZ = debugData[offset + 6];
+      const isValid = maxX >= minX && maxY >= minY && maxZ >= minZ && (minX !== 0 || minY !== 0 || minZ !== 0 || maxX !== 0 || maxY !== 0 || maxZ !== 0);
+      if (isValid)
+        validLeafCount++;
+    }
+    console.log(`[GPUBVHBuilder] After leaf pass: ${validLeafCount}/${triangleCount} leaves have valid AABBs`);
+    console.log(`[GPUBVHBuilder] First leaf (node ${internalNodeCount}) after leaf pass:`);
+    console.log(`  AABB: [(${debugData[0].toFixed(2)}, ${debugData[1].toFixed(2)}, ${debugData[2].toFixed(2)}) - (${debugData[4].toFixed(2)}, ${debugData[5].toFixed(2)}, ${debugData[6].toFixed(2)})]`);
+    console.log(`  left_or_first=${debugView.getUint32(12, true)}, right_or_count=${debugView.getUint32(28, true)}`);
+    debugReadback.unmap();
+    debugReadback.destroy();
+    const internalBindGroup = this.device.createBindGroup({
+      layout: this.aabbLayout,
+      entries: [
+        { binding: 0, resource: { buffer: nodesBuffer } },
+        { binding: 1, resource: { buffer: computedBuffer } },
+        { binding: 2, resource: { buffer: internalParamsBuffer } }
+      ]
+    });
+    const maxPasses = Math.ceil(Math.log2(triangleCount + 1)) + 1;
+    console.log(`[GPUBVHBuilder] Starting ${maxPasses} internal AABB passes for ${internalNodeCount} internal nodes`);
+    for (let pass = 0;pass < maxPasses; pass++) {
+      const encoder = this.device.createCommandEncoder({ label: `AABB Internal Pass ${pass}` });
+      const computePass = encoder.beginComputePass({ label: `AABB Internal Pass ${pass}` });
+      computePass.setPipeline(this.aabbPipeline);
+      computePass.setBindGroup(0, internalBindGroup);
+      computePass.dispatchWorkgroups(internalWorkgroups);
+      computePass.end();
+      this.device.queue.submit([encoder.finish()]);
+      await this.device.queue.onSubmittedWorkDone();
+      const passDebugReadback = this.device.createBuffer({
+        size: 32,
+        usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST
+      });
+      const computedReadback = this.device.createBuffer({
+        size: computedBufferSize,
+        usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST
+      });
+      const passDebugEncoder = this.device.createCommandEncoder();
+      passDebugEncoder.copyBufferToBuffer(nodesBuffer, 0, passDebugReadback, 0, 32);
+      passDebugEncoder.copyBufferToBuffer(computedBuffer, 0, computedReadback, 0, computedBufferSize);
+      this.device.queue.submit([passDebugEncoder.finish()]);
+      await Promise.all([
+        passDebugReadback.mapAsync(GPUMapMode.READ),
+        computedReadback.mapAsync(GPUMapMode.READ)
+      ]);
+      const passDebugData = new Float32Array(passDebugReadback.getMappedRange());
+      const computedData = new Uint32Array(computedReadback.getMappedRange());
+      let computedCount = 0;
+      for (let i = 0;i < internalNodeCount; i++) {
+        if (computedData[i] !== 0)
+          computedCount++;
+      }
+      const rootValid = passDebugData[4] >= passDebugData[0] && passDebugData[5] >= passDebugData[1] && passDebugData[6] >= passDebugData[2] && (passDebugData[0] !== 0 || passDebugData[1] !== 0 || passDebugData[2] !== 0 || passDebugData[4] !== 0 || passDebugData[5] !== 0 || passDebugData[6] !== 0);
+      console.log(`[GPUBVHBuilder] Pass ${pass}: computed=${computedCount}/${internalNodeCount}, Root AABB valid=${rootValid}`);
+      if (pass === maxPasses - 1 && !rootValid) {
+        console.log(`[GPUBVHBuilder] Pass ${pass}: Root AABB = [(${passDebugData[0].toFixed(2)}, ${passDebugData[1].toFixed(2)}, ${passDebugData[2].toFixed(2)}) - (${passDebugData[4].toFixed(2)}, ${passDebugData[5].toFixed(2)}, ${passDebugData[6].toFixed(2)})]`);
+        const rootView = new DataView(passDebugData.buffer);
+        const leftChild = rootView.getUint32(12, true);
+        const rightChild = rootView.getUint32(28, true) & 2147483647;
+        console.log(`[GPUBVHBuilder] Root children: left=${leftChild}, right=${rightChild}`);
+        console.log(`[GPUBVHBuilder] computed[${leftChild}]=${computedData[leftChild] ?? "N/A"}, computed[${rightChild}]=${computedData[rightChild] ?? "N/A"}`);
+        const uncomputed = [];
+        for (let i = 0;i < internalNodeCount; i++) {
+          if (computedData[i] === 0)
+            uncomputed.push(i);
+        }
+        console.log(`[GPUBVHBuilder] Uncomputed nodes: ${uncomputed.join(", ")}`);
+        const fullNodesReadback = this.device.createBuffer({
+          size: (internalNodeCount + triangleCount) * 32,
+          usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST
+        });
+        const fullEncoder = this.device.createCommandEncoder();
+        fullEncoder.copyBufferToBuffer(nodesBuffer, 0, fullNodesReadback, 0, (internalNodeCount + triangleCount) * 32);
+        this.device.queue.submit([fullEncoder.finish()]);
+        await fullNodesReadback.mapAsync(GPUMapMode.READ);
+        const fullNodesData = new Float32Array(fullNodesReadback.getMappedRange());
+        const fullNodesView = new DataView(fullNodesData.buffer);
+        const childParentMap = new Map;
+        for (let i = 0;i < internalNodeCount; i++) {
+          const offset = i * 8;
+          const lc = fullNodesView.getUint32((offset + 3) * 4, true);
+          const rcRaw = fullNodesView.getUint32((offset + 7) * 4, true);
+          const rc = rcRaw & 2147483647;
+          if (!childParentMap.has(lc))
+            childParentMap.set(lc, []);
+          childParentMap.get(lc).push(i);
+          if (!childParentMap.has(rc))
+            childParentMap.set(rc, []);
+          childParentMap.get(rc).push(i);
+        }
+        const multiParentNodes = [];
+        for (const [child, parents] of childParentMap) {
+          if (parents.length > 1) {
+            multiParentNodes.push([child, parents]);
+          }
+        }
+        if (multiParentNodes.length > 0) {
+          console.warn(`[GPUBVHBuilder] HIERARCHY BUG: ${multiParentNodes.length} nodes have multiple parents!`);
+          for (const [child, parents] of multiParentNodes.slice(0, 5)) {
+            const isLeaf = child >= internalNodeCount;
+            console.warn(`[GPUBVHBuilder]   Node ${child} (${isLeaf ? "leaf" : "internal"}) claimed by parents: ${parents.join(", ")}`);
+          }
+        }
+        for (const nodeIdx of uncomputed.slice(0, 10)) {
+          const offset = nodeIdx * 8;
+          const lc = fullNodesView.getUint32((offset + 3) * 4, true);
+          const rcRaw = fullNodesView.getUint32((offset + 7) * 4, true);
+          const rc = rcRaw & 2147483647;
+          const lcOffset = lc * 8;
+          const lcMin = [fullNodesData[lcOffset], fullNodesData[lcOffset + 1], fullNodesData[lcOffset + 2]];
+          const lcMax = [fullNodesData[lcOffset + 4], fullNodesData[lcOffset + 5], fullNodesData[lcOffset + 6]];
+          const lcValid = lcMax[0] >= lcMin[0] && lcMax[1] >= lcMin[1] && lcMax[2] >= lcMin[2] && (lcMin[0] !== 0 || lcMin[1] !== 0 || lcMin[2] !== 0 || lcMax[0] !== 0 || lcMax[1] !== 0 || lcMax[2] !== 0);
+          const rcOffset = rc * 8;
+          const rcMin = [fullNodesData[rcOffset], fullNodesData[rcOffset + 1], fullNodesData[rcOffset + 2]];
+          const rcMax = [fullNodesData[rcOffset + 4], fullNodesData[rcOffset + 5], fullNodesData[rcOffset + 6]];
+          const rcValid = rcMax[0] >= rcMin[0] && rcMax[1] >= rcMin[1] && rcMax[2] >= rcMin[2] && (rcMin[0] !== 0 || rcMin[1] !== 0 || rcMin[2] !== 0 || rcMax[0] !== 0 || rcMax[1] !== 0 || rcMax[2] !== 0);
+          const lcIsLeaf = lc >= internalNodeCount;
+          const rcIsLeaf = rc >= internalNodeCount;
+          const lcComputed = lc < internalNodeCount ? computedData[lc] !== 0 : true;
+          const rcComputed = rc < internalNodeCount ? computedData[rc] !== 0 : true;
+          console.log(`[GPUBVHBuilder] Node ${nodeIdx}: left=${lc}(${lcIsLeaf ? "leaf" : "int"},valid=${lcValid},computed=${lcComputed}), right=${rc}(${rcIsLeaf ? "leaf" : "int"},valid=${rcValid},computed=${rcComputed})`);
+          if (!lcValid) {
+            console.log(`[GPUBVHBuilder]   Left child ${lc} AABB: [(${lcMin[0].toFixed(2)}, ${lcMin[1].toFixed(2)}, ${lcMin[2].toFixed(2)}) - (${lcMax[0].toFixed(2)}, ${lcMax[1].toFixed(2)}, ${lcMax[2].toFixed(2)})]`);
+          }
+          if (!rcValid) {
+            console.log(`[GPUBVHBuilder]   Right child ${rc} AABB: [(${rcMin[0].toFixed(2)}, ${rcMin[1].toFixed(2)}, ${rcMin[2].toFixed(2)}) - (${rcMax[0].toFixed(2)}, ${rcMax[1].toFixed(2)}, ${rcMax[2].toFixed(2)})]`);
+          }
+        }
+        fullNodesReadback.unmap();
+        fullNodesReadback.destroy();
+      }
+      passDebugReadback.unmap();
+      computedReadback.unmap();
+      passDebugReadback.destroy();
+      computedReadback.destroy();
+    }
+    computedBuffer.destroy();
+    leafParamsBuffer.destroy();
+    internalParamsBuffer.destroy();
+  }
+  async readbackResults(nodesBuffer, triangleDataBuffer, sortedIndicesBuffer, input, totalNodeCount, triangleCount) {
+    const nodesByteSize = totalNodeCount * 32;
+    const nodesReadback = this.device.createBuffer({
+      size: nodesByteSize,
+      usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST
+    });
+    const indicesReadback = this.device.createBuffer({
+      size: triangleCount * 4,
+      usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST
+    });
+    const encoder = this.device.createCommandEncoder();
+    encoder.copyBufferToBuffer(nodesBuffer, 0, nodesReadback, 0, nodesByteSize);
+    encoder.copyBufferToBuffer(sortedIndicesBuffer, 0, indicesReadback, 0, triangleCount * 4);
+    this.device.queue.submit([encoder.finish()]);
+    await Promise.all([
+      nodesReadback.mapAsync(GPUMapMode.READ),
+      indicesReadback.mapAsync(GPUMapMode.READ)
+    ]);
+    const gpuNodesView = new Float32Array(nodesReadback.getMappedRange());
+    const sortedIndicesView = new Uint32Array(indicesReadback.getMappedRange());
+    const gpuNodes = new Float32Array(gpuNodesView);
+    const sortedIndices = new Uint32Array(sortedIndicesView);
+    const packedNodes = new Float32Array(totalNodeCount * 8);
+    const packedNodesView = new DataView(packedNodes.buffer);
+    for (let i = 0;i < totalNodeCount; i++) {
+      const srcOffset = i * 8;
+      const dstOffset = i * 8;
+      packedNodes[dstOffset + 0] = gpuNodes[srcOffset + 0];
+      packedNodes[dstOffset + 1] = gpuNodes[srcOffset + 1];
+      packedNodes[dstOffset + 2] = gpuNodes[srcOffset + 2];
+      const leftOrFirst = new DataView(gpuNodes.buffer).getUint32((srcOffset + 3) * 4, true);
+      packedNodesView.setUint32((dstOffset + 3) * 4, leftOrFirst, true);
+      packedNodes[dstOffset + 4] = gpuNodes[srcOffset + 4];
+      packedNodes[dstOffset + 5] = gpuNodes[srcOffset + 5];
+      packedNodes[dstOffset + 6] = gpuNodes[srcOffset + 6];
+      const rightOrCount = new DataView(gpuNodes.buffer).getUint32((srcOffset + 7) * 4, true);
+      packedNodesView.setUint32((dstOffset + 7) * 4, rightOrCount, true);
+    }
+    nodesReadback.unmap();
+    indicesReadback.unmap();
+    nodesReadback.destroy();
+    indicesReadback.destroy();
+    const internalNodeCount = triangleCount - 1;
+    let invalidIndices = 0;
+    let duplicateCheck = new Set;
+    let hasDuplicates = false;
+    for (let i = 0;i < triangleCount; i++) {
+      const idx = sortedIndices[i];
+      if (idx >= triangleCount) {
+        invalidIndices++;
+      }
+      if (duplicateCheck.has(idx)) {
+        hasDuplicates = true;
+      }
+      duplicateCheck.add(idx);
+    }
+    const rootView = new DataView(packedNodes.buffer);
+    const rootMinX = packedNodes[0], rootMinY = packedNodes[1], rootMinZ = packedNodes[2];
+    const rootLeftOrFirst = rootView.getUint32(3 * 4, true);
+    const rootMaxX = packedNodes[4], rootMaxY = packedNodes[5], rootMaxZ = packedNodes[6];
+    const rootRightOrCount = rootView.getUint32(7 * 4, true);
+    const rootIsInternal = (rootRightOrCount & 2147483648) !== 0;
+    const rootRightChild = rootRightOrCount & 2147483647;
+    const rootAABBValid = isFinite(rootMinX) && isFinite(rootMinY) && isFinite(rootMinZ) && isFinite(rootMaxX) && isFinite(rootMaxY) && isFinite(rootMaxZ) && (rootMaxX > rootMinX || rootMaxY > rootMinY || rootMaxZ > rootMinZ);
+    const leafNodeIdx = internalNodeCount;
+    const leafOffset = leafNodeIdx * 8;
+    const leafMinX = packedNodes[leafOffset + 0];
+    const leafMinY = packedNodes[leafOffset + 1];
+    const leafMinZ = packedNodes[leafOffset + 2];
+    const leafLeftOrFirst = rootView.getUint32((leafOffset + 3) * 4, true);
+    const leafMaxX = packedNodes[leafOffset + 4];
+    const leafMaxY = packedNodes[leafOffset + 5];
+    const leafMaxZ = packedNodes[leafOffset + 6];
+    const leafRightOrCount = rootView.getUint32((leafOffset + 7) * 4, true);
+    const leafIsInternal = (leafRightOrCount & 2147483648) !== 0;
+    const leafAABBValid = isFinite(leafMinX) && isFinite(leafMinY) && isFinite(leafMinZ) && isFinite(leafMaxX) && isFinite(leafMaxY) && isFinite(leafMaxZ) && (leafMaxX >= leafMinX && leafMaxY >= leafMinY && leafMaxZ >= leafMinZ);
+    console.log(`[GPUBVHBuilder] Diagnostics:`);
+    console.log(`  Sorted indices: ${invalidIndices} invalid, duplicates=${hasDuplicates}, first5=[${Array.from(sortedIndices.slice(0, 5)).join(",")}]`);
+    console.log(`  Root node: AABB valid=${rootAABBValid}, internal=${rootIsInternal}, left=${rootLeftOrFirst}, right=${rootRightChild}`);
+    console.log(`  Root AABB: [(${rootMinX.toFixed(2)}, ${rootMinY.toFixed(2)}, ${rootMinZ.toFixed(2)}) - (${rootMaxX.toFixed(2)}, ${rootMaxY.toFixed(2)}, ${rootMaxZ.toFixed(2)})]`);
+    console.log(`  First leaf (node ${leafNodeIdx}): triIdx=${leafLeftOrFirst}, count=${leafRightOrCount}, internal=${leafIsInternal}, AABB valid=${leafAABBValid}`);
+    console.log(`  First leaf AABB: [(${leafMinX.toFixed(2)}, ${leafMinY.toFixed(2)}, ${leafMinZ.toFixed(2)}) - (${leafMaxX.toFixed(2)}, ${leafMaxY.toFixed(2)}, ${leafMaxZ.toFixed(2)})]`);
+    if (invalidIndices > 0)
+      console.warn(`[GPUBVHBuilder] WARNING: ${invalidIndices} sorted indices out of range!`);
+    if (hasDuplicates)
+      console.warn(`[GPUBVHBuilder] WARNING: Duplicate indices in sorted array!`);
+    if (!rootAABBValid)
+      console.warn(`[GPUBVHBuilder] WARNING: Root AABB is invalid!`);
+    if (!leafAABBValid)
+      console.warn(`[GPUBVHBuilder] WARNING: First leaf AABB is invalid!`);
+    if (!rootIsInternal && triangleCount > 1)
+      console.warn(`[GPUBVHBuilder] WARNING: Root node is not marked as internal!`);
+    if (leafIsInternal)
+      console.warn(`[GPUBVHBuilder] WARNING: First leaf node is marked as internal!`);
+    if (leafRightOrCount !== 1)
+      console.warn(`[GPUBVHBuilder] WARNING: First leaf has count=${leafRightOrCount}, expected 1!`);
+    const { vertices, indices, uvs, materialIndices } = input;
+    const trianglesWithUV = new Float32Array(triangleCount * 20);
+    const triangles = new Float32Array(triangleCount * 12);
+    const trianglesView = new DataView(trianglesWithUV.buffer);
+    for (let i = 0;i < triangleCount; i++) {
+      const origIdx = sortedIndices[i];
+      const i0 = indices[origIdx * 3 + 0];
+      const i1 = indices[origIdx * 3 + 1];
+      const i2 = indices[origIdx * 3 + 2];
+      const v0x = vertices[i0 * 3 + 0];
+      const v0y = vertices[i0 * 3 + 1];
+      const v0z = vertices[i0 * 3 + 2];
+      const v1x = vertices[i1 * 3 + 0];
+      const v1y = vertices[i1 * 3 + 1];
+      const v1z = vertices[i1 * 3 + 2];
+      const v2x = vertices[i2 * 3 + 0];
+      const v2y = vertices[i2 * 3 + 1];
+      const v2z = vertices[i2 * 3 + 2];
+      const uvOffset = i * 20;
+      trianglesWithUV[uvOffset + 0] = v0x;
+      trianglesWithUV[uvOffset + 1] = v0y;
+      trianglesWithUV[uvOffset + 2] = v0z;
+      trianglesView.setUint32((uvOffset + 3) * 4, materialIndices?.[origIdx] ?? 0, true);
+      trianglesWithUV[uvOffset + 4] = v1x;
+      trianglesWithUV[uvOffset + 5] = v1y;
+      trianglesWithUV[uvOffset + 6] = v1z;
+      trianglesWithUV[uvOffset + 7] = 0;
+      trianglesWithUV[uvOffset + 8] = v2x;
+      trianglesWithUV[uvOffset + 9] = v2y;
+      trianglesWithUV[uvOffset + 10] = v2z;
+      trianglesWithUV[uvOffset + 11] = 0;
+      if (uvs && uvs.length > 0) {
+        trianglesWithUV[uvOffset + 12] = uvs[i0 * 2 + 0] ?? 0;
+        trianglesWithUV[uvOffset + 13] = uvs[i0 * 2 + 1] ?? 0;
+        trianglesWithUV[uvOffset + 14] = uvs[i1 * 2 + 0] ?? 0;
+        trianglesWithUV[uvOffset + 15] = uvs[i1 * 2 + 1] ?? 0;
+        trianglesWithUV[uvOffset + 16] = uvs[i2 * 2 + 0] ?? 0;
+        trianglesWithUV[uvOffset + 17] = uvs[i2 * 2 + 1] ?? 0;
+      }
+      trianglesWithUV[uvOffset + 18] = 0;
+      trianglesWithUV[uvOffset + 19] = 0;
+      const triOffset = i * 12;
+      triangles[triOffset + 0] = v0x;
+      triangles[triOffset + 1] = v0y;
+      triangles[triOffset + 2] = v0z;
+      triangles[triOffset + 3] = 0;
+      triangles[triOffset + 4] = v1x;
+      triangles[triOffset + 5] = v1y;
+      triangles[triOffset + 6] = v1z;
+      triangles[triOffset + 7] = 0;
+      triangles[triOffset + 8] = v2x;
+      triangles[triOffset + 9] = v2y;
+      triangles[triOffset + 10] = v2z;
+      triangles[triOffset + 11] = 0;
+    }
+    const materials = input.materials ?? [
+      { alphaMode: 0, alphaCutoff: 0.5, textureIndex: -1, albedo: [0.7, 0.7, 0.7], metallic: 0, roughness: 1, emissive: [0, 0, 0] }
+    ];
+    const packedMaterials = this.packMaterials(materials);
+    const hasAlphaTest = materials.some((m) => m.alphaMode === 1);
+    return {
+      nodes: packedNodes,
+      triangles,
+      trianglesWithUV,
+      materials: packedMaterials,
+      nodeCount: totalNodeCount,
+      triangleCount,
+      materialCount: materials.length,
+      hasAlphaTest
+    };
+  }
+  packMaterials(materials) {
+    if (materials.length === 0) {
+      return new Float32Array([0, 0.5, -1, 0, 0.7, 0.7, 0.7, 1, 0, 0, 0, 0]);
+    }
+    const packed = new Float32Array(materials.length * 12);
+    const view = new DataView(packed.buffer);
+    for (let i = 0;i < materials.length; i++) {
+      const mat = materials[i];
+      const offset = i * 12;
+      view.setUint32(offset * 4, mat.alphaMode, true);
+      packed[offset + 1] = mat.alphaCutoff;
+      view.setInt32((offset + 2) * 4, mat.textureIndex, true);
+      packed[offset + 3] = mat.metallic ?? 0;
+      packed[offset + 4] = mat.albedo?.[0] ?? 0.7;
+      packed[offset + 5] = mat.albedo?.[1] ?? 0.7;
+      packed[offset + 6] = mat.albedo?.[2] ?? 0.7;
+      packed[offset + 7] = mat.roughness ?? 1;
+      packed[offset + 8] = mat.emissive?.[0] ?? 0;
+      packed[offset + 9] = mat.emissive?.[1] ?? 0;
+      packed[offset + 10] = mat.emissive?.[2] ?? 0;
+      packed[offset + 11] = 0;
+    }
+    return packed;
+  }
+  destroy() {
+    this.radixSort.destroy();
+    this.initialized = false;
+  }
+}
+
 // ../../src/raytracing/SoftwareRT.ts
 var BVH_TRAVERSAL_SHADER = `
 // BVH Node (8 floats, 32 bytes)
@@ -32854,10 +34522,24 @@ struct CameraUniforms {
 }
 @group(0) @binding(3) var<uniform> camera: CameraUniforms;
 
+// Shading uniforms (light direction, colors, etc.)
+struct ShadingUniforms {
+  light_direction: vec3f,
+  light_intensity: f32,
+  light_color: vec3f,
+  ambient_intensity: f32,
+  ground_color: vec3f,
+  shading_mode: u32,  // 0 = normal viz, 1 = diffuse, 2 = diffuse + specular
+  object_color: vec3f,
+  _pad: f32,
+}
+@group(0) @binding(4) var<uniform> shading: ShadingUniforms;
+
 // Constants
 const STACK_SIZE: u32 = 32u;
 const T_MAX: f32 = 1e30;
 const EPSILON: f32 = 1e-6;
+const INTERNAL_FLAG: u32 = 0x80000000u; // High bit indicates internal node
 
 /**
  * Ray-AABB intersection test (slab method)
@@ -32963,7 +34645,10 @@ fn traverse_bvh(ray: Ray) -> HitInfo {
       continue; // Skip this subtree
     }
 
-    if (node.right_or_count > 0u) {
+    // Check if internal node (high bit set) or leaf node (high bit clear)
+    let is_internal = (node.right_or_count & INTERNAL_FLAG) != 0u;
+
+    if (!is_internal) {
       // Leaf node - test triangles
       let first = node.left_or_first;
       let count = node.right_or_count;
@@ -32979,7 +34664,7 @@ fn traverse_bvh(ray: Ray) -> HitInfo {
       // Internal node - push children in near-to-far order
       // This improves culling efficiency significantly
       let left = node.left_or_first;
-      let right = left + 1u;
+      let right = node.right_or_count & ~INTERNAL_FLAG; // Clear high bit to get actual index
 
       // Determine which child is closer along the ray's dominant axis
       let left_node = bvh_nodes[left];
@@ -33037,6 +34722,96 @@ fn traverse_bvh(ray: Ray) -> HitInfo {
 }
 
 /**
+ * Trace shadow ray - returns true if occluded (in shadow)
+ * Simplified BVH traversal for shadow rays (any-hit query).
+ */
+fn trace_shadow_ray(origin: vec3f, light_dir: vec3f, max_dist: f32) -> bool {
+  var shadow_ray: Ray;
+  shadow_ray.origin = origin;
+  shadow_ray.direction = light_dir;
+
+  // Stack for iterative traversal
+  var stack: array<u32, STACK_SIZE>;
+  var stack_ptr: u32 = 0u;
+
+  // Start at root
+  stack[0] = 0u;
+  stack_ptr = 1u;
+
+  while (stack_ptr > 0u) {
+    stack_ptr -= 1u;
+    let node_idx = stack[stack_ptr];
+    let node = bvh_nodes[node_idx];
+
+    // Inline AABB intersection test for shadow rays
+    let inv_dir = 1.0 / shadow_ray.direction;
+    let t1 = (node.aabb_min - shadow_ray.origin) * inv_dir;
+    let t2 = (node.aabb_max - shadow_ray.origin) * inv_dir;
+    let t_min_v = min(t1, t2);
+    let t_max_v = max(t1, t2);
+    let t_near = max(max(t_min_v.x, t_min_v.y), t_min_v.z);
+    let t_far = min(min(t_max_v.x, t_max_v.y), t_max_v.z);
+
+    // Skip if box is missed or too far
+    if (t_far < max(t_near, 0.0) || t_near > max_dist) {
+      continue;
+    }
+
+    // Check if internal node (high bit set) or leaf node (high bit clear)
+    let is_internal = (node.right_or_count & INTERNAL_FLAG) != 0u;
+
+    if (!is_internal) {
+      // Leaf node - test triangles
+      let first = node.left_or_first;
+      let count = node.right_or_count;
+
+      for (var i = 0u; i < count; i++) {
+        let tri_idx = first + i;
+        let tri = triangles[tri_idx];
+
+        // Inline Möller-Trumbore intersection for shadow rays
+        let edge1 = tri.v1 - tri.v0;
+        let edge2 = tri.v2 - tri.v0;
+        let h = cross(shadow_ray.direction, edge2);
+        let a = dot(edge1, h);
+
+        if (abs(a) > EPSILON) {
+          let f = 1.0 / a;
+          let s = shadow_ray.origin - tri.v0;
+          let u = f * dot(s, h);
+
+          if (u >= 0.0 && u <= 1.0) {
+            let q = cross(s, edge1);
+            let v = f * dot(shadow_ray.direction, q);
+
+            if (v >= 0.0 && u + v <= 1.0) {
+              let t = f * dot(edge2, q);
+              // Any hit within range = in shadow
+              if (t > EPSILON && t < max_dist) {
+                return true;
+              }
+            }
+          }
+        }
+      }
+    } else {
+      // Internal node - push both children
+      let left = node.left_or_first;
+      let right = node.right_or_count & ~INTERNAL_FLAG;
+
+      if (stack_ptr < STACK_SIZE - 1u) {
+        stack[stack_ptr] = right;
+        stack_ptr += 1u;
+        stack[stack_ptr] = left;
+        stack_ptr += 1u;
+      }
+    }
+  }
+
+  return false; // Not occluded - lit
+}
+
+/**
  * Generate camera ray for pixel using inverse view/projection matrices
  */
 fn generate_ray(pixel: vec2u, size: vec2u) -> Ray {
@@ -33055,17 +34830,37 @@ fn generate_ray(pixel: vec2u, size: vec2u) -> Ray {
 }
 
 /**
- * Simple shading - normal visualization
- * On hit: color = normal * 0.5 + 0.5 (remap to RGB)
- * On miss: sky gradient
+ * Shading function with RAY-TRACED SHADOWS
+ * Mode 0: Normal visualization
+ * Mode 1: Diffuse lighting + RT shadows
+ * Mode 2: Diffuse + specular + RT shadows (default)
+ *
+ * The key feature: we trace shadow rays to determine if surfaces
+ * are lit or in shadow - this is real ray tracing, not rasterization!
  */
 fn shade(ray: Ray, hit: HitInfo) -> vec4f {
   if (hit.triangle_id < 0) {
-    // Sky gradient based on ray Y direction
+    // Sky gradient based on ray Y direction and light direction
     let t = ray.direction.y * 0.5 + 0.5;
-    let sky_top = vec3f(0.5, 0.7, 1.0);
-    let sky_bottom = vec3f(1.0, 1.0, 1.0);
-    return vec4f(mix(sky_bottom, sky_top, t), 1.0);
+
+    // Day sky colors influenced by sun position
+    let sun_height = max(0.0, shading.light_direction.y);
+
+    // Sunset/sunrise tint when sun is low
+    let sunset_factor = 1.0 - smoothstep(0.0, 0.3, sun_height);
+
+    let sky_top = mix(vec3f(0.1, 0.15, 0.4), vec3f(0.4, 0.6, 1.0), sun_height);
+    let sky_bottom = mix(vec3f(0.8, 0.4, 0.2), vec3f(0.8, 0.85, 0.95), sun_height);
+    let sky_color = mix(sky_bottom, sky_top, t);
+
+    // Add sun disc
+    let sun_dir = normalize(shading.light_direction);
+    let sun_dot = dot(ray.direction, sun_dir);
+    let sun_disc = smoothstep(0.995, 0.999, sun_dot) * shading.light_intensity;
+    let sun_glow = pow(max(0.0, sun_dot), 256.0) * 0.5 * sun_height;
+
+    let final_sky = sky_color + shading.light_color * (sun_disc + sun_glow);
+    return vec4f(final_sky, 1.0);
   }
 
   // Get triangle for normal calculation
@@ -33079,8 +34874,79 @@ fn shade(ray: Ray, hit: HitInfo) -> vec4f {
     normal = -normal;
   }
 
-  // Normal visualization (remap -1..1 to 0..1)
-  return vec4f(normal * 0.5 + 0.5, 1.0);
+  // Mode 0: Normal visualization
+  if (shading.shading_mode == 0u) {
+    return vec4f(normal * 0.5 + 0.5, 1.0);
+  }
+
+  // Calculate hit position
+  let hit_pos = ray.origin + ray.direction * hit.t;
+
+  // Determine base color based on surface orientation and position
+  var base_color = shading.object_color;
+
+  // Check if this is ground (normal pointing mostly up, low Y position)
+  let is_ground = normal.y > 0.9 && hit_pos.y < 0.1;
+  if (is_ground) {
+    // Checkerboard pattern for ground
+    let grid_scale = 1.0;
+    let checker = floor(hit_pos.x * grid_scale) + floor(hit_pos.z * grid_scale);
+    let checker_mod = checker - floor(checker / 2.0) * 2.0;
+    let checker_color = select(shading.ground_color * 0.7, shading.ground_color, checker_mod > 0.5);
+    base_color = checker_color;
+  } else {
+    // Vary color by triangle ID for visual interest if using default color
+    if (shading.object_color.x == 0.8 && shading.object_color.y == 0.8 && shading.object_color.z == 0.8) {
+      let tri_hash = f32(hit.triangle_id % 7) / 7.0;
+      base_color = vec3f(
+        0.5 + 0.3 * sin(tri_hash * 6.28),
+        0.5 + 0.3 * sin(tri_hash * 6.28 + 2.0),
+        0.5 + 0.3 * sin(tri_hash * 6.28 + 4.0)
+      );
+    }
+  }
+
+  // Light direction
+  let light_dir = normalize(shading.light_direction);
+
+  // =========================================================
+  // RAY-TRACED SHADOW: Trace a ray from hit point toward light
+  // This is the KEY RT feature - accurate shadow determination
+  // =========================================================
+  let shadow_bias = 0.001; // Offset to avoid self-intersection
+  let shadow_origin = hit_pos + normal * shadow_bias;
+  let in_shadow = trace_shadow_ray(shadow_origin, light_dir, 1000.0);
+
+  // Shadow factor: 0.0 = fully shadowed, 1.0 = fully lit
+  let shadow_factor = select(1.0, 0.0, in_shadow);
+
+  // Ambient lighting (always present, even in shadow)
+  let ambient = shading.ambient_intensity * base_color;
+
+  // Hemisphere ambient for more natural lighting
+  let sky_ambient = vec3f(0.3, 0.4, 0.5) * 0.1 * max(0.0, normal.y);
+  let ground_ambient = vec3f(0.2, 0.15, 0.1) * 0.05 * max(0.0, -normal.y);
+  let hemi_ambient = sky_ambient + ground_ambient;
+
+  // Diffuse lighting (Lambertian) - affected by shadow
+  let n_dot_l = max(dot(normal, light_dir), 0.0);
+  let diffuse = n_dot_l * shading.light_intensity * shading.light_color * base_color * shadow_factor;
+
+  // Mode 1: Diffuse only with RT shadows
+  if (shading.shading_mode == 1u) {
+    return vec4f(ambient + hemi_ambient * base_color + diffuse, 1.0);
+  }
+
+  // Mode 2: Diffuse + Specular with RT shadows
+  let view_dir = normalize(-ray.direction);
+  let half_vec = normalize(light_dir + view_dir);
+  let n_dot_h = max(dot(normal, half_vec), 0.0);
+  let shininess = 32.0;
+  let specular_strength = 0.3;
+  // Specular is also affected by shadow (no specular highlight in shadow)
+  let specular = pow(n_dot_h, shininess) * specular_strength * shading.light_intensity * shading.light_color * shadow_factor;
+
+  return vec4f(ambient + hemi_ambient * base_color + diffuse + specular, 1.0);
 }
 
 @compute @workgroup_size(8, 8, 1)
@@ -33106,9 +34972,24 @@ class SoftwareRT {
   bindGroupLayout = null;
   initialized = false;
   _initPromise;
+  builderType = "cpu";
+  gpuBuilder = null;
+  lastBuildTimeMs = 0;
   constructor(device) {
     this.device = device;
     this._initPromise = this.initializeShaders();
+  }
+  setBuilderType(type) {
+    if (type === "gpu") {
+      console.warn("[SoftwareRT] GPU BVH builder is currently disabled (O(n²) scatter performance issue). Using CPU builder.");
+    }
+    this.builderType = "cpu";
+  }
+  getBuilderType() {
+    return this.builderType;
+  }
+  getLastBuildTime() {
+    return this.lastBuildTimeMs;
   }
   async ready() {
     await this._initPromise;
@@ -33142,6 +35023,11 @@ class SoftwareRT {
           },
           {
             binding: 3,
+            visibility: GPUShaderStage.COMPUTE,
+            buffer: { type: "uniform" }
+          },
+          {
+            binding: 4,
             visibility: GPUShaderStage.COMPUTE,
             buffer: { type: "uniform" }
           }
@@ -33179,7 +35065,7 @@ class SoftwareRT {
       vertexOffset: options.vertexOffset ?? 0
     };
   }
-  createBLAS(geometries) {
+  mergeGeometries(geometries) {
     let totalVertices = 0;
     let totalIndices = 0;
     for (const geom of geometries) {
@@ -33217,7 +35103,14 @@ class SoftwareRT {
       vertexOffset += vertexCount * 3;
       vertexIndexOffset += vertexCount;
     }
-    const bvh = buildBVH(mergedVertices, mergedIndices);
+    return { vertices: mergedVertices, indices: mergedIndices };
+  }
+  createBLAS(geometries) {
+    const { vertices, indices } = this.mergeGeometries(geometries);
+    const startTime = performance.now();
+    const bvh = buildBVH(vertices, indices);
+    this.lastBuildTimeMs = performance.now() - startTime;
+    console.log(`[SoftwareRT] CPU BVH built in ${this.lastBuildTimeMs.toFixed(1)}ms`);
     const nodesBuffer = this.device.createBuffer({
       label: "BVH Nodes Buffer",
       size: bvh.nodes.byteLength,
@@ -33240,6 +35133,42 @@ class SoftwareRT {
       _type: "blas",
       _handle: handle
     };
+  }
+  async createBLASAsync(geometries) {
+    const { vertices, indices } = this.mergeGeometries(geometries);
+    if (this.builderType === "gpu") {
+      if (!this.gpuBuilder) {
+        this.gpuBuilder = new GPUBVHBuilder(this.device);
+      }
+      await this.gpuBuilder.init();
+      const result = await this.gpuBuilder.build({ vertices, indices });
+      this.lastBuildTimeMs = result.buildTimeMs ?? 0;
+      console.log(`[SoftwareRT] GPU BVH built in ${this.lastBuildTimeMs.toFixed(1)}ms`);
+      const nodesBuffer = this.device.createBuffer({
+        label: "BVH Nodes Buffer",
+        size: result.nodes.byteLength,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
+      });
+      this.device.queue.writeBuffer(nodesBuffer, 0, result.nodes.buffer);
+      const trianglesBuffer = this.device.createBuffer({
+        label: "Triangles Buffer",
+        size: result.triangles.byteLength,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
+      });
+      this.device.queue.writeBuffer(trianglesBuffer, 0, result.triangles.buffer);
+      const handle = {
+        nodesBuffer,
+        trianglesBuffer,
+        nodeCount: result.nodeCount,
+        triangleCount: result.triangleCount
+      };
+      return {
+        _type: "blas",
+        _handle: handle
+      };
+    } else {
+      return this.createBLAS(geometries);
+    }
   }
   createTLAS(instances) {
     if (instances.length === 0) {
@@ -33269,7 +35198,7 @@ class SoftwareRT {
       console.warn("[SoftwareRT] Shader not yet initialized, skipping trace");
       return;
     }
-    const { tlas, width, height, outputTexture, camera } = options;
+    const { tlas, width, height, outputTexture, camera, shading } = options;
     const tlasHandle = tlas._handle;
     const cameraData = new Float32Array(32);
     if (camera) {
@@ -33299,6 +35228,39 @@ class SoftwareRT {
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
     });
     this.device.queue.writeBuffer(cameraBuffer, 0, cameraData);
+    const shadingData = new Float32Array(16);
+    const lightDir = shading?.lightDirection ?? new Float32Array([0.5, 0.8, 0.3]);
+    const lightIntensity = shading?.lightIntensity ?? 1;
+    const lightColor = shading?.lightColor ?? new Float32Array([1, 0.98, 0.9]);
+    const ambientIntensity = shading?.ambientIntensity ?? 0.15;
+    const groundColor = shading?.groundColor ?? new Float32Array([0.4, 0.5, 0.3]);
+    const shadingMode = shading?.shadingMode ?? 2;
+    const objectColor = shading?.objectColor ?? new Float32Array([0.8, 0.8, 0.8]);
+    const ldx = lightDir[0], ldy = lightDir[1], ldz = lightDir[2];
+    const ldLen = Math.sqrt(ldx * ldx + ldy * ldy + ldz * ldz);
+    shadingData[0] = ldx / ldLen;
+    shadingData[1] = ldy / ldLen;
+    shadingData[2] = ldz / ldLen;
+    shadingData[3] = lightIntensity;
+    shadingData[4] = lightColor[0];
+    shadingData[5] = lightColor[1];
+    shadingData[6] = lightColor[2];
+    shadingData[7] = ambientIntensity;
+    shadingData[8] = groundColor[0];
+    shadingData[9] = groundColor[1];
+    shadingData[10] = groundColor[2];
+    const shadingDataView = new DataView(shadingData.buffer);
+    shadingDataView.setUint32(11 * 4, shadingMode, true);
+    shadingData[12] = objectColor[0];
+    shadingData[13] = objectColor[1];
+    shadingData[14] = objectColor[2];
+    shadingData[15] = 0;
+    const shadingBuffer = this.device.createBuffer({
+      label: "Shading Uniforms",
+      size: 64,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+    });
+    this.device.queue.writeBuffer(shadingBuffer, 0, shadingData);
     const outputView = outputTexture.createView();
     const bindGroup = this.device.createBindGroup({
       label: "RT Bind Group",
@@ -33307,7 +35269,8 @@ class SoftwareRT {
         { binding: 0, resource: { buffer: tlasHandle.primaryBLAS.nodesBuffer } },
         { binding: 1, resource: { buffer: tlasHandle.primaryBLAS.trianglesBuffer } },
         { binding: 2, resource: outputView },
-        { binding: 3, resource: { buffer: cameraBuffer } }
+        { binding: 3, resource: { buffer: cameraBuffer } },
+        { binding: 4, resource: { buffer: shadingBuffer } }
       ]
     });
     const commandEncoder = this.device.createCommandEncoder({
@@ -33324,6 +35287,7 @@ class SoftwareRT {
     computePass.end();
     this.device.queue.submit([commandEncoder.finish()]);
     cameraBuffer.destroy();
+    shadingBuffer.destroy();
   }
   invertMatrix4(m) {
     const out = new Float32Array(16);
@@ -33369,6 +35333,13 @@ class SoftwareRT {
     handle.trianglesBuffer.destroy();
   }
   destroyTLAS(_tlas) {}
+  getBVHBuffers(blas) {
+    const handle = blas._handle;
+    return {
+      nodesBuffer: handle.nodesBuffer,
+      trianglesBuffer: handle.trianglesBuffer
+    };
+  }
 }
 
 // examples/internal/threejs-rt/threejs-rt-hardware.ts
