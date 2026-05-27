@@ -1378,6 +1378,23 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuDevice, void
                                 return g_engine->newUndefined();
                             }
 
+                            // Detect the destination texture format. In a real browser,
+                            // copyExternalImageToTexture converts the source's RGBA pixels into the
+                            // destination's format; we upload bytes verbatim via writeTexture, so for
+                            // BGRA8 destinations we must swap the R/B channels ourselves. Our
+                            // ImageBitmap data is always RGBA (stb_image / WebPDecodeRGBA), but PixiJS
+                            // v8's TextureSource.defaultOptions.format is "bgra8unorm", so every
+                            // Texture.from(imageBitmap) lands here — without the swap, red and blue
+                            // come out transposed.
+                            bool swapRB = false;
+                            {
+                                auto fmtProp = g_engine->getProperty(textureObj, "format");
+                                if (!g_engine->isUndefined(fmtProp)) {
+                                    std::string fmt = g_engine->toString(fmtProp);
+                                    swapRB = (fmt == "bgra8unorm" || fmt == "bgra8unorm-srgb");
+                                }
+                            }
+
                             // Optional mipLevel and origin
                             uint32_t mipLevel = 0;
                             auto mipLevelVal = g_engine->getProperty(destination, "mipLevel");
@@ -1412,24 +1429,34 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuDevice, void
                                 if (!g_engine->isUndefined(heightVal)) height = (uint32_t)g_engine->toNumber(heightVal);
                             }
 
-                            // Handle flipY and/or premultipliedAlpha by writing into a staging copy.
-                            // RGBA8 only (matches the hardcoded bytesPerRow below).
+                            // Handle flipY, premultipliedAlpha, and/or BGRA channel swap by writing
+                            // into a staging copy. RGBA8 only (matches the hardcoded bytesPerRow below).
                             std::vector<uint8_t> stagingData;
                             void* uploadDataPtr = dataPtr;
-                            if ((flipY || premultipliedAlpha) && dataPtr && imgHeight > 0 && imgWidth > 0) {
+                            if ((flipY || premultipliedAlpha || swapRB) && dataPtr && imgHeight > 0 && imgWidth > 0) {
                                 size_t bytesPerRow = (size_t)imgWidth * 4;
                                 stagingData.resize(dataSize);
                                 const uint8_t* srcData = static_cast<const uint8_t*>(dataPtr);
                                 for (int y = 0; y < imgHeight; y++) {
                                     const uint8_t* srcRow = srcData + (flipY ? (imgHeight - 1 - y) : y) * bytesPerRow;
                                     uint8_t* dstRow = stagingData.data() + (size_t)y * bytesPerRow;
-                                    if (premultipliedAlpha) {
+                                    if (premultipliedAlpha || swapRB) {
                                         for (int x = 0; x < imgWidth; x++) {
+                                            uint32_t r = srcRow[x * 4 + 0];
+                                            uint32_t g = srcRow[x * 4 + 1];
+                                            uint32_t b = srcRow[x * 4 + 2];
                                             uint32_t a = srcRow[x * 4 + 3];
-                                            // (v * a + 127) / 255 rounds correctly without a divide instruction
-                                            dstRow[x * 4 + 0] = (uint8_t)((srcRow[x * 4 + 0] * a + 127) / 255);
-                                            dstRow[x * 4 + 1] = (uint8_t)((srcRow[x * 4 + 1] * a + 127) / 255);
-                                            dstRow[x * 4 + 2] = (uint8_t)((srcRow[x * 4 + 2] * a + 127) / 255);
+                                            if (premultipliedAlpha) {
+                                                // (v * a + 127) / 255 rounds correctly without a divide instruction
+                                                r = (r * a + 127) / 255;
+                                                g = (g * a + 127) / 255;
+                                                b = (b * a + 127) / 255;
+                                            }
+                                            // BGRA8 destinations read byte 0 as B and byte 2 as R, so emit
+                                            // the channels swapped; RGBA8 destinations get them in order.
+                                            dstRow[x * 4 + 0] = (uint8_t)(swapRB ? b : r);
+                                            dstRow[x * 4 + 1] = (uint8_t)g;
+                                            dstRow[x * 4 + 2] = (uint8_t)(swapRB ? r : b);
                                             dstRow[x * 4 + 3] = (uint8_t)a;
                                         }
                                     } else {
@@ -1440,7 +1467,8 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuDevice, void
                                 if (g_verboseLogging) {
                                     std::cout << "[WebGPU] copyExternalImageToTexture: "
                                               << (flipY ? "flipY " : "")
-                                              << (premultipliedAlpha ? "premultiplyAlpha" : "")
+                                              << (premultipliedAlpha ? "premultiplyAlpha " : "")
+                                              << (swapRB ? "swapRB" : "")
                                               << std::endl;
                                 }
                             }
