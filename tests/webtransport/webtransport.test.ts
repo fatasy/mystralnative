@@ -2,8 +2,9 @@
  * WebTransport API end-to-end tests.
  *
  * These exercise the native WebTransport implementation (QUIC + HTTP/3 via
- * quiche) against a real WebTransport echo server (a small Rust `wtransport`
- * fixture). They validate the full client surface:
+ * quiche) against a real WebTransport echo server (the small Rust `wtransport`
+ * server shipped at `examples/webtransport/server`). They validate the full
+ * client surface:
  *   - connection lifecycle (ready)
  *   - datagrams (send + receive echo)
  *   - bidirectional streams (send + receive echo)
@@ -12,7 +13,7 @@
  * Requirements (the suite skips cleanly if any are missing):
  *   - The `mystral` binary built WITH quiche (MYSTRAL_HAS_QUICHE). WebTransport
  *     is feature-detected at runtime by attempting a connection.
- *   - A Rust toolchain (`cargo`) to build the echo-server fixture.
+ *   - A Rust toolchain (`cargo`) to build the echo server.
  *
  * Because they need a Rust toolchain and a live UDP server, these are NOT part
  * of the default CI `bun test tests/ci` run; run them explicitly with
@@ -25,8 +26,10 @@ import { existsSync, mkdirSync, writeFileSync, rmSync } from "fs";
 import { join } from "path";
 
 const MYSTRAL_BIN = join(import.meta.dir, "../../build/mystral");
-const FIXTURE_DIR = join(import.meta.dir, "fixtures/wt-echo-server");
-const SERVER_BIN = join(FIXTURE_DIR, "target/release/wt-echo-server");
+// The echo server lives with the runnable example so users can verify
+// WebTransport themselves (see examples/webtransport/README.md).
+const SERVER_DIR = join(import.meta.dir, "../../examples/webtransport/server");
+const SERVER_BIN = join(SERVER_DIR, "target/release/wt-echo-server");
 const TEST_DIR = join(import.meta.dir, "../../.test-tmp/webtransport");
 const SERVER_URL = "https://127.0.0.1:4433/echo";
 
@@ -40,10 +43,10 @@ let serverProc: ReturnType<typeof spawn> | null = null;
 
 async function startServer(): Promise<boolean> {
   if (!existsSync(SERVER_BIN)) {
-    console.log("Building WebTransport echo-server fixture (cargo)...");
-    const build = spawnSync(["cargo", "build", "--release"], { cwd: FIXTURE_DIR });
+    console.log("Building WebTransport echo server (cargo)...");
+    const build = spawnSync(["cargo", "build", "--release"], { cwd: SERVER_DIR });
     if (build.exitCode !== 0) {
-      console.log("Fixture build failed:", build.stderr?.toString());
+      console.log("Echo server build failed:", build.stderr?.toString());
       return false;
     }
   }
@@ -108,7 +111,7 @@ describe("WebTransport API", () => {
       return;
     }
     if (!hasCargo) {
-      console.log("Skipping: cargo not available to build the echo-server fixture.");
+      console.log("Skipping: cargo not available to build the echo server.");
       return;
     }
     const started = await startServer();

@@ -77,10 +77,11 @@ supporting `getReader().read()` and `getWriter().write()/close()/abort()`.
 
 ## Testing
 
-A Rust `wtransport`-based echo server fixture lives at
-`tests/webtransport/fixtures/wt-echo-server`. The end-to-end suite
-(`tests/webtransport/webtransport.test.ts`) builds it, starts it, and verifies
-datagrams, bidirectional streams, and unidirectional streams round-trip:
+A Rust `wtransport`-based echo server ships alongside the runnable example at
+`examples/webtransport/server` (see `examples/webtransport/README.md`). The
+end-to-end suite (`tests/webtransport/webtransport.test.ts`) builds it, starts
+it, and verifies datagrams, bidirectional streams, and unidirectional streams
+round-trip:
 
 ```bash
 bun test tests/webtransport
@@ -89,8 +90,11 @@ bun test tests/webtransport
 You can also run the example manually (start the echo server first):
 
 ```bash
-cargo run --release --manifest-path tests/webtransport/fixtures/wt-echo-server/Cargo.toml
-./build/mystral run examples/webtransport-test.js --headless
+# Terminal 1: start the echo server
+cargo run --release --manifest-path examples/webtransport/server/Cargo.toml
+
+# Terminal 2: run the example against it
+./build/mystral run examples/webtransport/webtransport-test.js --headless
 ```
 
 ## Roadmap: WebSockets & WebRTC
