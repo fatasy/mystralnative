@@ -858,6 +858,13 @@ endif()
 # Rust/BoringSSL itself. WebTransport is disabled (stubbed) if the library is
 # not present, so the build still succeeds without it.
 # Prebuilt layout: quiche/include/quiche.h, quiche/libquiche.a (or quiche.lib)
+#
+# Mobile: library-builder also produces iOS/Android libquiche prebuilts
+# (quiche-ios/<variant>, quiche-android/<abi>; fetched via download-deps --ios/
+# --android). They are intentionally NOT linked here yet: WebTransport also needs
+# libuv (MYSTRAL_HAS_LIBUV), which is desktop-only today. Once libuv is available
+# on mobile, extend this block to select the per-arch mobile libquiche and drop
+# the `NOT IOS AND NOT ANDROID` guard. See docs/realtimecommunication.md.
 option(MYSTRAL_USE_QUICHE "Enable QUIC/HTTP3 WebTransport via quiche" ON)
 set(QUICHE_DIR ${THIRD_PARTY_DIR}/quiche)
 if(MYSTRAL_USE_QUICHE AND EXISTS ${QUICHE_DIR} AND NOT IOS AND NOT ANDROID)
@@ -884,6 +891,8 @@ if(MYSTRAL_USE_QUICHE AND EXISTS ${QUICHE_DIR} AND NOT IOS AND NOT ANDROID)
 else()
     if(MYSTRAL_USE_QUICHE AND NOT IOS AND NOT ANDROID)
         message(STATUS "quiche not found - WebTransport disabled. Run 'node scripts/download-deps.mjs --only quiche' to enable.")
+    elseif(MYSTRAL_USE_QUICHE AND (IOS OR ANDROID))
+        message(STATUS "quiche on mobile: libquiche prebuilt available but WebTransport stays disabled until libuv lands on mobile (see docs/realtimecommunication.md).")
     endif()
 endif()
 

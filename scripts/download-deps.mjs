@@ -160,9 +160,9 @@ const DEPS = {
     // repo never compiles Rust/BoringSSL itself. If no prebuilt exists for this
     // platform/arch, the C++ build compiles a WebTransport stub (MYSTRAL_HAS_QUICHE off).
     // https://github.com/mystralengine/library-builder/releases
-    version: 'quiche-0.24.6-1',
+    version: 'quiche-0.24.6-2',
     getUrl: () => {
-      const baseUrl = 'https://github.com/mystralengine/library-builder/releases/download/quiche-0.24.6-1';
+      const baseUrl = 'https://github.com/mystralengine/library-builder/releases/download/quiche-0.24.6-2';
       if (platformName === 'macos') {
         const arch = ARCH === 'arm64' ? 'arm64' : 'x86_64';
         return `${baseUrl}/quiche-mac-${arch}.zip`;
@@ -183,6 +183,34 @@ const DEPS = {
       return null;
     },
     extractTo: 'quiche',
+  },
+  'quiche-ios': {
+    // quiche (QUIC + HTTP/3) iOS prebuilts from library-builder.
+    // device (arm64) + simulator (arm64 + x86_64). Each archive contains
+    // libquiche.a + include/quiche.h. Extracts to third_party/quiche-ios/<variant>/.
+    // https://github.com/mystralengine/library-builder/releases
+    version: 'quiche-0.24.6-2',
+    getUrl: () => null, // multi-archive, handled by downloadIosDep
+    extractTo: 'quiche-ios',
+    archives: {
+      device: 'https://github.com/mystralengine/library-builder/releases/download/quiche-0.24.6-2/quiche-ios-arm64.zip',
+      simulatorArm64: 'https://github.com/mystralengine/library-builder/releases/download/quiche-0.24.6-2/quiche-ios-sim-arm64.zip',
+      simulatorX64: 'https://github.com/mystralengine/library-builder/releases/download/quiche-0.24.6-2/quiche-ios-sim-x64.zip',
+    },
+  },
+  'quiche-android': {
+    // quiche (QUIC + HTTP/3) Android prebuilts from library-builder.
+    // arm64-v8a + armeabi-v7a + x86_64. Each archive contains libquiche.a +
+    // include/quiche.h. Extracts to third_party/quiche-android/<variant>/.
+    // https://github.com/mystralengine/library-builder/releases
+    version: 'quiche-0.24.6-2',
+    getUrl: () => null, // multi-archive, handled by downloadIosDep
+    extractTo: 'quiche-android',
+    archives: {
+      aarch64: 'https://github.com/mystralengine/library-builder/releases/download/quiche-0.24.6-2/quiche-android-arm64.zip',
+      armv7: 'https://github.com/mystralengine/library-builder/releases/download/quiche-0.24.6-2/quiche-android-armv7.zip',
+      x86_64: 'https://github.com/mystralengine/library-builder/releases/download/quiche-0.24.6-2/quiche-android-x64.zip',
+    },
   },
   stb: {
     // stb single-header libraries from nothings/stb
@@ -721,10 +749,10 @@ async function main() {
   const desktopDeps = ['wgpu', 'sdl3', 'dawn', 'v8', 'quickjs', 'stb', 'cgltf', 'webp', 'skia', 'swc', 'libuv', 'draco', 'quiche'];
 
   // iOS deps (only downloaded with --only or --ios)
-  const iosDeps = ['wgpu-ios', 'skia-ios'];
+  const iosDeps = ['wgpu-ios', 'skia-ios', 'quiche-ios'];
 
   // Android deps (only downloaded with --only or --android)
-  const androidDeps = ['wgpu-android', 'sdl3-android'];
+  const androidDeps = ['wgpu-android', 'sdl3-android', 'quiche-android'];
 
   // Windows-specific deps (only downloaded with --only)
   // skia-win-static: Static Skia+Dawn build from library-builder with /MT
