@@ -6,6 +6,7 @@
 #include "mystral/js/module_system.h"
 #include "mystral/http/http_client.h"
 #include "mystral/http/async_http_client.h"
+#include "mystral/webtransport/webtransport.h"
 #include "mystral/fs/async_file.h"
 #include "mystral/fs/file_watcher.h"
 #include "mystral/gltf/gltf_loader.h"
@@ -406,6 +407,9 @@ public:
         // Set up fetch API
         setupFetch();
 
+        // Set up WebTransport API (QUIC/HTTP3 via quiche; stubbed if not built)
+        webtransport::initBindings(jsEngine_.get());
+
         // Set up URL parsing and Worker polyfill (needed for Draco decoder, etc.)
         setupURL();
 
@@ -465,6 +469,9 @@ public:
         // Initialize file watcher (uses libuv fs_event for hot reload)
         fs::getFileWatcher().init();
 
+        // Initialize WebTransport subsystem (QUIC sockets are created lazily)
+        webtransport::init();
+
         std::cout << "[Mystral] Runtime initialized" << std::endl;
         return true;
     }
@@ -487,6 +494,9 @@ public:
 
         // Shutdown file watcher
         fs::getFileWatcher().shutdown();
+
+        // Shut down WebTransport sessions (closes QUIC connections + uv handles)
+        webtransport::shutdown();
 
 #ifdef MYSTRAL_USE_LIBUV_TIMERS
         // Clean up libuv timers before shutting down the event loop
@@ -752,6 +762,9 @@ public:
         // Process completed async HTTP requests (invoke their JS callbacks)
         // This must be called after runOnce() to invoke callbacks safely on the main thread
         http::getAsyncHttpClient().processCompletedRequests();
+
+        // Drive WebTransport QUIC sessions and dispatch their JS events (main thread)
+        webtransport::processEvents();
 
         // Process completed async file reads (queues their callbacks)
         // Note: We don't process the pending callbacks immediately because we might

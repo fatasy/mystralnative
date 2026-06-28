@@ -1,0 +1,107 @@
+# WebTransport
+
+MystralNative implements the [WebTransport API](https://developer.mozilla.org/en-US/docs/Web/API/WebTransport_API),
+giving games low-latency client networking over HTTP/3 (QUIC) — the same API you
+would use in the browser. It supports both **unreliable datagrams** (UDP-like,
+for fast state updates) and **reliable streams** (ordered, for chat, RPC, asset
+transfer).
+
+WebTransport is implemented natively on top of [Cloudflare quiche](https://github.com/cloudflare/quiche)
+(QUIC + HTTP/3) running on the same libuv event loop used by `fetch` and timers.
+
+## Requirements
+
+- WebTransport is only available in builds compiled **with quiche**
+  (`MYSTRAL_HAS_QUICHE`). Run `node scripts/download-deps.mjs --only quiche` to
+  fetch and build it (needs a Rust toolchain + Go + CMake for BoringSSL). If
+  quiche is not present, `new WebTransport(...)` rejects its `ready`/`closed`
+  promises instead of connecting.
+- The server URL must use `https://` and an explicit port, e.g.
+  `https://example.com:4433/path`.
+
+## Quick start
+
+```js
+const transport = new WebTransport("https://127.0.0.1:4433/echo");
+await transport.ready;
+
+// Unreliable datagrams
+const writer = transport.datagrams.writable.getWriter();
+await writer.write(new Uint8Array([1, 2, 3]));
+
+const reader = transport.datagrams.readable.getReader();
+const { value } = await reader.read(); // Uint8Array from the server
+
+// Reliable bidirectional stream
+const stream = await transport.createBidirectionalStream();
+const sw = stream.writable.getWriter();
+await sw.write(new TextEncoder().encode("hello"));
+await sw.close();
+
+const sr = stream.readable.getReader();
+const chunk = await sr.read(); // { value, done }
+```
+
+## Supported surface
+
+| Feature | Status |
+| --- | --- |
+| `new WebTransport(url)` | ✅ |
+| `transport.ready` / `transport.closed` | ✅ |
+| `transport.close({ closeCode, reason })` | ✅ |
+| `transport.datagrams` (read + write) | ✅ |
+| `transport.createBidirectionalStream()` | ✅ |
+| `transport.createUnidirectionalStream()` | ✅ |
+| `transport.incomingUnidirectionalStreams` | ✅ |
+| `transport.incomingBidirectionalStreams` | ✅ |
+| `WebTransportError` | ✅ |
+| `serverCertificateHashes` (self-signed pinning) | ⏳ not yet — peer verification is currently disabled for local/dev servers |
+
+Streams are exposed as spec-shaped `ReadableStream` / `WritableStream` objects
+supporting `getReader().read()` and `getWriter().write()/close()/abort()`.
+
+## Architecture notes
+
+- quiche provides the QUIC transport and a thin HTTP/3 layer used only to perform
+  the WebTransport extended `CONNECT` handshake (`:protocol = webtransport`).
+- After the session is established, datagrams are carried as HTTP/3 datagrams
+  (RFC 9297, quarter-stream-id prefix) and streams as raw QUIC streams using the
+  WebTransport `0x41` / `0x54` signal framing.
+- WebTransport SETTINGS (`WT_MAX_SESSIONS`, etc.) are advertised via a small FFI
+  shim added to quiche (`quiche_h3_config_set_additional_settings`), applied as a
+  patch during `download-deps`.
+
+## Testing
+
+A Rust `wtransport`-based echo server fixture lives at
+`tests/webtransport/fixtures/wt-echo-server`. The end-to-end suite
+(`tests/webtransport/webtransport.test.ts`) builds it, starts it, and verifies
+datagrams, bidirectional streams, and unidirectional streams round-trip:
+
+```bash
+bun test tests/webtransport
+```
+
+You can also run the example manually (start the echo server first):
+
+```bash
+cargo run --release --manifest-path tests/webtransport/fixtures/wt-echo-server/Cargo.toml
+./build/mystral run examples/webtransport-test.js --headless
+```
+
+## Roadmap: WebSockets & WebRTC
+
+WebTransport is the first of a planned set of real-time networking APIs exposed
+through the JS layer. Tracked follow-ups (see
+[issue #17](https://github.com/mystralengine/mystralnative/issues/17)):
+
+- [ ] **WebSockets** (`WebSocket`) — reliable, ordered messaging over TCP/TLS.
+      Smaller surface than WebTransport and broadly supported by existing game
+      backends. Likely built on libuv TCP + a WebSocket framing layer.
+- [ ] **WebRTC** (`RTCPeerConnection`, `RTCDataChannel`) — peer-to-peer data
+      channels for player-hosted/mesh networking and NAT traversal. Larger
+      surface (ICE/STUN/TURN, SCTP-over-DTLS); evaluate `webrtc-rs` or libdatachannel
+      as the native backend.
+- [ ] **WebTransport `serverCertificateHashes`** — allow connecting to
+      self-signed servers with certificate pinning instead of disabling peer
+      verification.

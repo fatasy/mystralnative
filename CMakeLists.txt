@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(MystralNativeRuntime VERSION 0.1.3 LANGUAGES C CXX)
+project(MystralNativeRuntime VERSION 0.0.8 LANGUAGES C CXX)
 
 # Windows: Use /MT (static CRT) for all builds
 # Both Skia and Dawn (from library-builder) are built with /MT static CRT.
@@ -848,6 +848,43 @@ else()
     endif()
 endif()
 
+# ============================================================================
+# quiche (QUIC + HTTP/3, for the WebTransport API)
+# ============================================================================
+# quiche is a Rust library exposing a C API. We vendor the source and build a
+# static library (libquiche.a) with `cargo build --release --features ffi`.
+# download-deps.mjs clones + builds it. WebTransport is disabled (stubbed) if
+# the library is not present, so the build still succeeds without a Rust
+# toolchain.
+option(MYSTRAL_USE_QUICHE "Enable QUIC/HTTP3 WebTransport via quiche" ON)
+set(QUICHE_DIR ${THIRD_PARTY_DIR}/quiche)
+if(MYSTRAL_USE_QUICHE AND EXISTS ${QUICHE_DIR} AND NOT IOS AND NOT ANDROID)
+    set(QUICHE_INCLUDE_DIR ${QUICHE_DIR}/quiche/include)
+    if(WIN32)
+        set(QUICHE_LIB_PATH ${QUICHE_DIR}/target/release/quiche.lib)
+    else()
+        set(QUICHE_LIB_PATH ${QUICHE_DIR}/target/release/libquiche.a)
+    endif()
+
+    if(EXISTS ${QUICHE_LIB_PATH} AND EXISTS ${QUICHE_INCLUDE_DIR}/quiche.h)
+        add_library(quiche::quiche STATIC IMPORTED)
+        set_target_properties(quiche::quiche PROPERTIES
+            IMPORTED_LOCATION ${QUICHE_LIB_PATH}
+            INTERFACE_INCLUDE_DIRECTORIES ${QUICHE_INCLUDE_DIR}
+        )
+        add_compile_definitions(MYSTRAL_HAS_QUICHE)
+        message(STATUS "Found quiche: ${QUICHE_LIB_PATH}")
+        message(STATUS "quiche includes: ${QUICHE_INCLUDE_DIR}")
+    else()
+        message(STATUS "quiche library not built - WebTransport disabled. Run 'node scripts/download-deps.mjs --only quiche' to enable.")
+        message(STATUS "  Expected library: ${QUICHE_LIB_PATH}")
+    endif()
+else()
+    if(MYSTRAL_USE_QUICHE AND NOT IOS AND NOT ANDROID)
+        message(STATUS "quiche not found - WebTransport disabled. Run 'node scripts/download-deps.mjs --only quiche' to enable.")
+    endif()
+endif()
+
 # Ray Tracing (optional - hardware RT via DXR/Vulkan/Metal)
 # For now, this only adds the C++ infrastructure and JS bindings.
 # Actual backend implementations (DXR, Vulkan RT, Metal RT) will be added in Wave 3-4.
@@ -923,6 +960,8 @@ set(MYSTRAL_SOURCES
     src/utils/cgltf_impl.cpp
     src/http/http_client.cpp
     src/http/async_http_client.cpp
+    src/webtransport/webtransport.cpp
+    src/webtransport/webtransport_polyfill.cpp
     src/fs/async_file.cpp
     src/fs/file_watcher.cpp
     src/gltf/gltf_loader.cpp
@@ -1259,6 +1298,20 @@ endif()
 # Draco linkage (native mesh decoder - bypasses WASM/Worker)
 if(TARGET draco::draco)
     target_link_libraries(mystral-runtime PRIVATE draco::draco)
+endif()
+
+# quiche linkage (QUIC/HTTP3 for WebTransport). The static lib bundles BoringSSL;
+# the Rust staticlib additionally needs a few platform system libraries.
+if(TARGET quiche::quiche)
+    target_link_libraries(mystral-runtime PUBLIC quiche::quiche)
+    if(APPLE)
+        target_link_libraries(mystral-runtime PUBLIC
+            "-framework Security"
+            "-framework CoreFoundation"
+            "-framework SystemConfiguration")
+    elseif(UNIX)
+        target_link_libraries(mystral-runtime PUBLIC pthread dl m)
+    endif()
 endif()
 
 # Vulkan linkage (for Vulkan RT backend)

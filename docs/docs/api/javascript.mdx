@@ -10,6 +10,9 @@ Mystral Native.js implements standard Web APIs for graphics, audio, networking, 
 | Canvas 2D | Full | Skia-based implementation |
 | Web Audio | Full | SDL3-based audio |
 | fetch | Full | HTTP/HTTPS and file:// protocols |
+| WebTransport | Full | HTTP/3 (QUIC) via quiche — datagrams + reliable streams |
+| WebSockets | In progress | Planned — see [Roadmap](#roadmap-realtime-networking) |
+| WebRTC | In progress | Planned — see [Roadmap](#roadmap-realtime-networking) |
 | URL / URLSearchParams | Full | URL parsing and query string handling |
 | Worker | Partial | Main-thread polyfill with async message passing |
 | Blob | Full | Binary data containers |
@@ -127,6 +130,65 @@ const result = await fetch("https://api.example.com/upload", {
     body: JSON.stringify({ key: "value" })
 });
 ```
+
+## WebTransport
+
+Low-latency client networking over HTTP/3 (QUIC), implemented natively via
+[Cloudflare quiche](https://github.com/cloudflare/quiche). Supports unreliable
+**datagrams** (UDP-like, for fast state updates) and reliable **streams**
+(ordered, for chat, RPC, asset transfer) — the same `WebTransport` API you use in
+the browser.
+
+```javascript
+const transport = new WebTransport("https://127.0.0.1:4433/echo");
+await transport.ready;
+
+// Unreliable datagrams
+const writer = transport.datagrams.writable.getWriter();
+await writer.write(new Uint8Array([1, 2, 3]));
+const reader = transport.datagrams.readable.getReader();
+const { value } = await reader.read(); // Uint8Array
+
+// Reliable bidirectional stream
+const stream = await transport.createBidirectionalStream();
+const sw = stream.writable.getWriter();
+await sw.write(new TextEncoder().encode("hello"));
+await sw.close();
+const sr = stream.readable.getReader();
+const chunk = await sr.read(); // { value, done }
+
+// Reliable unidirectional stream
+const uni = await transport.createUnidirectionalStream();
+await uni.getWriter().write(new Uint8Array([4, 5, 6]));
+
+// Server-initiated streams
+const incoming = transport.incomingUnidirectionalStreams.getReader();
+const { value: serverStream } = await incoming.read();
+```
+
+Supported: `ready`/`closed`/`close()`, `datagrams`,
+`createBidirectionalStream()`, `createUnidirectionalStream()`,
+`incomingUnidirectionalStreams`, `incomingBidirectionalStreams`, and
+`WebTransportError`.
+
+> **Note:** WebTransport requires a build with quiche compiled in
+> (`MYSTRAL_HAS_QUICHE`). The server URL must use `https://` with an explicit
+> port. `serverCertificateHashes` (self-signed pinning) is not yet supported.
+> See the [WebTransport guide](/mystralnative/docs/guides/webtransport) for full
+> details, the test fixture, and architecture notes.
+
+## Roadmap: Realtime networking
+
+WebTransport is the first of a planned set of realtime networking APIs exposed
+through the JS layer. Tracked in
+[issue #17](https://github.com/mystralengine/mystralnative/issues/17):
+
+| API | Status |
+|-----|--------|
+| WebTransport | ✅ Done — datagrams + reliable uni/bidi streams over HTTP/3 |
+| WebSockets (`WebSocket`) | 🚧 In progress — reliable ordered messaging over TCP/TLS; likely libuv TCP + WebSocket framing |
+| WebRTC (`RTCPeerConnection`, `RTCDataChannel`) | 🚧 In progress — P2P data channels for player-hosted/mesh networking + NAT traversal (ICE/STUN/TURN); evaluating `webrtc-rs` / libdatachannel |
+| WebTransport `serverCertificateHashes` | 🚧 In progress — connect to self-signed servers via cert pinning |
 
 ## Gamepad
 

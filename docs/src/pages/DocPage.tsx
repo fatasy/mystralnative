@@ -27,6 +27,7 @@ const sidebarItems = [
       { label: 'Canvas 2D Games', path: 'guides/canvas2d' },
       { label: 'Bundling & Building Apps', path: 'guides/bundling' },
       { label: 'Input Events', path: 'guides/input-events' },
+      { label: 'WebTransport', path: 'guides/webtransport' },
       { label: 'Building from Source', path: 'guides/building' },
       { label: 'Configuration', path: 'guides/configuration' },
     ],

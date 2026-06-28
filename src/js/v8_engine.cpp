@@ -523,6 +523,11 @@ public:
     JSValueHandle createUint8Array(const uint8_t* data, size_t count) override {
         v8::Isolate::Scope isolate_scope(isolate_);
         v8::HandleScope handle_scope(isolate_);
+        // A context must be entered for typed-array creation: this method can be
+        // called outside of a JS call stack (e.g. from WebTransport event
+        // dispatch), where no context is current. Matches newArrayBuffer().
+        v8::Local<v8::Context> context = context_.Get(isolate_);
+        v8::Context::Scope context_scope(context);
 
         std::unique_ptr<v8::BackingStore> backingStore = v8::ArrayBuffer::NewBackingStore(isolate_, count);
         if (data && count > 0) {
