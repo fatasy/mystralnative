@@ -22,7 +22,6 @@
 #include <cstring>
 #include <cstdint>
 #include <cstdlib>
-#include <limits>
 #include <map>
 #include <memory>
 #include <queue>
@@ -32,6 +31,9 @@
 #include <vector>
 
 #ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX  // prevent windows.h from defining min()/max() macros
+#endif
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #else
@@ -264,7 +266,7 @@ void readStreams(Session* s);
 void armTimeout(Session* s) {
     if (!s->conn) { s->hasTimeout = false; return; }
     uint64_t ms = quiche_conn_timeout_as_millis(s->conn);
-    if (ms == std::numeric_limits<uint64_t>::max()) {
+    if (ms == UINT64_MAX) {  // quiche: no timeout currently scheduled
         s->hasTimeout = false;
         return;
     }
