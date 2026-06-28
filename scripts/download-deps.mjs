@@ -160,9 +160,9 @@ const DEPS = {
     // repo never compiles Rust/BoringSSL itself. If no prebuilt exists for this
     // platform/arch, the C++ build compiles a WebTransport stub (MYSTRAL_HAS_QUICHE off).
     // https://github.com/mystralengine/library-builder/releases
-    version: 'quiche-0.24.6-2',
+    version: 'quiche-0.24.6-3',
     getUrl: () => {
-      const baseUrl = 'https://github.com/mystralengine/library-builder/releases/download/quiche-0.24.6-2';
+      const baseUrl = 'https://github.com/mystralengine/library-builder/releases/download/quiche-0.24.6-3';
       if (platformName === 'macos') {
         const arch = ARCH === 'arm64' ? 'arm64' : 'x86_64';
         return `${baseUrl}/quiche-mac-${arch}.zip`;
@@ -189,12 +189,12 @@ const DEPS = {
     // device (arm64) + simulator (arm64 + x86_64). Each archive contains
     // libquiche.a + include/quiche.h. Extracts to third_party/quiche-ios/<variant>/.
     // https://github.com/mystralengine/library-builder/releases
-    version: 'quiche-0.24.6-2',
+    version: 'quiche-0.24.6-3',
     getUrl: () => null, // multi-archive, handled by downloadIosDep
     extractTo: 'quiche-ios',
     archives: {
-      device: 'https://github.com/mystralengine/library-builder/releases/download/quiche-0.24.6-2/quiche-ios-arm64.zip',
-      simulatorX64: 'https://github.com/mystralengine/library-builder/releases/download/quiche-0.24.6-2/quiche-ios-sim-x64.zip',
+      device: 'https://github.com/mystralengine/library-builder/releases/download/quiche-0.24.6-3/quiche-ios-arm64.zip',
+      simulatorX64: 'https://github.com/mystralengine/library-builder/releases/download/quiche-0.24.6-3/quiche-ios-sim-x64.zip',
       // NOTE: arm64 simulator (simulatorArm64) is temporarily unavailable — the
       // BoringSSL arm64 asm cross-compiles for device, not the simulator. See
       // docs/realtimecommunication.md. Device arm64 + x86_64 simulator are shipped.
@@ -205,13 +205,13 @@ const DEPS = {
     // arm64-v8a + armeabi-v7a + x86_64. Each archive contains libquiche.a +
     // include/quiche.h. Extracts to third_party/quiche-android/<variant>/.
     // https://github.com/mystralengine/library-builder/releases
-    version: 'quiche-0.24.6-2',
+    version: 'quiche-0.24.6-3',
     getUrl: () => null, // multi-archive, handled by downloadIosDep
     extractTo: 'quiche-android',
     archives: {
-      aarch64: 'https://github.com/mystralengine/library-builder/releases/download/quiche-0.24.6-2/quiche-android-arm64.zip',
-      armv7: 'https://github.com/mystralengine/library-builder/releases/download/quiche-0.24.6-2/quiche-android-armv7.zip',
-      x86_64: 'https://github.com/mystralengine/library-builder/releases/download/quiche-0.24.6-2/quiche-android-x64.zip',
+      aarch64: 'https://github.com/mystralengine/library-builder/releases/download/quiche-0.24.6-3/quiche-android-arm64.zip',
+      armv7: 'https://github.com/mystralengine/library-builder/releases/download/quiche-0.24.6-3/quiche-android-armv7.zip',
+      x86_64: 'https://github.com/mystralengine/library-builder/releases/download/quiche-0.24.6-3/quiche-android-x64.zip',
     },
   },
   stb: {
