@@ -194,8 +194,10 @@ const DEPS = {
     extractTo: 'quiche-ios',
     archives: {
       device: 'https://github.com/mystralengine/library-builder/releases/download/quiche-0.24.6-2/quiche-ios-arm64.zip',
-      simulatorArm64: 'https://github.com/mystralengine/library-builder/releases/download/quiche-0.24.6-2/quiche-ios-sim-arm64.zip',
       simulatorX64: 'https://github.com/mystralengine/library-builder/releases/download/quiche-0.24.6-2/quiche-ios-sim-x64.zip',
+      // NOTE: arm64 simulator (simulatorArm64) is temporarily unavailable — the
+      // BoringSSL arm64 asm cross-compiles for device, not the simulator. See
+      // docs/realtimecommunication.md. Device arm64 + x86_64 simulator are shipped.
     },
   },
   'quiche-android': {
