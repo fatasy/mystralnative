@@ -153,16 +153,36 @@ const DEPS = {
     extractTo: 'quickjs',
   },
   quiche: {
-    // Cloudflare quiche - QUIC + HTTP/3 (used by the WebTransport API).
-    // Built from source: git clone --recursive (BoringSSL submodule) + a small
-    // FFI patch (exposes set_additional_settings for WebTransport SETTINGS) +
-    // `cargo build --release --features ffi`. Requires a Rust toolchain, cmake,
-    // and Go (for BoringSSL). Skipped gracefully if those are missing — the C++
-    // build then compiles a WebTransport stub.
-    version: '0.24.6',
-    getUrl: () => null,  // special handling below (git clone, not an archive)
+    // Cloudflare quiche - QUIC + HTTP/3 (native backend for the WebTransport API).
+    // Prebuilt static libs (libquiche.a / quiche.lib + patched quiche.h, BoringSSL
+    // bundled) come from mystralengine/library-builder, exactly like libuv/draco/swc.
+    // The library is built there (build-quiche.py + build-quiche.yml) so the engine
+    // repo never compiles Rust/BoringSSL itself. If no prebuilt exists for this
+    // platform/arch, the C++ build compiles a WebTransport stub (MYSTRAL_HAS_QUICHE off).
+    // https://github.com/mystralengine/library-builder/releases
+    version: 'quiche-0.24.6-1',
+    getUrl: () => {
+      const baseUrl = 'https://github.com/mystralengine/library-builder/releases/download/quiche-0.24.6-1';
+      if (platformName === 'macos') {
+        const arch = ARCH === 'arm64' ? 'arm64' : 'x86_64';
+        return `${baseUrl}/quiche-mac-${arch}.zip`;
+      } else if (platformName === 'linux') {
+        if (ARCH !== 'x64') {
+          console.warn(`quiche prebuilts not available for ${platformName}-${archName}`);
+          return null;
+        }
+        return `${baseUrl}/quiche-linux-x64.zip`;
+      } else if (platformName === 'windows') {
+        if (ARCH !== 'x64') {
+          console.warn(`quiche prebuilts not available for ${platformName}-${archName}`);
+          return null;
+        }
+        return `${baseUrl}/quiche-win-x64.zip`;
+      }
+      console.warn(`quiche prebuilts not available for ${platformName}-${archName}`);
+      return null;
+    },
     extractTo: 'quiche',
-    repo: 'https://github.com/cloudflare/quiche.git',
   },
   stb: {
     // stb single-header libraries from nothings/stb
@@ -568,69 +588,6 @@ async function downloadDep(name) {
       return true;
     } catch (error) {
       console.error(`Failed to download ${name}:`, error.message);
-      return false;
-    }
-  }
-
-  // Special handling for quiche (git clone --recursive + patch + cargo build)
-  if (name === 'quiche' && dep.repo) {
-    const libRel = PLATFORM === 'win32' ? 'target/release/quiche.lib' : 'target/release/libquiche.a';
-    const libPath = join(destDir, libRel);
-    if (existsSync(libPath) && !process.argv.includes('--force')) {
-      console.log(`${name} already built at ${libPath}`);
-      console.log('Skipping (use --force to rebuild)');
-      return true;
-    }
-
-    // Verify the toolchain is available; quiche needs cargo + Go (+ cmake) to
-    // build BoringSSL. If absent, skip — WebTransport compiles as a stub.
-    const haveCargo = (() => {
-      try { execSync('cargo --version', { stdio: 'ignore' }); return true; } catch { return false; }
-    })();
-    if (!haveCargo) {
-      console.warn(`Skipping ${name}: cargo (Rust toolchain) not found. WebTransport will be disabled.`);
-      return false;
-    }
-
-    try {
-      if (!existsSync(join(destDir, '.git'))) {
-        if (existsSync(destDir)) rmSync(destDir, { recursive: true });
-        console.log(`Cloning quiche ${dep.version} (with BoringSSL submodule)...`);
-        execSync(
-          `git clone --recursive --depth 1 --branch ${dep.version} ${dep.repo} "${destDir}"`,
-          { stdio: 'inherit' }
-        );
-      }
-
-      // Apply the WebTransport FFI patch (idempotent: git apply --check first).
-      const patchPath = join(__dirname, 'patches', 'quiche-webtransport-ffi.patch');
-      if (existsSync(patchPath)) {
-        const alreadyApplied = (() => {
-          try { execSync(`git -C "${destDir}" apply --reverse --check "${patchPath}"`, { stdio: 'ignore' }); return true; }
-          catch { return false; }
-        })();
-        if (!alreadyApplied) {
-          console.log('Applying quiche WebTransport FFI patch...');
-          execSync(`git -C "${destDir}" apply "${patchPath}"`, { stdio: 'inherit' });
-        } else {
-          console.log('quiche WebTransport FFI patch already applied');
-        }
-      }
-
-      console.log('Building quiche (cargo build --release --features ffi)...');
-      execSync('cargo build --release --package quiche --features ffi', {
-        cwd: destDir,
-        stdio: 'inherit',
-      });
-
-      if (existsSync(libPath)) {
-        console.log(`Successfully built ${name}: ${libPath}`);
-        return true;
-      }
-      console.error(`quiche build did not produce ${libPath}`);
-      return false;
-    } catch (error) {
-      console.error(`Failed to build ${name}:`, error.message);
       return false;
     }
   }

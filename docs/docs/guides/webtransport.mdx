@@ -13,8 +13,10 @@ WebTransport is implemented natively on top of [Cloudflare quiche](https://githu
 
 - WebTransport is only available in builds compiled **with quiche**
   (`MYSTRAL_HAS_QUICHE`). Run `node scripts/download-deps.mjs --only quiche` to
-  fetch and build it (needs a Rust toolchain + Go + CMake for BoringSSL). If
-  quiche is not present, `new WebTransport(...)` rejects its `ready`/`closed`
+  fetch the **prebuilt** static library (built per-platform by
+  [mystralengine/library-builder](https://github.com/mystralengine/library-builder),
+  the same place Skia/libuv/Draco come from — no Rust toolchain needed locally).
+  If quiche is not present, `new WebTransport(...)` rejects its `ready`/`closed`
   promises instead of connecting.
 - The server URL must use `https://` and an explicit port, e.g.
   `https://example.com:4433/path`.
@@ -69,7 +71,7 @@ supporting `getReader().read()` and `getWriter().write()/close()/abort()`.
   WebTransport `0x41` / `0x54` signal framing.
 - WebTransport SETTINGS (`WT_MAX_SESSIONS`, etc.) are advertised via a small FFI
   shim added to quiche (`quiche_h3_config_set_additional_settings`), applied as a
-  patch during `download-deps`.
+  patch when library-builder compiles quiche (`patches/quiche-webtransport-ffi.patch`).
 
 ## Testing
 

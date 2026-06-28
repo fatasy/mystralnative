@@ -851,19 +851,21 @@ endif()
 # ============================================================================
 # quiche (QUIC + HTTP/3, for the WebTransport API)
 # ============================================================================
-# quiche is a Rust library exposing a C API. We vendor the source and build a
-# static library (libquiche.a) with `cargo build --release --features ffi`.
-# download-deps.mjs clones + builds it. WebTransport is disabled (stubbed) if
-# the library is not present, so the build still succeeds without a Rust
-# toolchain.
+# quiche is a Rust library exposing a C API. The static library (libquiche.a /
+# quiche.lib + patched quiche.h, BoringSSL bundled) is built by
+# mystralengine/library-builder and downloaded as a prebuilt by
+# download-deps.mjs (like libuv/draco/swc) — the engine repo never compiles
+# Rust/BoringSSL itself. WebTransport is disabled (stubbed) if the library is
+# not present, so the build still succeeds without it.
+# Prebuilt layout: quiche/include/quiche.h, quiche/libquiche.a (or quiche.lib)
 option(MYSTRAL_USE_QUICHE "Enable QUIC/HTTP3 WebTransport via quiche" ON)
 set(QUICHE_DIR ${THIRD_PARTY_DIR}/quiche)
 if(MYSTRAL_USE_QUICHE AND EXISTS ${QUICHE_DIR} AND NOT IOS AND NOT ANDROID)
-    set(QUICHE_INCLUDE_DIR ${QUICHE_DIR}/quiche/include)
+    set(QUICHE_INCLUDE_DIR ${QUICHE_DIR}/include)
     if(WIN32)
-        set(QUICHE_LIB_PATH ${QUICHE_DIR}/target/release/quiche.lib)
+        set(QUICHE_LIB_PATH ${QUICHE_DIR}/quiche.lib)
     else()
-        set(QUICHE_LIB_PATH ${QUICHE_DIR}/target/release/libquiche.a)
+        set(QUICHE_LIB_PATH ${QUICHE_DIR}/libquiche.a)
     endif()
 
     if(EXISTS ${QUICHE_LIB_PATH} AND EXISTS ${QUICHE_INCLUDE_DIR}/quiche.h)
