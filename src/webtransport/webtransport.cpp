@@ -8,19 +8,21 @@
 
 #include <iostream>
 
-// Full implementation requires both quiche and libuv. Otherwise we fall back to
-// a stub that makes WebTransport construction reject in JS.
-#if defined(MYSTRAL_HAS_QUICHE) && defined(MYSTRAL_HAS_LIBUV)
+// Full implementation requires quiche. The QUIC UDP socket and timers are driven
+// directly on the runtime's per-frame poll loop using raw non-blocking sockets
+// (no libuv), so WebTransport works on every platform — desktop and mobile.
+// Otherwise we fall back to a stub that makes WebTransport construction reject.
+#if defined(MYSTRAL_HAS_QUICHE)
 
 #include "mystral/js/engine.h"
-#include "mystral/async/event_loop.h"
 
-#include <uv.h>
 #include <quiche.h>
 
+#include <chrono>
 #include <cstring>
 #include <cstdint>
 #include <cstdlib>
+#include <limits>
 #include <map>
 #include <memory>
 #include <queue>
@@ -29,13 +31,44 @@
 #include <string>
 #include <vector>
 
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
+#include <arpa/inet.h>
+#include <fcntl.h>
 #include <netdb.h>
+#include <netinet/in.h>
 #include <sys/socket.h>
+#include <unistd.h>
+#endif
 
 namespace mystral {
 namespace webtransport {
 
 namespace {
+
+// ---------------------------------------------------------------------------
+// Cross-platform raw UDP socket helpers (no libuv)
+// ---------------------------------------------------------------------------
+
+#ifdef _WIN32
+using socket_t = SOCKET;
+constexpr socket_t kInvalidSocket = INVALID_SOCKET;
+inline void closeSocket(socket_t s) { ::closesocket(s); }
+inline bool setSocketNonBlocking(socket_t s) {
+    u_long mode = 1;
+    return ::ioctlsocket(s, FIONBIO, &mode) == 0;
+}
+#else
+using socket_t = int;
+constexpr socket_t kInvalidSocket = -1;
+inline void closeSocket(socket_t s) { ::close(s); }
+inline bool setSocketNonBlocking(socket_t s) {
+    int flags = ::fcntl(s, F_GETFL, 0);
+    return flags >= 0 && ::fcntl(s, F_SETFL, flags | O_NONBLOCK) == 0;
+}
+#endif
 
 // ---------------------------------------------------------------------------
 // WebTransport / HTTP/3 wire constants
@@ -163,12 +196,11 @@ struct StreamState {
 struct Session {
     uint32_t id = 0;
 
-    uv_udp_t udp;
-    uv_timer_t timer;
-    bool udpClosing = false;
-    bool timerClosing = false;
-    bool udpClosed = false;
-    bool timerClosed = false;
+    // Raw non-blocking UDP socket; polled each frame in pumpSocket(). The QUIC
+    // loss/idle timers are tracked with steady_clock (no libuv timer handle).
+    socket_t sock = kInvalidSocket;
+    std::chrono::steady_clock::time_point timeoutAt{};
+    bool hasTimeout = false;
 
     quiche_conn* conn = nullptr;
     quiche_h3_conn* h3 = nullptr;
@@ -190,7 +222,7 @@ struct Session {
     bool reportedReady = false;
     bool reportedClosed = false;
     bool failed = false;
-    bool wantClose = false;    // teardown requested; free once handles closed
+    bool wantClose = false;    // teardown requested
 
     int64_t connectStreamId = -1;
 
@@ -203,6 +235,7 @@ struct Session {
     std::map<uint64_t, StreamState> streams;
 
     ~Session() {
+        if (sock != kInvalidSocket) closeSocket(sock);
         if (h3) quiche_h3_conn_free(h3);
         if (conn) quiche_conn_free(conn);
         if (h3config) quiche_h3_config_free(h3config);
@@ -226,8 +259,21 @@ Session* findSession(uint32_t id) {
 void readDatagrams(Session* s);
 void readStreams(Session* s);
 
+// Re-arm the QUIC timeout deadline based on quiche's schedule. Driven on the
+// per-frame poll loop in pumpSocket(); no libuv timer involved.
+void armTimeout(Session* s) {
+    if (!s->conn) { s->hasTimeout = false; return; }
+    uint64_t ms = quiche_conn_timeout_as_millis(s->conn);
+    if (ms == std::numeric_limits<uint64_t>::max()) {
+        s->hasTimeout = false;
+        return;
+    }
+    s->timeoutAt = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
+    s->hasTimeout = true;
+}
+
 void flushEgress(Session* s) {
-    if (!s->conn) return;
+    if (!s->conn || s->sock == kInvalidSocket) return;
     static uint8_t out[MAX_DATAGRAM_SIZE];
     while (true) {
         quiche_send_info sendInfo;
@@ -237,65 +283,60 @@ void flushEgress(Session* s) {
             std::cerr << "[WebTransport] quiche_conn_send failed: " << written << std::endl;
             break;
         }
-        uv_buf_t buf = uv_buf_init(reinterpret_cast<char*>(out), static_cast<unsigned int>(written));
-        // try_send is synchronous/non-blocking; the QUIC layer handles loss.
-        int rc = uv_udp_try_send(&s->udp, &buf, 1,
-                                 reinterpret_cast<const struct sockaddr*>(&sendInfo.to));
-        if (rc < 0 && rc != UV_EAGAIN) {
-            std::cerr << "[WebTransport] uv_udp_try_send failed: " << uv_strerror(rc) << std::endl;
+        // Non-blocking sendto; QUIC handles loss/retransmission. EWOULDBLOCK just
+        // means the OS buffer is momentarily full — quiche will resend later.
+        int sent = static_cast<int>(::sendto(
+            s->sock, reinterpret_cast<const char*>(out), static_cast<int>(written), 0,
+            reinterpret_cast<const struct sockaddr*>(&sendInfo.to),
+            static_cast<socklen_t>(sendInfo.to_len)));
+        if (sent < 0) {
+            // Drop on transient error; retransmission is the QUIC layer's job.
             break;
         }
     }
-    // Re-arm the timeout timer based on quiche's schedule.
-    if (!s->timerClosing) {
-        uint64_t t = quiche_conn_timeout_as_millis(s->conn);
-        uv_timer_start(&s->timer, [](uv_timer_t* h) {
-            auto* sess = static_cast<Session*>(h->data);
-            if (sess && sess->conn) {
-                quiche_conn_on_timeout(sess->conn);
-                flushEgress(sess);
-            }
-        }, t, 0);
-    }
+    armTimeout(s);
 }
 
-void onAlloc(uv_handle_t*, size_t suggested, uv_buf_t* buf) {
-    static thread_local std::vector<char> backing(65536);
-    if (backing.size() < suggested) backing.resize(suggested);
-    buf->base = backing.data();
-    buf->len = static_cast<unsigned int>(backing.size());
-}
+// Drain all datagrams currently readable on the socket, feed them to quiche, and
+// (once the session is up) read out datagrams/streams immediately. Reading right
+// after quiche_conn_recv matters: quiche garbage-collects a server-initiated
+// stream that arrives complete (data + FIN) if it is not read promptly. Also
+// fires the QUIC timeout when its deadline has passed. Runs on the main thread.
+void pumpSocket(Session* s) {
+    if (!s->conn || s->sock == kInvalidSocket) return;
 
-void onUdpRecv(uv_udp_t* handle, ssize_t nread, const uv_buf_t* buf,
-               const struct sockaddr* addr, unsigned flags) {
-    (void)flags;
-    auto* s = static_cast<Session*>(handle->data);
-    if (!s || !s->conn) return;
-    if (nread <= 0 || addr == nullptr) return;  // EAGAIN / empty datagram
+    static thread_local std::vector<uint8_t> rbuf(65536);
+    while (true) {
+        struct sockaddr_storage from{};
+        socklen_t fromLen = sizeof(from);
+        auto n = ::recvfrom(s->sock, reinterpret_cast<char*>(rbuf.data()),
+                            static_cast<int>(rbuf.size()), 0,
+                            reinterpret_cast<struct sockaddr*>(&from), &fromLen);
+        if (n < 0) break;  // EWOULDBLOCK / no more data this tick (or transient error)
 
-    quiche_recv_info recvInfo;
-    recvInfo.from = const_cast<struct sockaddr*>(addr);
-    recvInfo.from_len = (addr->sa_family == AF_INET6) ? sizeof(struct sockaddr_in6)
-                                                      : sizeof(struct sockaddr_in);
-    recvInfo.to = reinterpret_cast<struct sockaddr*>(&s->local);
-    recvInfo.to_len = s->localLen;
+        quiche_recv_info recvInfo;
+        recvInfo.from = reinterpret_cast<struct sockaddr*>(&from);
+        recvInfo.from_len = fromLen;
+        recvInfo.to = reinterpret_cast<struct sockaddr*>(&s->local);
+        recvInfo.to_len = s->localLen;
 
-    ssize_t done = quiche_conn_recv(s->conn, reinterpret_cast<uint8_t*>(buf->base),
-                                    static_cast<size_t>(nread), &recvInfo);
-    if (done < 0 && done != QUICHE_ERR_DONE) {
-        std::cerr << "[WebTransport] quiche_conn_recv failed: " << done << std::endl;
-        return;
+        ssize_t done = quiche_conn_recv(s->conn, rbuf.data(),
+                                        static_cast<size_t>(n), &recvInfo);
+        if (done < 0 && done != QUICHE_ERR_DONE) {
+            std::cerr << "[WebTransport] quiche_conn_recv failed: " << done << std::endl;
+            continue;
+        }
+        if (s->wtReady) {
+            readDatagrams(s);
+            readStreams(s);
+        }
     }
-    // Read datagrams and streams IMMEDIATELY after recv. quiche garbage-collects
-    // a server-initiated stream that arrives complete (data + FIN) if it is not
-    // read promptly, so deferring the read to the per-frame processEvents() loses
-    // it. We only queue events here (no JS dispatch); processEvents() dispatches
-    // them on the main thread. libuv callbacks already run on the main thread.
-    if (s->wtReady) {
-        readDatagrams(s);
-        readStreams(s);
+
+    // Drive QUIC timers off a monotonic clock instead of a libuv timer.
+    if (s->hasTimeout && std::chrono::steady_clock::now() >= s->timeoutAt) {
+        quiche_conn_on_timeout(s->conn);
+        flushEgress(s);
     }
-    // Handshake progress and JS dispatch happen in processEvents().
 }
 
 // ---------------------------------------------------------------------------
@@ -583,33 +624,6 @@ void readStreams(Session* s) {
 }
 
 // ---------------------------------------------------------------------------
-// Session teardown
-// ---------------------------------------------------------------------------
-
-void onHandleClosed(uv_handle_t* handle) {
-    auto* s = static_cast<Session*>(handle->data);
-    if (!s) return;
-    if (handle == reinterpret_cast<uv_handle_t*>(&s->udp)) s->udpClosed = true;
-    if (handle == reinterpret_cast<uv_handle_t*>(&s->timer)) s->timerClosed = true;
-    if (s->udpClosed && s->timerClosed) {
-        g_sessions.erase(s->id);  // frees Session (quiche objects freed in dtor)
-    }
-}
-
-void beginTeardown(Session* s) {
-    if (s->udpClosing && s->timerClosing) return;
-    s->udpClosing = true;
-    s->timerClosing = true;
-    uv_timer_stop(&s->timer);
-    if (!uv_is_closing(reinterpret_cast<uv_handle_t*>(&s->timer))) {
-        uv_close(reinterpret_cast<uv_handle_t*>(&s->timer), onHandleClosed);
-    }
-    if (!uv_is_closing(reinterpret_cast<uv_handle_t*>(&s->udp))) {
-        uv_close(reinterpret_cast<uv_handle_t*>(&s->udp), onHandleClosed);
-    }
-}
-
-// ---------------------------------------------------------------------------
 // JS dispatch
 // ---------------------------------------------------------------------------
 
@@ -692,7 +706,44 @@ bool parseUrl(const std::string& url, std::string& host, int& port, std::string&
     return host.size() > 0 && port > 0 && port < 65536;
 }
 
-// __wtConnect(url) -> sessionId (>=1) or -1 on immediate failure.
+// Creates a non-blocking UDP socket bound to an ephemeral local port matching the
+// peer's address family, and records the local address. Returns kInvalidSocket on
+// failure.
+socket_t createUdpSocket(Session* s) {
+    socket_t fd = ::socket(s->peer.ss_family, SOCK_DGRAM, 0);
+    if (fd == kInvalidSocket) return kInvalidSocket;
+
+    struct sockaddr_storage bindAddr{};
+    socklen_t bindLen;
+    if (s->peer.ss_family == AF_INET6) {
+        struct sockaddr_in6 a{};
+        a.sin6_family = AF_INET6;
+        std::memcpy(&bindAddr, &a, sizeof(a));
+        bindLen = sizeof(struct sockaddr_in6);
+    } else {
+        struct sockaddr_in a{};
+        a.sin_family = AF_INET;
+        std::memcpy(&bindAddr, &a, sizeof(a));
+        bindLen = sizeof(struct sockaddr_in);
+    }
+    if (::bind(fd, reinterpret_cast<const struct sockaddr*>(&bindAddr), bindLen) != 0) {
+        closeSocket(fd);
+        return kInvalidSocket;
+    }
+    if (!setSocketNonBlocking(fd)) {
+        closeSocket(fd);
+        return kInvalidSocket;
+    }
+
+    s->localLen = sizeof(s->local);
+    if (::getsockname(fd, reinterpret_cast<struct sockaddr*>(&s->local), &s->localLen) != 0) {
+        closeSocket(fd);
+        return kInvalidSocket;
+    }
+    return fd;
+}
+
+// __wtConnect(url) -> sessionId (>=1) or 0 on immediate failure.
 uint32_t connectSession(const std::string& url) {
     std::string host;
     int port = 0;
@@ -708,35 +759,16 @@ uint32_t connectSession(const std::string& url) {
     s->port = port;
     s->path = path;
 
-    uv_loop_t* loop = async::EventLoop::instance().handle();
-    if (!loop) return 0;
-
     if (!resolvePeer(host, port, &s->peer, &s->peerLen)) {
         std::cerr << "[WebTransport] DNS resolution failed for " << host << std::endl;
         return 0;
     }
 
-    // UDP socket bound to an ephemeral local port matching the peer family.
-    uv_udp_init(loop, &s->udp);
-    s->udp.data = s;
-    struct sockaddr_storage bindAddr{};
-    if (s->peer.ss_family == AF_INET6) {
-        struct sockaddr_in6 a{};
-        a.sin6_family = AF_INET6;
-        std::memcpy(&bindAddr, &a, sizeof(a));
-    } else {
-        struct sockaddr_in a{};
-        a.sin_family = AF_INET;
-        std::memcpy(&bindAddr, &a, sizeof(a));
+    s->sock = createUdpSocket(s);
+    if (s->sock == kInvalidSocket) {
+        std::cerr << "[WebTransport] failed to create UDP socket" << std::endl;
+        return 0;
     }
-    uv_udp_bind(&s->udp, reinterpret_cast<const struct sockaddr*>(&bindAddr), 0);
-
-    s->localLen = sizeof(s->local);
-    uv_udp_getsockname(&s->udp, reinterpret_cast<struct sockaddr*>(&s->local),
-                       reinterpret_cast<int*>(&s->localLen));
-
-    uv_timer_init(loop, &s->timer);
-    s->timer.data = s;
 
     // quiche config.
     s->config = quiche_config_new(QUICHE_PROTOCOL_VERSION);
@@ -785,7 +817,6 @@ uint32_t connectSession(const std::string& url) {
         return 0;
     }
 
-    uv_udp_recv_start(&s->udp, onAlloc, onUdpRecv);
     flushEgress(s);  // send the initial QUIC handshake packet(s)
 
     uint32_t id = s->id;
@@ -912,8 +943,10 @@ void processEvents() {
     std::vector<uint32_t> toTeardown;
     for (auto& [id, sessPtr] : g_sessions) {
         Session* s = sessPtr.get();
-        if (s->udpClosing) continue;  // already tearing down
         if (!s->conn) continue;
+
+        // Drain inbound UDP, feed quiche, read the data plane, and fire timers.
+        pumpSocket(s);
 
         // QUIC handshake completion.
         if (!s->established && quiche_conn_is_established(s->conn)) {
@@ -950,7 +983,7 @@ void processEvents() {
             }
             flushEgress(s);
         }
-        // Data plane: datagram/stream READS happen in onUdpRecv() (right after
+        // Data plane: datagram/stream READS happen in pumpSocket() (right after
         // quiche_conn_recv) so server-initiated streams are not garbage-collected
         // before we read them. Here we only retry blocked writes and flush egress.
         if (s->wtReady) {
@@ -970,9 +1003,6 @@ void processEvents() {
                 if (quiche_conn_peer_error(s->conn, &isApp, &errCode, &reason, &reasonLen) && reason) {
                     msg.assign(reinterpret_cast<const char*>(reason), reasonLen);
                 }
-                if (s->failed && !s->reportedReady) {
-                    // Error already queued during handshake; still emit closed.
-                }
                 g_events.push({s->id, EventType::Closed, -1, errCode, false, {}, msg});
             }
             toTeardown.push_back(id);
@@ -987,8 +1017,6 @@ void processEvents() {
                 flushEgress(s);
             }
             toTeardown.push_back(id);
-        } else if (s->wantClose && quiche_conn_is_closed(s->conn)) {
-            toTeardown.push_back(id);
         }
     }
 
@@ -999,15 +1027,22 @@ void processEvents() {
         dispatchEvent(e);
     }
 
-    // Begin teardown for finished sessions.
+    // Free finished sessions (Session dtor closes the socket and frees quiche
+    // objects). Safe here: we are no longer iterating g_sessions.
     for (uint32_t id : toTeardown) {
-        Session* s = findSession(id);
-        if (s) beginTeardown(s);
+        g_sessions.erase(id);
     }
 }
 
+bool hasActiveSessions() {
+    return !g_sessions.empty();
+}
+
 void init() {
-    // Nothing to do eagerly; sessions create their own sockets on connect().
+#ifdef _WIN32
+    WSADATA wsaData;
+    WSAStartup(MAKEWORD(2, 2), &wsaData);
+#endif
     if (std::getenv("MYSTRAL_WT_QUICHE_LOG")) {
         quiche_enable_debug_logging(
             [](const char* line, void*) { std::cerr << "[quiche] " << line << std::endl; },
@@ -1022,12 +1057,15 @@ void shutdown() {
             quiche_conn_close(s->conn, true, 0, nullptr, 0);
             flushEgress(s);
         }
-        beginTeardown(s);
     }
+    g_sessions.clear();  // Session dtors close sockets and free quiche objects
     if (g_hasDispatch && g_engine) {
         g_engine->unprotect(g_dispatch);
         g_hasDispatch = false;
     }
+#ifdef _WIN32
+    WSACleanup();
+#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -1133,10 +1171,10 @@ bool initBindings(js::Engine* engine) {
 }  // namespace webtransport
 }  // namespace mystral
 
-#else  // !(MYSTRAL_HAS_QUICHE && MYSTRAL_HAS_LIBUV)
+#else  // !MYSTRAL_HAS_QUICHE
 
 // ---------------------------------------------------------------------------
-// Stub: WebTransport unavailable (quiche or libuv not compiled in).
+// Stub: WebTransport unavailable (quiche not compiled in).
 // ---------------------------------------------------------------------------
 
 #include "mystral/js/engine.h"
@@ -1147,6 +1185,7 @@ namespace webtransport {
 void init() {}
 void shutdown() {}
 void processEvents() {}
+bool hasActiveSessions() { return false; }
 
 bool initBindings(js::Engine* engine) {
     // Provide a WebTransport that always rejects so feature-detecting code can
@@ -1154,7 +1193,7 @@ bool initBindings(js::Engine* engine) {
     const char* stub = R"JS(
 globalThis.WebTransport = class WebTransport {
   constructor() {
-    const err = new Error('WebTransport is not supported in this build (quiche/libuv not compiled in)');
+    const err = new Error('WebTransport is not supported in this build (quiche not compiled in)');
     this.ready = Promise.reject(err);
     this.closed = Promise.reject(err);
     this.ready.catch(() => {});

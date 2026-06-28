@@ -7,7 +7,9 @@ for fast state updates) and **reliable streams** (ordered, for chat, RPC, asset
 transfer).
 
 WebTransport is implemented natively on top of [Cloudflare quiche](https://github.com/cloudflare/quiche)
-(QUIC + HTTP/3) running on the same libuv event loop used by `fetch` and timers.
+(QUIC + HTTP/3). The QUIC UDP socket is a raw non-blocking socket polled on the
+runtime's per-frame loop (timers via `steady_clock`) — no libuv dependency, so it
+runs the same on desktop and mobile.
 
 ## Requirements
 

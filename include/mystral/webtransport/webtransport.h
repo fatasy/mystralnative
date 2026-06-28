@@ -12,10 +12,12 @@
  *     HTTP/3 datagrams (RFC 9297, quarter-stream-id prefix) over QUIC datagrams,
  *     and WebTransport streams are carried as raw QUIC streams using the
  *     WEBTRANSPORT_STREAM (0x41) / WT uni stream type (0x54) signal framing.
- *   - The UDP socket and timers run on the shared libuv event loop. All JS
+ *   - The QUIC UDP socket is a raw non-blocking socket polled every frame from
+ *     processEvents(); the loss/idle timers are driven with steady_clock. No
+ *     libuv dependency, so WebTransport works on desktop and mobile alike. All JS
  *     callbacks are dispatched on the main thread from processEvents().
  *
- * When quiche/libuv are not compiled in, a stub is used so that constructing a
+ * When quiche is not compiled in, a stub is used so that constructing a
  * WebTransport in JS rejects cleanly instead of failing to link.
  */
 
@@ -48,10 +50,17 @@ bool initBindings(js::Engine* engine);
 
 /**
  * Drive QUIC I/O for all sessions and dispatch any queued events to JS.
- * Must be called once per frame from the runtime poll loop, after the libuv
- * event loop has been pumped (EventLoop::runOnce()).
+ * Must be called once per frame from the runtime poll loop. This polls each
+ * session's UDP socket, advances the QUIC/handshake state machine, fires any due
+ * timers, and dispatches events on the main thread.
  */
 void processEvents();
+
+/**
+ * True if there is at least one active WebTransport session. The runtime uses
+ * this to keep its no-SDL/headless poll loop alive while a session is pending.
+ */
+bool hasActiveSessions();
 
 }  // namespace webtransport
 }  // namespace mystral

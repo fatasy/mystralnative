@@ -703,7 +703,8 @@ public:
 
             // In no-SDL (headless) mode, exit when there's no more work to do
             if (config_.noSdl) {
-                bool hasWork = !rafCallbacks_.empty() || hasActiveTimers();
+                bool hasWork = !rafCallbacks_.empty() || hasActiveTimers() ||
+                               webtransport::hasActiveSessions();
                 if (!hasWork) {
                     idleFrames++;
                     if (idleFrames >= maxIdleFrames) {

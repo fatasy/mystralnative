@@ -857,17 +857,39 @@ endif()
 # download-deps.mjs (like libuv/draco/swc) — the engine repo never compiles
 # Rust/BoringSSL itself. WebTransport is disabled (stubbed) if the library is
 # not present, so the build still succeeds without it.
-# Prebuilt layout: quiche/include/quiche.h, quiche/libquiche.a (or quiche.lib)
 #
-# Mobile: library-builder also produces iOS/Android libquiche prebuilts
-# (quiche-ios/<variant>, quiche-android/<abi>; fetched via download-deps --ios/
-# --android). They are intentionally NOT linked here yet: WebTransport also needs
-# libuv (MYSTRAL_HAS_LIBUV), which is desktop-only today. Once libuv is available
-# on mobile, extend this block to select the per-arch mobile libquiche and drop
-# the `NOT IOS AND NOT ANDROID` guard. See docs/realtimecommunication.md.
+# WebTransport drives its QUIC UDP socket + timers directly on the runtime poll
+# loop with raw non-blocking sockets (no libuv), so it is enabled on desktop AND
+# mobile. download-deps.mjs lays prebuilts out per platform/variant:
+#   desktop : quiche/{include/quiche.h, libquiche.a|quiche.lib}
+#   iOS     : quiche-ios/<device|simulatorArm64|simulatorX64>/{include, libquiche.a}
+#   Android : quiche-android/<aarch64|armv7|x86_64>/{include, libquiche.a}
+# (arm64 iOS simulator is not yet shipped — see docs/realtimecommunication.md.)
 option(MYSTRAL_USE_QUICHE "Enable QUIC/HTTP3 WebTransport via quiche" ON)
-set(QUICHE_DIR ${THIRD_PARTY_DIR}/quiche)
-if(MYSTRAL_USE_QUICHE AND EXISTS ${QUICHE_DIR} AND NOT IOS AND NOT ANDROID)
+if(MYSTRAL_USE_QUICHE)
+    # Select the prebuilt directory for this target.
+    if(IOS)
+        if(CMAKE_OSX_SYSROOT MATCHES "[Ss]imulator")
+            if(CMAKE_OSX_ARCHITECTURES MATCHES "x86_64")
+                set(QUICHE_DIR ${THIRD_PARTY_DIR}/quiche-ios/simulatorX64)
+            else()
+                set(QUICHE_DIR ${THIRD_PARTY_DIR}/quiche-ios/simulatorArm64)
+            endif()
+        else()
+            set(QUICHE_DIR ${THIRD_PARTY_DIR}/quiche-ios/device)
+        endif()
+    elseif(ANDROID)
+        if(CMAKE_ANDROID_ARCH_ABI STREQUAL "arm64-v8a" OR ANDROID_ABI STREQUAL "arm64-v8a")
+            set(QUICHE_DIR ${THIRD_PARTY_DIR}/quiche-android/aarch64)
+        elseif(CMAKE_ANDROID_ARCH_ABI STREQUAL "armeabi-v7a" OR ANDROID_ABI STREQUAL "armeabi-v7a")
+            set(QUICHE_DIR ${THIRD_PARTY_DIR}/quiche-android/armv7)
+        else()
+            set(QUICHE_DIR ${THIRD_PARTY_DIR}/quiche-android/x86_64)
+        endif()
+    else()
+        set(QUICHE_DIR ${THIRD_PARTY_DIR}/quiche)
+    endif()
+
     set(QUICHE_INCLUDE_DIR ${QUICHE_DIR}/include)
     if(WIN32)
         set(QUICHE_LIB_PATH ${QUICHE_DIR}/quiche.lib)
@@ -885,14 +907,8 @@ if(MYSTRAL_USE_QUICHE AND EXISTS ${QUICHE_DIR} AND NOT IOS AND NOT ANDROID)
         message(STATUS "Found quiche: ${QUICHE_LIB_PATH}")
         message(STATUS "quiche includes: ${QUICHE_INCLUDE_DIR}")
     else()
-        message(STATUS "quiche library not built - WebTransport disabled. Run 'node scripts/download-deps.mjs --only quiche' to enable.")
-        message(STATUS "  Expected library: ${QUICHE_LIB_PATH}")
-    endif()
-else()
-    if(MYSTRAL_USE_QUICHE AND NOT IOS AND NOT ANDROID)
-        message(STATUS "quiche not found - WebTransport disabled. Run 'node scripts/download-deps.mjs --only quiche' to enable.")
-    elseif(MYSTRAL_USE_QUICHE AND (IOS OR ANDROID))
-        message(STATUS "quiche on mobile: libquiche prebuilt available but WebTransport stays disabled until libuv lands on mobile (see docs/realtimecommunication.md).")
+        message(STATUS "quiche not found at ${QUICHE_LIB_PATH} - WebTransport disabled (stub).")
+        message(STATUS "  Run 'node scripts/download-deps.mjs --only quiche' (desktop) or '--ios' / '--android' (mobile) to enable.")
     endif()
 endif()
 
@@ -1320,6 +1336,9 @@ if(TARGET quiche::quiche)
             "-framework Security"
             "-framework CoreFoundation"
             "-framework SystemConfiguration")
+    elseif(WIN32)
+        # Sockets (WebTransport UDP) + system libs required by BoringSSL on Windows.
+        target_link_libraries(mystral-runtime PUBLIC ws2_32 advapi32 crypt32 bcrypt userenv ntdll)
     elseif(UNIX)
         target_link_libraries(mystral-runtime PUBLIC pthread dl m)
     endif()
