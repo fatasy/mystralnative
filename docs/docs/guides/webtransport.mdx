@@ -14,10 +14,15 @@ runs the same on desktop and mobile.
 ## Requirements
 
 - WebTransport is only available in builds compiled **with quiche**
-  (`MYSTRAL_HAS_QUICHE`). Run `node scripts/download-deps.mjs --only quiche` to
-  fetch the **prebuilt** static library (built per-platform by
+  (`MYSTRAL_HAS_QUICHE`). **The official MystralNative release binaries have
+  quiche built in by default as of v0.1.4**, so downloaded releases support
+  WebTransport out of the box — no custom build required. When building from
+  source, quiche is fetched automatically with the other dependencies by
+  `node scripts/download-deps.mjs` (or `--only quiche` for just it) as a
+  **prebuilt** static library — built per-platform by
   [mystralengine/library-builder](https://github.com/mystralengine/library-builder),
-  the same place Skia/libuv/Draco come from — no Rust toolchain needed locally).
+  the same place Skia/libuv/Draco come from, so no Rust toolchain is needed
+  locally — and CMake enables WebTransport automatically when it is present.
   If quiche is not present, `new WebTransport(...)` rejects its `ready`/`closed`
   promises instead of connecting.
 - The server URL must use `https://` and an explicit port, e.g.

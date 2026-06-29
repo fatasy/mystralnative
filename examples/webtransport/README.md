@@ -21,10 +21,14 @@ webtransport/
 
 ## Requirements
 
-- A `mystral` binary built **with quiche** (`MYSTRAL_HAS_QUICHE`). quiche is a
-  prebuilt dependency — fetch it with `node scripts/download-deps.mjs --only quiche`
-  before configuring CMake. If quiche is not compiled in, `new WebTransport(...)`
-  rejects its `ready` promise instead of connecting.
+- A `mystral` binary built **with quiche** (`MYSTRAL_HAS_QUICHE`).
+  **The official MystralNative release binaries have quiche built in by default
+  as of v0.1.4** — if you downloaded a release you don't need to do anything.
+  If you build from source, quiche is a standard prebuilt dependency:
+  `node scripts/download-deps.mjs` fetches it along with the other deps (or
+  `--only quiche` for just it), and CMake enables WebTransport automatically
+  whenever the library is present. If quiche is not compiled in,
+  `new WebTransport(...)` rejects its `ready` promise instead of connecting.
 - A Rust toolchain (`cargo`) to build the echo server.
 
 ## Running it
