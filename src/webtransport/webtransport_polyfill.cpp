@@ -7,10 +7,12 @@
  * webtransport.cpp. It also installs `globalThis.__wtDispatch`, the single entry
  * point the native layer calls (on the main thread) to deliver events.
  *
- * Minimal, spec-shaped ReadableStream/WritableStream implementations are used so
- * the API works without depending on a full WHATWG Streams implementation. They
- * support the methods real WebTransport code uses: getReader().read() returning
- * { value, done }, and getWriter().write()/close()/abort().
+ * Streams are backed by the runtime's real WHATWG ReadableStream/WritableStream
+ * (installed by the streams polyfill in runtime.cpp), so they support the full
+ * surface real WebTransport code expects: getReader().read() / getWriter()
+ * .write()/close()/abort(), plus pipeTo(), pipeThrough(), tee() and async
+ * iteration (for await...of). Datagrams and incoming streams are fed by stashing
+ * each stream's controller and pushing native events into it.
  */
 
 namespace mystral {
@@ -20,6 +22,13 @@ const char* kWebTransportPolyfill = R"JS(
 (function () {
   if (typeof globalThis.WebTransport !== 'undefined' && globalThis.__wtSessions) {
     return; // already installed
+  }
+
+  if (typeof globalThis.ReadableStream === 'undefined' ||
+      typeof globalThis.WritableStream === 'undefined') {
+    // The streams polyfill (runtime.cpp) must run first.
+    console.error('[WebTransport] Web Streams not available; WebTransport disabled.');
+    return;
   }
 
   const sessions = new Map();
@@ -36,84 +45,6 @@ const char* kWebTransportPolyfill = R"JS(
   }
   globalThis.WebTransportError = WebTransportError;
 
-  // --- Minimal ReadableStream (queue-backed) -------------------------------
-  class WTReadableStream {
-    constructor() {
-      this._chunks = [];
-      this._readers = [];
-      this._closed = false;
-      this._error = null;
-      this._locked = false;
-    }
-    _push(chunk) {
-      if (this._readers.length) {
-        this._readers.shift().resolve({ value: chunk, done: false });
-      } else {
-        this._chunks.push(chunk);
-      }
-    }
-    _close() {
-      this._closed = true;
-      while (this._readers.length) {
-        this._readers.shift().resolve({ value: undefined, done: true });
-      }
-    }
-    _fail(err) {
-      this._error = err;
-      while (this._readers.length) {
-        this._readers.shift().reject(err);
-      }
-    }
-    get locked() { return this._locked; }
-    getReader() {
-      this._locked = true;
-      const self = this;
-      return {
-        read() {
-          if (self._chunks.length) {
-            return Promise.resolve({ value: self._chunks.shift(), done: false });
-          }
-          if (self._error) return Promise.reject(self._error);
-          if (self._closed) return Promise.resolve({ value: undefined, done: true });
-          return new Promise((resolve, reject) => self._readers.push({ resolve, reject }));
-        },
-        cancel() { self._closed = true; return Promise.resolve(); },
-        releaseLock() { self._locked = false; },
-        get closed() { return Promise.resolve(); },
-      };
-    }
-  }
-
-  // --- Minimal WritableStream (sink-backed) --------------------------------
-  class WTWritableStream {
-    constructor(sink) {
-      this._sink = sink;
-      this._locked = false;
-    }
-    get locked() { return this._locked; }
-    getWriter() {
-      this._locked = true;
-      const self = this;
-      return {
-        write(chunk) {
-          try { return Promise.resolve(self._sink.write(chunk)); }
-          catch (e) { return Promise.reject(e); }
-        },
-        close() {
-          try { return Promise.resolve(self._sink.close ? self._sink.close() : undefined); }
-          catch (e) { return Promise.reject(e); }
-        },
-        abort(reason) {
-          try { return Promise.resolve(self._sink.abort ? self._sink.abort(reason) : undefined); }
-          catch (e) { return Promise.reject(e); }
-        },
-        get ready() { return Promise.resolve(); },
-        get closed() { return Promise.resolve(); },
-        releaseLock() { self._locked = false; },
-      };
-    }
-  }
-
   function toBytes(chunk) {
     if (chunk instanceof Uint8Array) return chunk;
     if (chunk instanceof ArrayBuffer) return new Uint8Array(chunk);
@@ -123,9 +54,17 @@ const char* kWebTransportPolyfill = R"JS(
     return new Uint8Array(chunk);
   }
 
+  // A readable backed by a controller we stash so native events can push into
+  // it. Returns { stream, controller }.
+  function makeReadable() {
+    const box = {};
+    box.stream = new ReadableStream({ start(c) { box.controller = c; } });
+    return box;
+  }
+
   // A WebTransportSendStream: a WritableStream that writes to a QUIC stream.
   function makeSendStream(sessionId, streamId) {
-    return new WTWritableStream({
+    return new WritableStream({
       write(chunk) {
         const bytes = toBytes(chunk);
         const n = __wtStreamWrite(sessionId, streamId, bytes, false);
@@ -137,6 +76,19 @@ const char* kWebTransportPolyfill = R"JS(
       },
       abort() {
         __wtStreamShutdown(sessionId, streamId, 0);
+      },
+    });
+  }
+
+  // A datagram WritableStream (writes unreliable datagrams).
+  function makeDatagramWritable(sessionId) {
+    return new WritableStream({
+      write(chunk) {
+        const bytes = toBytes(chunk);
+        const r = __wtSendDatagram(sessionId, bytes);
+        if (r < 0) {
+          // Datagrams are unreliable; a full queue is not a fatal error.
+        }
       },
     });
   }
@@ -161,20 +113,11 @@ const char* kWebTransportPolyfill = R"JS(
         return;
       }
 
-      const dgramReadable = new WTReadableStream();
-      const dgramWritable = new WTWritableStream({
-        write: (chunk) => {
-          const bytes = toBytes(chunk);
-          const r = __wtSendDatagram(id, bytes);
-          if (r < 0) {
-            // Datagrams are unreliable; a full queue is not a fatal error.
-          }
-        },
-      });
-
+      const dgramReadable = makeReadable();
       this.datagrams = {
-        readable: dgramReadable,
-        writable: dgramWritable,
+        readable: dgramReadable.stream,
+        writable: makeDatagramWritable(id),
+        createWritable: () => makeDatagramWritable(id),
         maxDatagramSize: 1200,
         incomingMaxAge: null,
         outgoingMaxAge: null,
@@ -182,16 +125,16 @@ const char* kWebTransportPolyfill = R"JS(
         outgoingHighWaterMark: 1,
       };
 
-      const incomingUni = new WTReadableStream();
-      const incomingBidi = new WTReadableStream();
-      this.incomingUnidirectionalStreams = incomingUni;
-      this.incomingBidirectionalStreams = incomingBidi;
+      const incomingUni = makeReadable();
+      const incomingBidi = makeReadable();
+      this.incomingUnidirectionalStreams = incomingUni.stream;
+      this.incomingBidirectionalStreams = incomingBidi.stream;
 
       const state = {
         id,
         readyResolve, readyReject, closedResolve, closedReject,
         dgramReadable, incomingUni, incomingBidi,
-        streams: new Map(),  // streamId -> { readable }
+        streams: new Map(),  // streamId -> { readable: box }
         ready: false,
         closedFlag: false,
         lastError: null,
@@ -213,10 +156,10 @@ const char* kWebTransportPolyfill = R"JS(
       if (!st) throw new WebTransportError('Session is not connected');
       const sid = __wtCreateStream(st.id, true);
       if (sid < 0) throw new WebTransportError('Unable to create bidirectional stream', { source: 'stream' });
-      const readable = new WTReadableStream();
+      const readable = makeReadable();
       const writable = makeSendStream(st.id, sid);
       st.streams.set(sid, { readable });
-      return { readable, writable };
+      return { readable: readable.stream, writable };
     }
 
     close(closeInfo) {
@@ -256,47 +199,51 @@ const char* kWebTransportPolyfill = R"JS(
         } else {
           st.closedResolve(info);
         }
-        st.dgramReadable._close();
-        st.incomingUni._close();
-        st.incomingBidi._close();
+        try { st.dgramReadable.controller.close(); } catch (e) {}
+        try { st.incomingUni.controller.close(); } catch (e) {}
+        try { st.incomingBidi.controller.close(); } catch (e) {}
         for (const s of st.streams.values()) {
-          if (s.readable) s.readable._close();
+          try { if (s.readable) s.readable.controller.close(); } catch (e) {}
         }
         sessions.delete(sessionId);
         break;
       }
 
       case 'datagram':
-        st.dgramReadable._push(a);  // a: Uint8Array
+        try { st.dgramReadable.controller.enqueue(a); } catch (e) {}  // a: Uint8Array
         break;
 
       case 'incomingUni': {
-        const readable = new WTReadableStream();
+        const readable = makeReadable();
         st.streams.set(a, { readable });   // a: streamId
-        st.incomingUni._push(readable);
+        try { st.incomingUni.controller.enqueue(readable.stream); } catch (e) {}
         break;
       }
 
       case 'incomingBidi': {
-        const readable = new WTReadableStream();
+        const readable = makeReadable();
         const writable = makeSendStream(st.id, a);  // a: streamId
         st.streams.set(a, { readable });
-        st.incomingBidi._push({ readable, writable });
+        try { st.incomingBidi.controller.enqueue({ readable: readable.stream, writable }); } catch (e) {}
         break;
       }
 
       case 'streamData': {
         const s = st.streams.get(a);  // a: streamId, b: Uint8Array, c: fin
         if (s && s.readable) {
-          if (b && b.length) s.readable._push(b);
-          if (c) s.readable._close();
+          if (b && b.length) { try { s.readable.controller.enqueue(b); } catch (e) {} }
+          if (c) { try { s.readable.controller.close(); } catch (e) {} }
         }
         break;
       }
 
       case 'streamReset': {
         const s = st.streams.get(a);  // a: streamId, b: error code
-        if (s && s.readable) s.readable._fail(new WebTransportError('Stream reset (code ' + b + ')', { source: 'stream', streamErrorCode: b }));
+        if (s && s.readable) {
+          try {
+            s.readable.controller.error(new WebTransportError('Stream reset (code ' + b + ')', { source: 'stream', streamErrorCode: b }));
+          } catch (e) {}
+        }
         st.streams.delete(a);
         break;
       }

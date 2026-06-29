@@ -224,4 +224,112 @@ describe("WebTransport API", () => {
     );
     expect(out).toContain("PASS: uni hello uni");
   });
+
+  // --- Proper WHATWG Streams surface --------------------------------------
+
+  it("exposes WHATWG stream globals and WebTransport streams are real streams", async () => {
+    if (!guard()) return;
+    const out = await runScript(
+      "wt-globals.js",
+      `async function main() {
+        const names = ['ReadableStream','WritableStream','TransformStream','TextEncoderStream','TextDecoderStream'];
+        const globalsOk = names.every((n) => typeof globalThis[n] === 'function');
+        const wt = new WebTransport('${SERVER_URL}');
+        await wt.ready;
+        const instOk = (wt.datagrams.readable instanceof ReadableStream)
+          && (wt.datagrams.writable instanceof WritableStream)
+          && (wt.incomingUnidirectionalStreams instanceof ReadableStream)
+          && (typeof wt.datagrams.readable.pipeThrough === 'function')
+          && (typeof wt.datagrams.readable[Symbol.asyncIterator] === 'function');
+        console.log(globalsOk && instOk ? 'PASS: globals' : 'FAIL: globals ' + globalsOk + '/' + instOk);
+        process.exit(0);
+      }
+      main();`,
+    );
+    expect(out).toContain("PASS: globals");
+  });
+
+  it("reads datagrams via async iteration (for await...of)", async () => {
+    if (!guard()) return;
+    const out = await runScript(
+      "wt-dgram-iter.js",
+      `async function main() {
+        const wt = new WebTransport('${SERVER_URL}');
+        await wt.ready;
+        const writer = wt.datagrams.writable.getWriter();
+        await writer.write(new TextEncoder().encode('iter-dgram'));
+        let got = '';
+        for await (const chunk of wt.datagrams.readable) { got = new TextDecoder().decode(chunk); break; }
+        console.log(got === 'iter-dgram' ? 'PASS: dgram-iter ' + got : 'FAIL: ' + JSON.stringify(got));
+        process.exit(0);
+      }
+      main();`,
+    );
+    expect(out).toContain("PASS: dgram-iter iter-dgram");
+  });
+
+  it("sends datagrams via datagrams.createWritable()", async () => {
+    if (!guard()) return;
+    const out = await runScript(
+      "wt-dgram-createwritable.js",
+      `async function main() {
+        const wt = new WebTransport('${SERVER_URL}');
+        await wt.ready;
+        const writer = wt.datagrams.createWritable().getWriter();
+        await writer.write(new TextEncoder().encode('cw-dgram'));
+        const reader = wt.datagrams.readable.getReader();
+        const { value } = await reader.read();
+        const got = new TextDecoder().decode(value);
+        console.log(got === 'cw-dgram' ? 'PASS: createWritable ' + got : 'FAIL: ' + JSON.stringify(got));
+        process.exit(0);
+      }
+      main();`,
+    );
+    expect(out).toContain("PASS: createWritable cw-dgram");
+  });
+
+  it("unidirectional streams via TextEncoderStream.pipeTo + pipeThrough(TextDecoderStream) (W3C echo pattern)", async () => {
+    if (!guard()) return;
+    const out = await runScript(
+      "wt-uni-pipe.js",
+      `async function main() {
+        const wt = new WebTransport('${SERVER_URL}');
+        await wt.ready;
+        const incoming = wt.incomingUnidirectionalStreams.getReader();
+        const enc = new TextEncoderStream();
+        const w = enc.writable.getWriter();
+        w.write('uni-pipe'); w.close();
+        await enc.readable.pipeTo(await wt.createUnidirectionalStream());
+        const { value: stream } = await incoming.read();
+        if (!stream) { console.log('FAIL: no incoming uni'); process.exit(0); }
+        let got = '';
+        for await (const chunk of stream.pipeThrough(new TextDecoderStream())) got += chunk;
+        console.log(got === 'uni-pipe' ? 'PASS: uni-pipe ' + got : 'FAIL: ' + JSON.stringify(got));
+        process.exit(0);
+      }
+      main();`,
+    );
+    expect(out).toContain("PASS: uni-pipe uni-pipe");
+  });
+
+  it("bidirectional streams via chained pipeThrough (encoder -> bidi -> decoder)", async () => {
+    if (!guard()) return;
+    const out = await runScript(
+      "wt-bidi-pipe.js",
+      `async function main() {
+        const wt = new WebTransport('${SERVER_URL}');
+        await wt.ready;
+        const enc = new TextEncoderStream();
+        const w = enc.writable.getWriter();
+        w.write('bidi-pipe'); w.close();
+        let got = '';
+        const bidi = await wt.createBidirectionalStream();
+        for await (const msg of enc.readable.pipeThrough(bidi).pipeThrough(new TextDecoderStream())) got += msg;
+        console.log(got === 'bidi-pipe' ? 'PASS: bidi-pipe ' + got : 'FAIL: ' + JSON.stringify(got));
+        process.exit(0);
+      }
+      main();`,
+    );
+    expect(out).toContain("PASS: bidi-pipe bidi-pipe");
+  });
 });

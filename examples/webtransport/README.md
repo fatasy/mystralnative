@@ -10,6 +10,11 @@ It exercises the full client surface against a local echo server:
 - reliable **bidirectional** streams
 - reliable **unidirectional** streams (outgoing + the server's echo stream back)
 
+Streams are real WHATWG streams, so `pipeTo()`, `pipeThrough()`, async iteration
+(`for await … of`) and `TextEncoderStream`/`TextDecoderStream` all work — the
+canonical [W3C WebTransport samples](https://github.com/w3c/webtransport/tree/main/samples)
+run unmodified.
+
 ```
 webtransport/
 ├── webtransport-test.js   ← the example (runs under the mystral runtime)

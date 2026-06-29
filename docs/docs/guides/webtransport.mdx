@@ -51,6 +51,27 @@ const sr = stream.readable.getReader();
 const chunk = await sr.read(); // { value, done }
 ```
 
+## Working with streams
+
+WebTransport streams are real WHATWG streams, so you can use pipes, transform
+streams and async iteration instead of manual reader/writer loops:
+
+```js
+// Send a UTF-8 string over a unidirectional stream.
+const enc = new TextEncoderStream();
+const w = enc.writable.getWriter();
+w.write("hello server");
+w.close();
+await enc.readable.pipeTo(await transport.createUnidirectionalStream());
+
+// Receive server-initiated unidirectional streams and decode them as text.
+for await (const readable of transport.incomingUnidirectionalStreams) {
+  for await (const text of readable.pipeThrough(new TextDecoderStream())) {
+    console.log("received:", text);
+  }
+}
+```
+
 ## Supported surface
 
 | Feature | Status |
@@ -63,11 +84,23 @@ const chunk = await sr.read(); // { value, done }
 | `transport.createUnidirectionalStream()` | ✅ |
 | `transport.incomingUnidirectionalStreams` | ✅ |
 | `transport.incomingBidirectionalStreams` | ✅ |
+| `transport.datagrams.createWritable()` | ✅ |
 | `WebTransportError` | ✅ |
+| `stream.pipeTo()` / `stream.pipeThrough()` / `stream.tee()` | ✅ |
+| `for await (const chunk of stream)` (async iteration) | ✅ |
+| `TextEncoderStream` / `TextDecoderStream` | ✅ |
 | `serverCertificateHashes` (self-signed pinning) | ⏳ not yet — peer verification is currently disabled for local/dev servers |
+| `sendOrder` / `sendGroup` / `writer.atomicWrite()` / `writer.commit()` / `transport.draining` | ⏳ roadmap |
 
-Streams are exposed as spec-shaped `ReadableStream` / `WritableStream` objects
-supporting `getReader().read()` and `getWriter().write()/close()/abort()`.
+Streams are real WHATWG streams. The runtime ships proper global
+`ReadableStream`, `WritableStream` and `TransformStream` implementations, so a
+WebTransport stream's `readable`/`writable` support the full surface real code
+expects: `getReader().read()` and `getWriter().write()/close()/abort()`, plus
+`pipeTo()`, `pipeThrough()`, `tee()`, and async iteration
+(`for await (const chunk of stream) { … }`). `TextEncoderStream` and
+`TextDecoderStream` are also provided, so the canonical
+[W3C WebTransport samples](https://github.com/w3c/webtransport/tree/main/samples)
+— e.g. `readable.pipeThrough(new TextDecoderStream())` — work unmodified.
 
 ## Architecture notes
 
