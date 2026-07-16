@@ -2702,14 +2702,20 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
                                     auto jsRenderPass = g_engine->newObject();
                                     g_engine->setPrivateData(jsRenderPass, renderPass);
 
+                                    // A Three.js RenderPipeline can open an offscreen pass while
+                                    // the final surface pass is still alive. Every JS method must
+                                    // therefore target the encoder represented by this wrapper,
+                                    // not the most recently opened pass in g_jsRenderPass.
+                                    WGPURenderPassEncoder capturedRenderPassForCommands = renderPass;
+
                                     // renderPass.setPipeline(pipeline)
                                     g_engine->setProperty(jsRenderPass, "setPipeline",
-                                        g_engine->newFunction("setPipeline", [](void* ctx, const std::vector<js::JSValueHandle>& args) {
+                                        g_engine->newFunction("setPipeline", [capturedRenderPassForCommands](void* ctx, const std::vector<js::JSValueHandle>& args) {
                                             if (args.empty()) return g_engine->newUndefined();
 
                                             WGPURenderPipeline pipeline = (WGPURenderPipeline)g_engine->getPrivateData(args[0]);
-                                            if (g_jsRenderPass && pipeline) {
-                                                wgpuRenderPassEncoderSetPipeline(g_jsRenderPass, pipeline);
+                                            if (capturedRenderPassForCommands && pipeline) {
+                                                wgpuRenderPassEncoderSetPipeline(capturedRenderPassForCommands, pipeline);
                                                 if (g_verboseLogging) std::cout << "[WebGPU] Pipeline set" << std::endl;
                                             }
 
@@ -2719,7 +2725,7 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
 
                                     // renderPass.setBindGroup(index, bindGroup, dynamicOffsets?)
                                     g_engine->setProperty(jsRenderPass, "setBindGroup",
-                                        g_engine->newFunction("setBindGroup", [](void* ctx, const std::vector<js::JSValueHandle>& args) {
+                                        g_engine->newFunction("setBindGroup", [capturedRenderPassForCommands](void* ctx, const std::vector<js::JSValueHandle>& args) {
                                             if (args.size() < 2) {
                                                 g_engine->throwException("setBindGroup requires index and bindGroup");
                                                 return g_engine->newUndefined();
@@ -2728,9 +2734,9 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
                                             uint32_t groupIndex = (uint32_t)g_engine->toNumber(args[0]);
                                             WGPUBindGroup bindGroup = (WGPUBindGroup)g_engine->getPrivateData(args[1]);
 
-                                            if (g_jsRenderPass && bindGroup) {
+                                            if (capturedRenderPassForCommands && bindGroup) {
                                                 // TODO: Support dynamic offsets
-                                                wgpuRenderPassEncoderSetBindGroup(g_jsRenderPass, groupIndex, bindGroup, 0, nullptr);
+                                                wgpuRenderPassEncoderSetBindGroup(capturedRenderPassForCommands, groupIndex, bindGroup, 0, nullptr);
                                                 if (g_verboseLogging) std::cout << "[WebGPU] Set bind group at index " << groupIndex << std::endl;
                                             }
 
@@ -2740,7 +2746,7 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
 
                                     // renderPass.draw(vertexCount, instanceCount?, firstVertex?, firstInstance?)
                                     g_engine->setProperty(jsRenderPass, "draw",
-                                        g_engine->newFunction("draw", [](void* ctx, const std::vector<js::JSValueHandle>& args) {
+                                        g_engine->newFunction("draw", [capturedRenderPassForCommands](void* ctx, const std::vector<js::JSValueHandle>& args) {
                                             if (args.empty()) return g_engine->newUndefined();
 
                                             uint32_t vertexCount = (uint32_t)g_engine->toNumber(args[0]);
@@ -2748,8 +2754,8 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
                                             uint32_t firstVertex = args.size() > 2 ? (uint32_t)g_engine->toNumber(args[2]) : 0;
                                             uint32_t firstInstance = args.size() > 3 ? (uint32_t)g_engine->toNumber(args[3]) : 0;
 
-                                            if (g_jsRenderPass) {
-                                                wgpuRenderPassEncoderDraw(g_jsRenderPass, vertexCount, instanceCount, firstVertex, firstInstance);
+                                            if (capturedRenderPassForCommands) {
+                                                wgpuRenderPassEncoderDraw(capturedRenderPassForCommands, vertexCount, instanceCount, firstVertex, firstInstance);
                                                 if (g_verboseLogging) std::cout << "[WebGPU] Draw: " << vertexCount << " vertices" << std::endl;
                                             }
 
@@ -2759,7 +2765,7 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
 
                                     // renderPass.setVertexBuffer(slot, buffer, offset?, size?)
                                     g_engine->setProperty(jsRenderPass, "setVertexBuffer",
-                                        g_engine->newFunction("setVertexBuffer", [](void* ctx, const std::vector<js::JSValueHandle>& args) {
+                                        g_engine->newFunction("setVertexBuffer", [capturedRenderPassForCommands](void* ctx, const std::vector<js::JSValueHandle>& args) {
                                             if (args.size() < 2) return g_engine->newUndefined();
 
                                             uint32_t slot = (uint32_t)g_engine->toNumber(args[0]);
@@ -2767,8 +2773,8 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
                                             uint64_t offset = args.size() > 2 ? (uint64_t)g_engine->toNumber(args[2]) : 0;
                                             uint64_t size = args.size() > 3 ? (uint64_t)g_engine->toNumber(args[3]) : WGPU_WHOLE_SIZE;
 
-                                            if (g_jsRenderPass && buffer) {
-                                                wgpuRenderPassEncoderSetVertexBuffer(g_jsRenderPass, slot, buffer, offset, size);
+                                            if (capturedRenderPassForCommands && buffer) {
+                                                wgpuRenderPassEncoderSetVertexBuffer(capturedRenderPassForCommands, slot, buffer, offset, size);
                                                 if (g_verboseLogging) std::cout << "[WebGPU] Set vertex buffer at slot " << slot << std::endl;
                                             }
 
@@ -2778,7 +2784,7 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
 
                                     // renderPass.setIndexBuffer(buffer, format, offset?, size?)
                                     g_engine->setProperty(jsRenderPass, "setIndexBuffer",
-                                        g_engine->newFunction("setIndexBuffer", [](void* ctx, const std::vector<js::JSValueHandle>& args) {
+                                        g_engine->newFunction("setIndexBuffer", [capturedRenderPassForCommands](void* ctx, const std::vector<js::JSValueHandle>& args) {
                                             if (args.size() < 2) return g_engine->newUndefined();
 
                                             WGPUBuffer buffer = (WGPUBuffer)g_engine->getPrivateData(args[0]);
@@ -2790,8 +2796,8 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
                                             if (formatStr == "uint32") format = WGPUIndexFormat_Uint32;
                                             else if (formatStr == "uint16") format = WGPUIndexFormat_Uint16;
 
-                                            if (g_jsRenderPass && buffer) {
-                                                wgpuRenderPassEncoderSetIndexBuffer(g_jsRenderPass, buffer, format, offset, size);
+                                            if (capturedRenderPassForCommands && buffer) {
+                                                wgpuRenderPassEncoderSetIndexBuffer(capturedRenderPassForCommands, buffer, format, offset, size);
                                                 if (g_verboseLogging) std::cout << "[WebGPU] Set index buffer, format: " << formatStr << std::endl;
                                             }
 
@@ -2801,7 +2807,7 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
 
                                     // renderPass.drawIndexed(indexCount, instanceCount?, firstIndex?, baseVertex?, firstInstance?)
                                     g_engine->setProperty(jsRenderPass, "drawIndexed",
-                                        g_engine->newFunction("drawIndexed", [](void* ctx, const std::vector<js::JSValueHandle>& args) {
+                                        g_engine->newFunction("drawIndexed", [capturedRenderPassForCommands](void* ctx, const std::vector<js::JSValueHandle>& args) {
                                             if (args.empty()) return g_engine->newUndefined();
 
                                             uint32_t indexCount = (uint32_t)g_engine->toNumber(args[0]);
@@ -2810,8 +2816,8 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
                                             int32_t baseVertex = args.size() > 3 ? (int32_t)g_engine->toNumber(args[3]) : 0;
                                             uint32_t firstInstance = args.size() > 4 ? (uint32_t)g_engine->toNumber(args[4]) : 0;
 
-                                            if (g_jsRenderPass) {
-                                                wgpuRenderPassEncoderDrawIndexed(g_jsRenderPass, indexCount, instanceCount, firstIndex, baseVertex, firstInstance);
+                                            if (capturedRenderPassForCommands) {
+                                                wgpuRenderPassEncoderDrawIndexed(capturedRenderPassForCommands, indexCount, instanceCount, firstIndex, baseVertex, firstInstance);
                                                 if (g_verboseLogging) std::cout << "[WebGPU] DrawIndexed: " << indexCount << " indices, firstInstance=" << firstInstance << std::endl;
                                             }
 
@@ -2821,14 +2827,14 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
 
                                     // renderPass.drawIndirect(indirectBuffer, indirectOffset)
                                     g_engine->setProperty(jsRenderPass, "drawIndirect",
-                                        g_engine->newFunction("drawIndirect", [](void* ctx, const std::vector<js::JSValueHandle>& args) {
+                                        g_engine->newFunction("drawIndirect", [capturedRenderPassForCommands](void* ctx, const std::vector<js::JSValueHandle>& args) {
                                             if (args.size() < 2) return g_engine->newUndefined();
 
                                             WGPUBuffer indirectBuffer = (WGPUBuffer)g_engine->getPrivateData(args[0]);
                                             uint64_t indirectOffset = (uint64_t)g_engine->toNumber(args[1]);
 
-                                            if (g_jsRenderPass && indirectBuffer) {
-                                                wgpuRenderPassEncoderDrawIndirect(g_jsRenderPass, indirectBuffer, indirectOffset);
+                                            if (capturedRenderPassForCommands && indirectBuffer) {
+                                                wgpuRenderPassEncoderDrawIndirect(capturedRenderPassForCommands, indirectBuffer, indirectOffset);
                                                 if (g_verboseLogging) std::cout << "[WebGPU] DrawIndirect at offset " << indirectOffset << std::endl;
                                             }
 
@@ -2838,14 +2844,14 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
 
                                     // renderPass.drawIndexedIndirect(indirectBuffer, indirectOffset)
                                     g_engine->setProperty(jsRenderPass, "drawIndexedIndirect",
-                                        g_engine->newFunction("drawIndexedIndirect", [](void* ctx, const std::vector<js::JSValueHandle>& args) {
+                                        g_engine->newFunction("drawIndexedIndirect", [capturedRenderPassForCommands](void* ctx, const std::vector<js::JSValueHandle>& args) {
                                             if (args.size() < 2) return g_engine->newUndefined();
 
                                             WGPUBuffer indirectBuffer = (WGPUBuffer)g_engine->getPrivateData(args[0]);
                                             uint64_t indirectOffset = (uint64_t)g_engine->toNumber(args[1]);
 
-                                            if (g_jsRenderPass && indirectBuffer) {
-                                                wgpuRenderPassEncoderDrawIndexedIndirect(g_jsRenderPass, indirectBuffer, indirectOffset);
+                                            if (capturedRenderPassForCommands && indirectBuffer) {
+                                                wgpuRenderPassEncoderDrawIndexedIndirect(capturedRenderPassForCommands, indirectBuffer, indirectOffset);
                                                 if (g_verboseLogging) std::cout << "[WebGPU] DrawIndexedIndirect at offset " << indirectOffset << std::endl;
                                             }
 
@@ -2855,7 +2861,7 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
 
                                     // renderPass.setViewport(x, y, width, height, minDepth, maxDepth)
                                     g_engine->setProperty(jsRenderPass, "setViewport",
-                                        g_engine->newFunction("setViewport", [](void* ctx, const std::vector<js::JSValueHandle>& args) {
+                                        g_engine->newFunction("setViewport", [capturedRenderPassForCommands](void* ctx, const std::vector<js::JSValueHandle>& args) {
                                             if (args.size() < 6) return g_engine->newUndefined();
 
                                             float x = (float)g_engine->toNumber(args[0]);
@@ -2865,8 +2871,8 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
                                             float minDepth = (float)g_engine->toNumber(args[4]);
                                             float maxDepth = (float)g_engine->toNumber(args[5]);
 
-                                            if (g_jsRenderPass) {
-                                                wgpuRenderPassEncoderSetViewport(g_jsRenderPass, x, y, width, height, minDepth, maxDepth);
+                                            if (capturedRenderPassForCommands) {
+                                                wgpuRenderPassEncoderSetViewport(capturedRenderPassForCommands, x, y, width, height, minDepth, maxDepth);
                                                 if (g_verboseLogging) std::cout << "[WebGPU] SetViewport: " << x << "," << y << " " << width << "x" << height << std::endl;
                                             }
 
@@ -2876,7 +2882,7 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
 
                                     // renderPass.setScissorRect(x, y, width, height)
                                     g_engine->setProperty(jsRenderPass, "setScissorRect",
-                                        g_engine->newFunction("setScissorRect", [](void* ctx, const std::vector<js::JSValueHandle>& args) {
+                                        g_engine->newFunction("setScissorRect", [capturedRenderPassForCommands](void* ctx, const std::vector<js::JSValueHandle>& args) {
                                             if (args.size() < 4) return g_engine->newUndefined();
 
                                             uint32_t x = (uint32_t)g_engine->toNumber(args[0]);
@@ -2884,8 +2890,8 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
                                             uint32_t width = (uint32_t)g_engine->toNumber(args[2]);
                                             uint32_t height = (uint32_t)g_engine->toNumber(args[3]);
 
-                                            if (g_jsRenderPass) {
-                                                wgpuRenderPassEncoderSetScissorRect(g_jsRenderPass, x, y, width, height);
+                                            if (capturedRenderPassForCommands) {
+                                                wgpuRenderPassEncoderSetScissorRect(capturedRenderPassForCommands, x, y, width, height);
                                                 if (g_verboseLogging) std::cout << "[WebGPU] SetScissorRect: " << x << "," << y << " " << width << "x" << height << std::endl;
                                             }
 
@@ -2895,7 +2901,7 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
 
                                     // renderPass.setBlendConstant(color)
                                     g_engine->setProperty(jsRenderPass, "setBlendConstant",
-                                        g_engine->newFunction("setBlendConstant", [](void* ctx, const std::vector<js::JSValueHandle>& args) {
+                                        g_engine->newFunction("setBlendConstant", [capturedRenderPassForCommands](void* ctx, const std::vector<js::JSValueHandle>& args) {
                                             if (args.empty()) return g_engine->newUndefined();
 
                                             auto color = args[0];
@@ -2912,8 +2918,8 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
                                                 blendColor.a = g_engine->toNumber(g_engine->getProperty(color, "a"));
                                             }
 
-                                            if (g_jsRenderPass) {
-                                                wgpuRenderPassEncoderSetBlendConstant(g_jsRenderPass, &blendColor);
+                                            if (capturedRenderPassForCommands) {
+                                                wgpuRenderPassEncoderSetBlendConstant(capturedRenderPassForCommands, &blendColor);
                                             }
 
                                             return g_engine->newUndefined();
@@ -2922,12 +2928,12 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
 
                                     // renderPass.setStencilReference(reference)
                                     g_engine->setProperty(jsRenderPass, "setStencilReference",
-                                        g_engine->newFunction("setStencilReference", [](void* ctx, const std::vector<js::JSValueHandle>& args) {
+                                        g_engine->newFunction("setStencilReference", [capturedRenderPassForCommands](void* ctx, const std::vector<js::JSValueHandle>& args) {
                                             if (args.empty()) return g_engine->newUndefined();
 
                                             uint32_t reference = (uint32_t)g_engine->toNumber(args[0]);
-                                            if (g_jsRenderPass) {
-                                                wgpuRenderPassEncoderSetStencilReference(g_jsRenderPass, reference);
+                                            if (capturedRenderPassForCommands) {
+                                                wgpuRenderPassEncoderSetStencilReference(capturedRenderPassForCommands, reference);
                                             }
 
                                             return g_engine->newUndefined();
