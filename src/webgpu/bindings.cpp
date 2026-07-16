@@ -2018,11 +2018,12 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
                                 }
                             }
 
-                            // Vertex state (entryPoint stays zero-init/null when omitted —
-                            // the implementation selects the module's single entry point)
+                            // Vertex state
                             pipelineDesc.vertex.module = vsModule;
                             if (hasVertexEntry) {
                                 WGPU_SET_ENTRY_POINT(pipelineDesc.vertex, vertexEntry.c_str());
+                            } else {
+                                WGPU_SET_ENTRY_POINT_AUTO(pipelineDesc.vertex);
                             }
 
                             // Parse vertex buffers if present
@@ -2247,6 +2248,8 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
                                 fragmentState.module = fsModule;
                                 if (hasFragmentEntry) {
                                     WGPU_SET_ENTRY_POINT(fragmentState, fragmentEntry.c_str());
+                                } else {
+                                    WGPU_SET_ENTRY_POINT_AUTO(fragmentState);
                                 }
                                 fragmentState.targetCount = colorTargets.size();
                                 fragmentState.targets = colorTargets.data();
@@ -2455,6 +2458,8 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
                             pipelineDesc.compute.module = module;
                             if (hasEntryPoint) {
                                 WGPU_SET_ENTRY_POINT(pipelineDesc.compute, entryPoint.c_str());
+                            } else {
+                                WGPU_SET_ENTRY_POINT_AUTO(pipelineDesc.compute);
                             }
 
                             WGPUComputePipeline pipeline = wgpuDeviceCreateComputePipeline(g_device, &pipelineDesc);
@@ -4277,6 +4282,23 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
                         "device.lost"
                     );
                     g_engine->setProperty(device, "lost", deviceLostPromise);
+
+                    // createRenderPipelineAsync / createComputePipelineAsync —
+                    // three.js' compileAsync path uses these; alias them to the
+                    // sync variants wrapped in a resolved Promise (JS glue so the
+                    // pipeline object travels through the Promise unchanged)
+                    g_engine->setGlobalProperty("__mystral_device_tmp", device);
+                    g_engine->eval(R"(
+                        (function(d) {
+                            d.createRenderPipelineAsync = function(desc) {
+                                return Promise.resolve(d.createRenderPipeline(desc));
+                            };
+                            d.createComputePipelineAsync = function(desc) {
+                                return Promise.resolve(d.createComputePipeline(desc));
+                            };
+                        })(globalThis.__mystral_device_tmp);
+                        delete globalThis.__mystral_device_tmp;
+                    )", "pipeline-async-setup");
 
                     // Return the device directly
                     // await on a non-Promise just returns the value
