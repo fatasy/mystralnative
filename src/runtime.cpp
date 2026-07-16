@@ -148,7 +148,7 @@ static void installCrashHandlers() {
 
 // Forward declaration for WebGPU bindings
 namespace webgpu {
-    bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuDevice, void* wgpuQueue, void* wgpuSurface, uint32_t surfaceFormat, uint32_t width, uint32_t height, bool debug = false);
+    bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, void* wgpuDevice, void* wgpuQueue, void* wgpuSurface, uint32_t surfaceFormat, uint32_t width, uint32_t height, bool debug = false);
     void setOffscreenTexture(void* texture, void* textureView);
     void beginDawnFrame();
     void endDawnFrame();
@@ -437,7 +437,7 @@ public:
         // Set up WebGPU bindings in JS
         // For no-SDL mode, pass nullptr for surface (offscreen rendering uses texture directly)
         WGPUSurface surface = config_.noSdl ? nullptr : webgpu_->getSurface();
-        if (!webgpu::initBindings(jsEngine_.get(), webgpu_->getInstance(), webgpu_->getDevice(), webgpu_->getQueue(), surface, webgpu_->getPreferredFormat(), width_, height_, config_.debug)) {
+        if (!webgpu::initBindings(jsEngine_.get(), webgpu_->getInstance(), webgpu_->getAdapter(), webgpu_->getDevice(), webgpu_->getQueue(), surface, webgpu_->getPreferredFormat(), width_, height_, config_.debug)) {
             std::cerr << "[Mystral] Failed to initialize WebGPU bindings" << std::endl;
             return false;
         }
@@ -3752,6 +3752,11 @@ globalThis.__mystralNativeDecodeDracoAsync = function(buffer, attrs) {
                     };
                 }
                 return { tagName: (tagName || '').toUpperCase(), style: {} };
+            };
+            // Namespaced variant — libraries (e.g. three.js loaders) create
+            // elements via createElementNS('http://www.w3.org/1999/xhtml', tag)
+            document.createElementNS = function(namespaceURI, tagName) {
+                return document.createElement(tagName);
             };
         )";
         jsEngine_->eval(createElementSetup, "createElement-setup");

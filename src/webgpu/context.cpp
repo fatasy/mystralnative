@@ -184,6 +184,34 @@ static void onDeviceError(WGPUErrorType type, char const* message, void* userdat
 }
 #endif
 
+#if defined(MYSTRAL_WEBGPU_WGPU) || defined(MYSTRAL_WEBGPU_DAWN)
+/**
+ * Enumerate every feature the adapter exposes so the device can be created
+ * with all of them — matching what a browser page can opt into (three.js,
+ * for example, requests every available adapter feature when creating its
+ * device). Previously only IndirectFirstInstance was requested, so standard
+ * capabilities such as float32-filterable or the texture-format tiers were
+ * silently missing from the device even when the hardware supports them.
+ */
+static std::vector<WGPUFeatureName> enumerateAdapterFeatures(WGPUAdapter adapter) {
+    std::vector<WGPUFeatureName> features;
+#if defined(MYSTRAL_WEBGPU_DAWN)
+    WGPUSupportedFeatures supported = {};
+    wgpuAdapterGetFeatures(adapter, &supported);
+    features.assign(supported.features, supported.features + supported.featureCount);
+    wgpuSupportedFeaturesFreeMembers(supported);
+#else
+    size_t count = wgpuAdapterEnumerateFeatures(adapter, nullptr);
+    features.resize(count);
+    if (count > 0) {
+        wgpuAdapterEnumerateFeatures(adapter, features.data());
+    }
+#endif
+    std::cout << "[WebGPU] Requesting " << features.size() << " adapter features" << std::endl;
+    return features;
+}
+#endif
+
 #if defined(MYSTRAL_WEBGPU_WGPU)
 static void onWgpuLog(WGPULogLevel level, char const* message, void* userdata) {
     const char* levelStr = "???";
@@ -348,33 +376,20 @@ bool Context::initializeHeadless() {
     wgpuAdapterGetLimits(adapter_, &adapterLimits);
     WGPULimits requiredLimits = adapterLimits;
     deviceDesc.requiredLimits = &requiredLimits;
-
-    static WGPUFeatureName requiredFeaturesDawn[1];
-    size_t featureCount = 0;
-    if (wgpuAdapterHasFeature(adapter_, WGPUFeatureName_IndirectFirstInstance)) {
-        requiredFeaturesDawn[0] = WGPUFeatureName_IndirectFirstInstance;
-        featureCount = 1;
-        hasIndirectFirstInstance_ = true;
-    }
-    deviceDesc.requiredFeatureCount = featureCount;
-    deviceDesc.requiredFeatures = featureCount > 0 ? requiredFeaturesDawn : nullptr;
 #elif defined(MYSTRAL_WEBGPU_WGPU)
     WGPUSupportedLimits adapterLimits = {};
     wgpuAdapterGetLimits(adapter_, &adapterLimits);
     WGPURequiredLimits requiredLimits = {};
     requiredLimits.limits = adapterLimits.limits;
     deviceDesc.requiredLimits = &requiredLimits;
-
-    static WGPUFeatureName requiredFeaturesWGPU[1];
-    size_t featureCount = 0;
-    if (wgpuAdapterHasFeature(adapter_, WGPUFeatureName_IndirectFirstInstance)) {
-        requiredFeaturesWGPU[0] = WGPUFeatureName_IndirectFirstInstance;
-        featureCount = 1;
-        hasIndirectFirstInstance_ = true;
-    }
-    deviceDesc.requiredFeatureCount = featureCount;
-    deviceDesc.requiredFeatures = featureCount > 0 ? requiredFeaturesWGPU : nullptr;
 #endif
+
+    // Request every adapter feature (see enumerateAdapterFeatures)
+    std::vector<WGPUFeatureName> requiredFeatures = enumerateAdapterFeatures(adapter_);
+    hasIndirectFirstInstance_ =
+        wgpuAdapterHasFeature(adapter_, WGPUFeatureName_IndirectFirstInstance);
+    deviceDesc.requiredFeatureCount = requiredFeatures.size();
+    deviceDesc.requiredFeatures = requiredFeatures.empty() ? nullptr : requiredFeatures.data();
 
     WGPUUncapturedErrorCallbackInfo errorCallbackInfo = {};
     errorCallbackInfo.callback = onDeviceError;
@@ -622,22 +637,6 @@ bool Context::createSurface(void* nativeHandle, int platformType) {
     }
 
     deviceDesc.requiredLimits = &requiredLimits;
-
-    // Check if IndirectFirstInstance is supported before requesting it
-    // This feature allows instance_index in shaders to include firstInstance offset
-    static WGPUFeatureName requiredFeaturesDawn[1];
-    size_t featureCount = 0;
-    if (wgpuAdapterHasFeature(adapter_, WGPUFeatureName_IndirectFirstInstance)) {
-        requiredFeaturesDawn[0] = WGPUFeatureName_IndirectFirstInstance;
-        featureCount = 1;
-        hasIndirectFirstInstance_ = true;
-        std::cout << "[WebGPU] Requesting IndirectFirstInstance feature (supported)" << std::endl;
-    } else {
-        hasIndirectFirstInstance_ = false;
-        std::cout << "[WebGPU] IndirectFirstInstance feature NOT supported (continuing without)" << std::endl;
-    }
-    deviceDesc.requiredFeatureCount = featureCount;
-    deviceDesc.requiredFeatures = featureCount > 0 ? requiredFeaturesDawn : nullptr;
 #elif defined(MYSTRAL_WEBGPU_WGPU)
     // wgpu-native uses WGPURequiredLimits wrapper
     WGPUSupportedLimits adapterLimits = {};
@@ -654,23 +653,16 @@ bool Context::createSurface(void* nativeHandle, int platformType) {
     }
 
     deviceDesc.requiredLimits = &requiredLimits;
-
-    // Check if IndirectFirstInstance is supported before requesting it
-    // This feature allows instance_index in shaders to include firstInstance offset
-    static WGPUFeatureName requiredFeaturesWGPU[1];
-    size_t featureCount = 0;
-    if (wgpuAdapterHasFeature(adapter_, WGPUFeatureName_IndirectFirstInstance)) {
-        requiredFeaturesWGPU[0] = WGPUFeatureName_IndirectFirstInstance;
-        featureCount = 1;
-        hasIndirectFirstInstance_ = true;
-        std::cout << "[WebGPU] Requesting IndirectFirstInstance feature (supported)" << std::endl;
-    } else {
-        hasIndirectFirstInstance_ = false;
-        std::cout << "[WebGPU] IndirectFirstInstance feature NOT supported (continuing without)" << std::endl;
-    }
-    deviceDesc.requiredFeatureCount = featureCount;
-    deviceDesc.requiredFeatures = featureCount > 0 ? requiredFeaturesWGPU : nullptr;
 #endif
+
+    // Request every adapter feature (see enumerateAdapterFeatures)
+    std::vector<WGPUFeatureName> requiredFeatures = enumerateAdapterFeatures(adapter_);
+    hasIndirectFirstInstance_ =
+        wgpuAdapterHasFeature(adapter_, WGPUFeatureName_IndirectFirstInstance);
+    std::cout << "[WebGPU] IndirectFirstInstance "
+              << (hasIndirectFirstInstance_ ? "supported" : "NOT supported") << std::endl;
+    deviceDesc.requiredFeatureCount = requiredFeatures.size();
+    deviceDesc.requiredFeatures = requiredFeatures.empty() ? nullptr : requiredFeatures.data();
 
     // Set up error callback
     WGPUUncapturedErrorCallbackInfo errorCallbackInfo = {};
@@ -820,16 +812,6 @@ bool Context::createSurfaceWithDisplay(void* display, void* window, int platform
         requiredLimits.maxColorAttachmentBytesPerSample = neededBytesPerSample;
     }
     deviceDesc.requiredLimits = &requiredLimits;
-
-    static WGPUFeatureName requiredFeaturesDawn[1];
-    size_t featureCount = 0;
-    if (wgpuAdapterHasFeature(adapter_, WGPUFeatureName_IndirectFirstInstance)) {
-        requiredFeaturesDawn[0] = WGPUFeatureName_IndirectFirstInstance;
-        featureCount = 1;
-        hasIndirectFirstInstance_ = true;
-    }
-    deviceDesc.requiredFeatureCount = featureCount;
-    deviceDesc.requiredFeatures = featureCount > 0 ? requiredFeaturesDawn : nullptr;
 #elif defined(MYSTRAL_WEBGPU_WGPU)
     WGPUSupportedLimits adapterLimits = {};
     wgpuAdapterGetLimits(adapter_, &adapterLimits);
@@ -840,17 +822,14 @@ bool Context::createSurfaceWithDisplay(void* display, void* window, int platform
         requiredLimits.limits.maxColorAttachmentBytesPerSample = neededBytesPerSample;
     }
     deviceDesc.requiredLimits = &requiredLimits;
-
-    static WGPUFeatureName requiredFeaturesWGPU[1];
-    size_t featureCount = 0;
-    if (wgpuAdapterHasFeature(adapter_, WGPUFeatureName_IndirectFirstInstance)) {
-        requiredFeaturesWGPU[0] = WGPUFeatureName_IndirectFirstInstance;
-        featureCount = 1;
-        hasIndirectFirstInstance_ = true;
-    }
-    deviceDesc.requiredFeatureCount = featureCount;
-    deviceDesc.requiredFeatures = featureCount > 0 ? requiredFeaturesWGPU : nullptr;
 #endif
+
+    // Request every adapter feature (see enumerateAdapterFeatures)
+    std::vector<WGPUFeatureName> requiredFeatures = enumerateAdapterFeatures(adapter_);
+    hasIndirectFirstInstance_ =
+        wgpuAdapterHasFeature(adapter_, WGPUFeatureName_IndirectFirstInstance);
+    deviceDesc.requiredFeatureCount = requiredFeatures.size();
+    deviceDesc.requiredFeatures = requiredFeatures.empty() ? nullptr : requiredFeatures.data();
 
     WGPUUncapturedErrorCallbackInfo errorCallbackInfo = {};
     errorCallbackInfo.callback = onDeviceError;

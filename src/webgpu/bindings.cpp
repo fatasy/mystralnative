@@ -84,11 +84,152 @@ namespace webgpu {
 static bool g_verboseLogging = false;  // Disabled by default, enable with --debug
 
 // Store references to WebGPU objects
+static WGPUAdapter g_adapter = nullptr;
 static WGPUDevice g_device = nullptr;
 static WGPUQueue g_queue = nullptr;
 static WGPUSurface g_surface = nullptr;
 static WGPUInstance g_instance = nullptr;
 static js::Engine* g_engine = nullptr;
+
+// ============================================================================
+// Limits & features reflection helpers
+// ============================================================================
+
+// Fill a JS object with every field of a WGPULimits struct so JS sees what the
+// native device/adapter actually supports. This matters for correctness, not
+// just introspection: three.js reads limits.maxComputeWorkgroupsPerDimension
+// to split large compute dispatches into 2D grids — with the old hardcoded
+// object (which omitted the compute limits) a 4096² kernel dispatched
+// 262144×1×1 workgroups, exceeding the 65535 cap and invalidating the whole
+// command buffer.
+static void setLimitsProperties(js::JSValueHandle obj, const WGPULimits& l) {
+    auto set = [&](const char* name, double v) {
+        g_engine->setProperty(obj, name, g_engine->newNumber(v));
+    };
+    set("maxTextureDimension1D", l.maxTextureDimension1D);
+    set("maxTextureDimension2D", l.maxTextureDimension2D);
+    set("maxTextureDimension3D", l.maxTextureDimension3D);
+    set("maxTextureArrayLayers", l.maxTextureArrayLayers);
+    set("maxBindGroups", l.maxBindGroups);
+    set("maxBindGroupsPlusVertexBuffers", l.maxBindGroupsPlusVertexBuffers);
+    set("maxBindingsPerBindGroup", l.maxBindingsPerBindGroup);
+    set("maxDynamicUniformBuffersPerPipelineLayout", l.maxDynamicUniformBuffersPerPipelineLayout);
+    set("maxDynamicStorageBuffersPerPipelineLayout", l.maxDynamicStorageBuffersPerPipelineLayout);
+    set("maxSampledTexturesPerShaderStage", l.maxSampledTexturesPerShaderStage);
+    set("maxSamplersPerShaderStage", l.maxSamplersPerShaderStage);
+    set("maxStorageBuffersPerShaderStage", l.maxStorageBuffersPerShaderStage);
+    set("maxStorageTexturesPerShaderStage", l.maxStorageTexturesPerShaderStage);
+    set("maxUniformBuffersPerShaderStage", l.maxUniformBuffersPerShaderStage);
+    set("maxUniformBufferBindingSize", (double)l.maxUniformBufferBindingSize);
+    set("maxStorageBufferBindingSize", (double)l.maxStorageBufferBindingSize);
+    set("minUniformBufferOffsetAlignment", l.minUniformBufferOffsetAlignment);
+    set("minStorageBufferOffsetAlignment", l.minStorageBufferOffsetAlignment);
+    set("maxVertexBuffers", l.maxVertexBuffers);
+    set("maxBufferSize", (double)l.maxBufferSize);
+    set("maxVertexAttributes", l.maxVertexAttributes);
+    set("maxVertexBufferArrayStride", l.maxVertexBufferArrayStride);
+    set("maxColorAttachments", l.maxColorAttachments);
+    set("maxColorAttachmentBytesPerSample", l.maxColorAttachmentBytesPerSample);
+    set("maxComputeWorkgroupStorageSize", l.maxComputeWorkgroupStorageSize);
+    set("maxComputeInvocationsPerWorkgroup", l.maxComputeInvocationsPerWorkgroup);
+    set("maxComputeWorkgroupSizeX", l.maxComputeWorkgroupSizeX);
+    set("maxComputeWorkgroupSizeY", l.maxComputeWorkgroupSizeY);
+    set("maxComputeWorkgroupSizeZ", l.maxComputeWorkgroupSizeZ);
+    set("maxComputeWorkgroupsPerDimension", l.maxComputeWorkgroupsPerDimension);
+}
+
+// Query the real limits of the live device (Dawn and wgpu-native disagree on
+// the out-struct shape). Returns false when no device is available.
+static bool queryDeviceLimits(WGPULimits* out) {
+    if (!g_device) return false;
+#if defined(MYSTRAL_WEBGPU_DAWN)
+    WGPULimits limits = {};
+    wgpuDeviceGetLimits(g_device, &limits);
+    *out = limits;
+#else
+    WGPUSupportedLimits supported = {};
+    wgpuDeviceGetLimits(g_device, &supported);
+    *out = supported.limits;
+#endif
+    return true;
+}
+
+static bool queryAdapterLimits(WGPULimits* out) {
+    if (!g_adapter) return queryDeviceLimits(out);
+#if defined(MYSTRAL_WEBGPU_DAWN)
+    WGPULimits limits = {};
+    wgpuAdapterGetLimits(g_adapter, &limits);
+    *out = limits;
+#else
+    WGPUSupportedLimits supported = {};
+    wgpuAdapterGetLimits(g_adapter, &supported);
+    *out = supported.limits;
+#endif
+    return true;
+}
+
+// Standard WebGPU feature-name strings → WGPUFeatureName. Only names that are
+// spelled identically in the JS spec and available in both backends' headers
+// are listed unconditionally; newer enums are Dawn-only.
+struct FeatureNameEntry {
+    const char* name;
+    WGPUFeatureName feature;
+};
+static const FeatureNameEntry kFeatureNames[] = {
+    {"depth-clip-control", WGPUFeatureName_DepthClipControl},
+    {"depth32float-stencil8", WGPUFeatureName_Depth32FloatStencil8},
+    {"timestamp-query", WGPUFeatureName_TimestampQuery},
+    {"texture-compression-bc", WGPUFeatureName_TextureCompressionBC},
+    {"texture-compression-etc2", WGPUFeatureName_TextureCompressionETC2},
+    {"texture-compression-astc", WGPUFeatureName_TextureCompressionASTC},
+    {"indirect-first-instance", WGPUFeatureName_IndirectFirstInstance},
+    {"shader-f16", WGPUFeatureName_ShaderF16},
+    {"rg11b10ufloat-renderable", WGPUFeatureName_RG11B10UfloatRenderable},
+    {"bgra8unorm-storage", WGPUFeatureName_BGRA8UnormStorage},
+    {"float32-filterable", WGPUFeatureName_Float32Filterable},
+#if defined(MYSTRAL_WEBGPU_DAWN)
+    {"float32-blendable", WGPUFeatureName_Float32Blendable},
+    {"clip-distances", WGPUFeatureName_ClipDistances},
+    {"dual-source-blending", WGPUFeatureName_DualSourceBlending},
+    {"subgroups", WGPUFeatureName_Subgroups},
+    {"texture-formats-tier1", WGPUFeatureName_TextureFormatsTier1},
+#endif
+};
+
+// Build a browser-shaped GPUSupportedFeatures: an array of the enabled
+// feature-name strings (so `[...features]` works) with a `has()` method.
+static js::JSValueHandle buildFeaturesObject(bool (*hasFeature)(WGPUFeatureName)) {
+    auto features = g_engine->newArray(0);
+    uint32_t count = 0;
+    for (const auto& entry : kFeatureNames) {
+        if (hasFeature(entry.feature)) {
+            g_engine->setPropertyIndex(features, count++, g_engine->newString(entry.name));
+        }
+    }
+    g_engine->setProperty(features, "size", g_engine->newNumber(count));
+    g_engine->setProperty(features, "has",
+        g_engine->newFunction("has", [hasFeature](void* ctx, const std::vector<js::JSValueHandle>& args) {
+            if (args.empty()) return g_engine->newBoolean(false);
+            std::string name = g_engine->toString(args[0]);
+            for (const auto& entry : kFeatureNames) {
+                if (name == entry.name) {
+                    return g_engine->newBoolean(hasFeature(entry.feature));
+                }
+            }
+            return g_engine->newBoolean(false);
+        })
+    );
+    return features;
+}
+
+static bool deviceHasFeature(WGPUFeatureName feature) {
+    return g_device && wgpuDeviceHasFeature(g_device, feature);
+}
+
+static bool adapterHasFeature(WGPUFeatureName feature) {
+    if (!g_adapter) return deviceHasFeature(feature);
+    return wgpuAdapterHasFeature(g_adapter, feature);
+}
 
 // Offscreen rendering support (for no-SDL mode)
 static WGPUTexture g_offscreenTexture = nullptr;
@@ -348,7 +489,7 @@ static WGPUTexture getCurrentSwapchainTexture() {
 /**
  * Initialize WebGPU bindings in the JS engine
  */
-bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuDevice, void* wgpuQueue, void* wgpuSurface, uint32_t surfaceFormat, uint32_t width, uint32_t height, bool debug) {
+bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, void* wgpuDevice, void* wgpuQueue, void* wgpuSurface, uint32_t surfaceFormat, uint32_t width, uint32_t height, bool debug) {
     if (!engine) {
         std::cerr << "[WebGPU] No JS engine provided for bindings" << std::endl;
         return false;
@@ -360,6 +501,7 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuDevice, void
 
     g_engine = engine;
     g_instance = (WGPUInstance)wgpuInstance;
+    g_adapter = (WGPUAdapter)wgpuAdapter;
     g_device = (WGPUDevice)wgpuDevice;
     g_queue = (WGPUQueue)wgpuQueue;
     g_surface = (WGPUSurface)wgpuSurface;
@@ -1120,6 +1262,14 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuDevice, void
                     );
 
                     // queue.writeBuffer(buffer, offset, data, dataOffset?, size?)
+                    //
+                    // Spec conformance: when `data` is a TypedArray, the optional
+                    // dataOffset/size arguments are ELEMENT counts, not bytes
+                    // (https://www.w3.org/TR/webgpu/#dom-gpuqueue-writebuffer).
+                    // three.js relies on this for partial attribute uploads — the
+                    // previous byte interpretation shrank Float32Array writes 4×.
+                    // The view's byteOffset must also be honored, so the copy is
+                    // resolved against the view's underlying ArrayBuffer.
                     g_engine->setProperty(queue, "writeBuffer",
                         g_engine->newFunction("writeBuffer", [](void* ctx, const std::vector<js::JSValueHandle>& args) {
                             if (args.size() < 3) {
@@ -1129,22 +1279,52 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuDevice, void
 
                             WGPUBuffer buffer = (WGPUBuffer)g_engine->getPrivateData(args[0]);
                             uint64_t offset = (uint64_t)g_engine->toNumber(args[1]);
+                            auto data = args[2];
 
-                            // Get ArrayBuffer data
-                            size_t dataSize = 0;
-                            void* dataPtr = g_engine->getArrayBufferData(args[2], &dataSize);
+                            double bytesPerElement = 1;  // ArrayBuffer/DataView: offsets are bytes
+                            void* basePtr = nullptr;
+                            size_t viewByteOffset = 0;
+                            size_t viewByteLength = 0;
 
-                            if (!dataPtr || dataSize == 0) {
+                            auto bufferProp = g_engine->getProperty(data, "buffer");
+                            if (g_engine->isObject(bufferProp)) {
+                                // TypedArray or DataView: resolve against the underlying
+                                // ArrayBuffer so engines whose getArrayBufferData ignores
+                                // view offsets still copy the right window
+                                auto bpeProp = g_engine->getProperty(data, "BYTES_PER_ELEMENT");
+                                if (g_engine->isNumber(bpeProp)) {
+                                    bytesPerElement = g_engine->toNumber(bpeProp);
+                                }
+                                size_t baseSize = 0;
+                                basePtr = g_engine->getArrayBufferData(bufferProp, &baseSize);
+                                viewByteOffset = (size_t)g_engine->toNumber(g_engine->getProperty(data, "byteOffset"));
+                                viewByteLength = (size_t)g_engine->toNumber(g_engine->getProperty(data, "byteLength"));
+                            } else {
+                                size_t dataSize = 0;
+                                basePtr = g_engine->getArrayBufferData(data, &dataSize);
+                                viewByteLength = dataSize;
+                            }
+
+                            if (!basePtr || viewByteLength == 0) {
                                 g_engine->throwException("writeBuffer: invalid data");
                                 return g_engine->newUndefined();
                             }
 
-                            // Optional dataOffset and size
-                            size_t dataOffset = args.size() > 3 ? (size_t)g_engine->toNumber(args[3]) : 0;
-                            size_t writeSize = args.size() > 4 ? (size_t)g_engine->toNumber(args[4]) : (dataSize - dataOffset);
+                            size_t dataOffsetBytes = args.size() > 3
+                                ? (size_t)(g_engine->toNumber(args[3]) * bytesPerElement)
+                                : 0;
+                            size_t writeSize = args.size() > 4
+                                ? (size_t)(g_engine->toNumber(args[4]) * bytesPerElement)
+                                : (viewByteLength - dataOffsetBytes);
+
+                            if (dataOffsetBytes + writeSize > viewByteLength) {
+                                g_engine->throwException("writeBuffer: range out of bounds");
+                                return g_engine->newUndefined();
+                            }
 
                             if (buffer && g_queue) {
-                                wgpuQueueWriteBuffer(g_queue, buffer, offset, (uint8_t*)dataPtr + dataOffset, writeSize);
+                                wgpuQueueWriteBuffer(g_queue, buffer, offset,
+                                    (uint8_t*)basePtr + viewByteOffset + dataOffsetBytes, writeSize);
                             }
 
                             return g_engine->newUndefined();
@@ -1507,40 +1687,19 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuDevice, void
 
                     g_engine->setProperty(device, "queue", queue);
 
-                    // device.limits - expose device limits
+                    // device.limits - reflect the REAL limits of the live device
+                    // (it is created with the adapter's full limits in context.cpp;
+                    // a hardcoded subset here starved JS of the compute limits)
                     auto deviceLimits = g_engine->newObject();
-                    g_engine->setProperty(deviceLimits, "maxTextureDimension2D", g_engine->newNumber(8192));
-                    g_engine->setProperty(deviceLimits, "maxColorAttachmentBytesPerSample", g_engine->newNumber(64));
-                    g_engine->setProperty(deviceLimits, "maxBindGroups", g_engine->newNumber(4));
-                    g_engine->setProperty(deviceLimits, "maxBindingsPerBindGroup", g_engine->newNumber(1000));
-                    g_engine->setProperty(deviceLimits, "maxUniformBufferBindingSize", g_engine->newNumber(65536));
-                    g_engine->setProperty(deviceLimits, "maxStorageBufferBindingSize", g_engine->newNumber(134217728));
-                    g_engine->setProperty(deviceLimits, "maxSampledTexturesPerShaderStage", g_engine->newNumber(16));
-                    g_engine->setProperty(deviceLimits, "maxSamplersPerShaderStage", g_engine->newNumber(16));
-                    g_engine->setProperty(deviceLimits, "maxStorageTexturesPerShaderStage", g_engine->newNumber(8));
-                    g_engine->setProperty(deviceLimits, "maxUniformBuffersPerShaderStage", g_engine->newNumber(12));
-                    g_engine->setProperty(deviceLimits, "maxStorageBuffersPerShaderStage", g_engine->newNumber(8));
-                    g_engine->setProperty(deviceLimits, "maxDynamicUniformBuffersPerPipelineLayout", g_engine->newNumber(8));
-                    g_engine->setProperty(deviceLimits, "minUniformBufferOffsetAlignment", g_engine->newNumber(256));
-                    g_engine->setProperty(deviceLimits, "minStorageBufferOffsetAlignment", g_engine->newNumber(256));
+                    WGPULimits realDeviceLimits = {};
+                    if (queryDeviceLimits(&realDeviceLimits)) {
+                        setLimitsProperties(deviceLimits, realDeviceLimits);
+                    }
                     g_engine->setProperty(device, "limits", deviceLimits);
 
-                    // device.features - Set-like object with enabled features
-                    // These should match the features exposed in adapter.features that were requested
-                    auto deviceFeatures = g_engine->newArray(0);
-                    g_engine->setProperty(deviceFeatures, "has",
-                        g_engine->newFunction("has", [](void* ctx, const std::vector<js::JSValueHandle>& args) {
-                            if (args.empty()) return g_engine->newBoolean(false);
-                            std::string featureName = g_engine->toString(args[0]);
-                            // indirect-first-instance enables non-zero firstInstance in indirect draws
-                            if (featureName == "indirect-first-instance") {
-                                return g_engine->newBoolean(true);
-                            }
-                            // timestamp-query is NOT supported yet - bindings not implemented
-                            return g_engine->newBoolean(false);
-                        })
-                    );
-                    g_engine->setProperty(device, "features", deviceFeatures);
+                    // device.features - reflect what the live device actually has
+                    // (queried through wgpuDeviceHasFeature, not hardcoded)
+                    g_engine->setProperty(device, "features", buildFeaturesObject(deviceHasFeature));
 
                     // device.createBuffer(descriptor)
                     g_engine->setProperty(device, "createBuffer",
@@ -4108,41 +4267,17 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuDevice, void
                 })
             );
 
-            // adapter.features - Set-like object that is also iterable
-            // We use an array for iteration support with a has() method added
-            // Dawn supports indirect-first-instance on Metal which is required for indirect draws
-            // with non-zero firstInstance values
-            auto features = g_engine->newArray(0);
-            g_engine->setProperty(features, "has",
-                g_engine->newFunction("has", [](void* ctx, const std::vector<js::JSValueHandle>& args) {
-                    if (args.empty()) return g_engine->newBoolean(false);
-                    std::string featureName = g_engine->toString(args[0]);
-                    // indirect-first-instance is required for indirect draws with non-zero firstInstance
-                    // This is supported by Dawn on all backends
-                    if (featureName == "indirect-first-instance") {
-                        return g_engine->newBoolean(true);
-                    }
-                    // timestamp-query is NOT supported yet - bindings not implemented
-                    return g_engine->newBoolean(false);
-                })
-            );
-            g_engine->setProperty(features, "size", g_engine->newNumber(1));
-            g_engine->setProperty(adapter, "features", features);
+            // adapter.features - reflect what the native adapter actually
+            // exposes (queried through wgpuAdapterHasFeature, not hardcoded)
+            g_engine->setProperty(adapter, "features", buildFeaturesObject(adapterHasFeature));
 
-            // adapter.limits
+            // adapter.limits - the adapter's real limits (falls back to the
+            // device when the adapter handle was not provided)
             auto limits = g_engine->newObject();
-            g_engine->setProperty(limits, "maxTextureDimension2D", g_engine->newNumber(8192));
-            g_engine->setProperty(limits, "maxColorAttachmentBytesPerSample", g_engine->newNumber(64));
-            g_engine->setProperty(limits, "maxBindGroups", g_engine->newNumber(4));
-            g_engine->setProperty(limits, "maxBindingsPerBindGroup", g_engine->newNumber(1000));
-            g_engine->setProperty(limits, "maxUniformBufferBindingSize", g_engine->newNumber(65536));
-            g_engine->setProperty(limits, "maxStorageBufferBindingSize", g_engine->newNumber(134217728));
-            g_engine->setProperty(limits, "maxSampledTexturesPerShaderStage", g_engine->newNumber(16));
-            g_engine->setProperty(limits, "maxSamplersPerShaderStage", g_engine->newNumber(16));
-            g_engine->setProperty(limits, "maxStorageTexturesPerShaderStage", g_engine->newNumber(8));
-            g_engine->setProperty(limits, "maxUniformBuffersPerShaderStage", g_engine->newNumber(12));
-            g_engine->setProperty(limits, "maxStorageBuffersPerShaderStage", g_engine->newNumber(8));
-            g_engine->setProperty(limits, "maxDynamicUniformBuffersPerPipelineLayout", g_engine->newNumber(8));
+            WGPULimits realAdapterLimits = {};
+            if (queryAdapterLimits(&realAdapterLimits)) {
+                setLimitsProperties(limits, realAdapterLimits);
+            }
             g_engine->setProperty(adapter, "limits", limits);
 
             // Return the adapter directly
