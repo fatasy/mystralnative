@@ -3758,6 +3758,26 @@ globalThis.__mystralNativeDecodeDracoAsync = function(buffer, attrs) {
             document.createElementNS = function(namespaceURI, tagName) {
                 return document.createElement(tagName);
             };
+            // DOM event class globals — browser code type-checks events with
+            // `instanceof PointerEvent` etc.; without these constructors that
+            // check is a ReferenceError. Dispatched events are still plain
+            // objects (instanceof yields false) — code should duck-type until
+            // dispatch constructs real instances.
+            if (typeof globalThis.Event === 'undefined') {
+                globalThis.Event = class Event {
+                    constructor(type, init) {
+                        this.type = String(type || '');
+                        Object.assign(this, init || {});
+                    }
+                    preventDefault() {}
+                    stopPropagation() {}
+                };
+            }
+            globalThis.UIEvent ??= class UIEvent extends globalThis.Event {};
+            globalThis.MouseEvent ??= class MouseEvent extends globalThis.UIEvent {};
+            globalThis.PointerEvent ??= class PointerEvent extends globalThis.MouseEvent {};
+            globalThis.WheelEvent ??= class WheelEvent extends globalThis.MouseEvent {};
+            globalThis.KeyboardEvent ??= class KeyboardEvent extends globalThis.UIEvent {};
         )";
         jsEngine_->eval(createElementSetup, "createElement-setup");
 
