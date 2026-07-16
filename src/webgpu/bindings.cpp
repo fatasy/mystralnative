@@ -1968,21 +1968,30 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
 
                             auto descriptor = args[0];
 
-                            // Get vertex stage
+                            // Get vertex stage. entryPoint is OPTIONAL per spec — when
+                            // omitted (three.js r183+ does this) the implementation must
+                            // select the module's single entry point; a zero-init/null
+                            // entryPoint means exactly that in both backends.
                             auto vertex = g_engine->getProperty(descriptor, "vertex");
                             auto vertexModule = g_engine->getProperty(vertex, "module");
-                            std::string vertexEntry = g_engine->toString(g_engine->getProperty(vertex, "entryPoint"));
+                            auto vertexEntryProp = g_engine->getProperty(vertex, "entryPoint");
+                            bool hasVertexEntry =
+                                !g_engine->isUndefined(vertexEntryProp) && !g_engine->isNull(vertexEntryProp);
+                            std::string vertexEntry = hasVertexEntry ? g_engine->toString(vertexEntryProp) : std::string();
 
                             // Get fragment stage (optional - depth-only pipelines don't have fragment)
                             auto fragment = g_engine->getProperty(descriptor, "fragment");
                             WGPUShaderModule fsModule = nullptr;
-                            std::string fragmentEntry = "main";
+                            std::string fragmentEntry;
+                            bool hasFragmentEntry = false;
                             bool hasFragment = !g_engine->isUndefined(fragment) && !g_engine->isNull(fragment);
                             if (hasFragment) {
                                 auto fragmentModule = g_engine->getProperty(fragment, "module");
                                 fsModule = (WGPUShaderModule)g_engine->getPrivateData(fragmentModule);
                                 auto fragEntryProp = g_engine->getProperty(fragment, "entryPoint");
-                                if (!g_engine->isUndefined(fragEntryProp)) {
+                                hasFragmentEntry =
+                                    !g_engine->isUndefined(fragEntryProp) && !g_engine->isNull(fragEntryProp);
+                                if (hasFragmentEntry) {
                                     fragmentEntry = g_engine->toString(fragEntryProp);
                                 }
                             }
@@ -2009,9 +2018,12 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
                                 }
                             }
 
-                            // Vertex state
+                            // Vertex state (entryPoint stays zero-init/null when omitted —
+                            // the implementation selects the module's single entry point)
                             pipelineDesc.vertex.module = vsModule;
-                            WGPU_SET_ENTRY_POINT(pipelineDesc.vertex, vertexEntry.c_str());
+                            if (hasVertexEntry) {
+                                WGPU_SET_ENTRY_POINT(pipelineDesc.vertex, vertexEntry.c_str());
+                            }
 
                             // Parse vertex buffers if present
                             std::vector<WGPUVertexBufferLayout> vertexBuffers;
@@ -2233,7 +2245,9 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
                                 }
 
                                 fragmentState.module = fsModule;
-                                WGPU_SET_ENTRY_POINT(fragmentState, fragmentEntry.c_str());
+                                if (hasFragmentEntry) {
+                                    WGPU_SET_ENTRY_POINT(fragmentState, fragmentEntry.c_str());
+                                }
                                 fragmentState.targetCount = colorTargets.size();
                                 fragmentState.targets = colorTargets.data();
                                 pipelineDesc.fragment = &fragmentState;
@@ -2428,17 +2442,20 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
                             WGPUShaderModule module = (WGPUShaderModule)g_engine->getPrivateData(moduleProp);
 
                             // Entry point (default "main")
-                            std::string entryPoint = "main";
+                            // entryPoint is OPTIONAL per spec — zero-init/null selects
+                            // the module's single entry point
                             auto entryPointProp = g_engine->getProperty(computeProp, "entryPoint");
-                            if (!g_engine->isUndefined(entryPointProp)) {
-                                entryPoint = g_engine->toString(entryPointProp);
-                            }
+                            bool hasEntryPoint =
+                                !g_engine->isUndefined(entryPointProp) && !g_engine->isNull(entryPointProp);
+                            std::string entryPoint = hasEntryPoint ? g_engine->toString(entryPointProp) : std::string();
 
                             // Create pipeline
                             WGPUComputePipelineDescriptor pipelineDesc = {};
                             pipelineDesc.layout = layout;
                             pipelineDesc.compute.module = module;
-                            WGPU_SET_ENTRY_POINT(pipelineDesc.compute, entryPoint.c_str());
+                            if (hasEntryPoint) {
+                                WGPU_SET_ENTRY_POINT(pipelineDesc.compute, entryPoint.c_str());
+                            }
 
                             WGPUComputePipeline pipeline = wgpuDeviceCreateComputePipeline(g_device, &pipelineDesc);
                             if (!pipeline) {
