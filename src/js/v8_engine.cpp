@@ -27,9 +27,6 @@ namespace js {
 static std::unique_ptr<v8::Platform> g_platform;
 static bool g_initialized = false;
 
-// Store native function callbacks
-static std::unordered_map<void*, NativeFunction> g_nativeFunctions;
-
 // Global set of protected handles that should not be deleted by nativeCallback cleanup
 static std::unordered_set<void*> g_protectedHandles;
 
@@ -104,10 +101,14 @@ public:
             delete handle;
         }
         frameHandles_.clear();
-        for (auto* fn : frameNativeFunctions_) {
-            delete fn;
+        // Weak callbacks do not run after the isolate starts shutting down.
+        // Release the native callbacks still owned by live JS functions now.
+        for (auto* ref : nativeFunctionRefs_) {
+            ref->persistent.Reset();
+            delete ref->function;
+            delete ref;
         }
-        frameNativeFunctions_.clear();
+        nativeFunctionRefs_.clear();
         for (auto& entry : moduleCache_) {
             entry.second.Reset();
         }
@@ -547,21 +548,28 @@ public:
         v8::Local<v8::Context> context = context_.Get(isolate_);
         v8::Context::Scope context_scope(context);
 
-        // Store the callback
+        // The External embedded in the JS function stores this pointer. Its
+        // lifetime must therefore follow the JS function, not the animation
+        // frame in which the wrapper happened to be created.
         auto* fnPtr = new NativeFunction(fn);
         v8::Local<v8::External> external = v8::External::New(isolate_, fnPtr);
-
-        // Track per-frame NativeFunction allocations for cleanup
-        // Init-time functions (created before beginFrame) are NOT tracked
-        // and persist for the lifetime of the engine
-        // Also skip tracking when suspended (for cached wrapper creation)
-        if (inFrame_ && !frameTrackingSuspended_) {
-            frameNativeFunctions_.push_back(fnPtr);
-        }
 
         // Use Function::New instead of FunctionTemplate::New — lighter weight,
         // avoids SharedFunctionInfo/FeedbackVector accumulation that prevents GC
         v8::Local<v8::Function> func = v8::Function::New(context, nativeCallback, external).ToLocalChecked();
+
+        auto* ref = new NativeFunctionRef();
+        ref->persistent.Reset(isolate_, func);
+        ref->function = fnPtr;
+        ref->owner = this;
+        nativeFunctionRefs_.insert(ref);
+        ref->persistent.SetWeak(ref, [](const v8::WeakCallbackInfo<NativeFunctionRef>& data) {
+            NativeFunctionRef* ref = data.GetParameter();
+            ref->owner->nativeFunctionRefs_.erase(ref);
+            ref->persistent.Reset();
+            delete ref->function;
+            delete ref;
+        }, v8::WeakCallbackType::kParameter);
 
         v8::Persistent<v8::Value>* persistent = new v8::Persistent<v8::Value>(isolate_, func);
         frameHandles_.insert(persistent);
@@ -782,7 +790,6 @@ public:
     }
 
     void beginFrame() override {
-        inFrame_ = true;
         isolate_->SetIdle(false);
     }
 
@@ -795,26 +802,10 @@ public:
         }
         frameHandles_.clear();
 
-        // Free NativeFunction allocations created during this frame
-        for (auto* fn : frameNativeFunctions_) {
-            delete fn;
-        }
-        frameNativeFunctions_.clear();
-
-        inFrame_ = false;
-
         // Tell V8 we're idle between frames so it can do deferred GC work
         // (incremental marking, sweeping, weak callback processing).
         // beginFrame() sets this back to false.
         isolate_->SetIdle(true);
-    }
-
-    void suspendFrameTracking() override {
-        frameTrackingSuspended_ = true;
-    }
-
-    void resumeFrameTracking() override {
-        frameTrackingSuspended_ = false;
     }
 
     void registerRelease(JSValueHandle obj, std::function<void()> callback) override {
@@ -1162,6 +1153,14 @@ private:
         v8::Isolate* isolate = nullptr;
     };
 
+    // Keeps the C++ callback behind a v8::External alive exactly as long as
+    // its JavaScript Function. The persistent is weak and does not root it.
+    struct NativeFunctionRef {
+        v8::Persistent<v8::Function> persistent;
+        NativeFunction* function = nullptr;
+        V8Engine* owner = nullptr;
+    };
+
     v8::Isolate* isolate_ = nullptr;
     v8::ArrayBuffer::Allocator* allocator_ = nullptr;
     v8::Global<v8::Context> context_;
@@ -1171,9 +1170,7 @@ private:
     std::unordered_map<std::string, v8::Global<v8::Module>> moduleCache_;
     std::unordered_map<int, std::string> moduleIdToPath_;  // Reverse lookup: module hash -> path
     std::unordered_set<v8::Persistent<v8::Value>*> frameHandles_;  // Handles to free at end of frame
-    std::vector<NativeFunction*> frameNativeFunctions_;  // NativeFunction allocations to free at end of frame
-    bool inFrame_ = false;  // True during animation frame execution
-    bool frameTrackingSuspended_ = false;  // When true, skip frame tracking for new allocations
+    std::unordered_set<NativeFunctionRef*> nativeFunctionRefs_;  // Weakly owned by JS functions
 };
 
 // Factory function

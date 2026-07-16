@@ -883,9 +883,6 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
                         // This shares the main surface/device for simplicity
                         if (g_verboseLogging) std::cout << "[Canvas] Creating offscreen WebGPU context" << std::endl;
 
-                        // Suspend frame tracking - this context persists across frames
-                        g_engine->suspendFrameTracking();
-
                         auto canvasContext = g_engine->newObject();
 
                         // Store reference to our surface
@@ -933,9 +930,6 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
                                 // Register in texture registry so createView can find it
                                 uint64_t textureId = g_nextTextureId++;
                                 g_textureRegistry[textureId] = {texture, g_surfaceFormat, g_canvasWidth, g_canvasHeight, 1, 1, WGPUTextureDimension_2D};
-
-                                // Suspend frame tracking for texture wrapper (persists until next frame)
-                                g_engine->suspendFrameTracking();
 
                                 // Create JS wrapper for texture
                                 auto jsTexture = g_engine->newObject();
@@ -1000,15 +994,9 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
                                     })
                                 );
 
-                                // Resume frame tracking for texture
-                                g_engine->resumeFrameTracking();
-
                                 return jsTexture;
                             })
                         );
-
-                        // Resume frame tracking
-                        g_engine->resumeFrameTracking();
 
                         return canvasContext;
                     }
@@ -2527,10 +2515,6 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
                             // Note: Multiple encoders are supported via per-encoder render pass tracking
                             g_jsCommandEncoder = encoder;
 
-                            // Suspend frame tracking while creating encoder wrapper
-                            // This prevents the wrapper's methods from being garbage collected at frame end
-                            g_engine->suspendFrameTracking();
-
                             auto jsEncoder = g_engine->newObject();
                             g_engine->setPrivateData(jsEncoder, encoder);
 
@@ -2695,9 +2679,6 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
                                     g_jsRenderPass = renderPass;
 
                                     if (g_verboseLogging) std::cout << "[WebGPU] Render pass started (" << numAttachments << " attachments), clear: (" << firstR << "," << firstG << "," << firstB << "," << firstA << ")" << std::endl;
-
-                                    // Suspend frame tracking while creating render pass wrapper
-                                    g_engine->suspendFrameTracking();
 
                                     auto jsRenderPass = g_engine->newObject();
                                     g_engine->setPrivateData(jsRenderPass, renderPass);
@@ -2994,9 +2975,6 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
                                             return g_engine->newUndefined();
                                         })
                                     );
-
-                                    // Resume frame tracking
-                                    g_engine->resumeFrameTracking();
 
                                     return jsRenderPass;
                                 })
@@ -3356,9 +3334,6 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
                                     return jsCommandBuffer;
                                 })
                             );
-
-                            // Resume frame tracking now that encoder wrapper is created
-                            g_engine->resumeFrameTracking();
 
                             return jsEncoder;
                         })
