@@ -794,15 +794,23 @@ public:
         // Process microtask queue for promises
         processMicrotasks();
 
-        // Begin frame — enables per-frame allocation tracking
-        jsEngine_->beginFrame();
+        // Begin frame — enables per-frame allocation tracking.
+        // MYSTRAL_NO_FRAME_CLEAR=1 disables the per-frame handle reclamation
+        // (diagnostic: heavy three.js scenes crash with native faults when
+        // handles still referenced across frames are reclaimed).
+        static const bool frameClearEnabled = std::getenv("MYSTRAL_NO_FRAME_CLEAR") == nullptr;
+        if (frameClearEnabled) {
+            jsEngine_->beginFrame();
+        }
         webgpu::beginDawnFrame();
 
         // Execute requestAnimationFrame callbacks (renders a frame)
         executeAnimationFrameCallbacks();
 
         // Free non-protected handles, per-frame native allocations, and Dawn resources
-        jsEngine_->clearFrameHandles();
+        if (frameClearEnabled) {
+            jsEngine_->clearFrameHandles();
+        }
         webgpu::endDawnFrame();
 
         // TODO: Translate to Web events via InputShim

@@ -19,6 +19,7 @@
  */
 
 #include "mystral/js/engine.h"
+#include <cstdlib>
 #include <iostream>
 #include <vector>
 #include <unordered_map>
@@ -82,6 +83,15 @@ namespace webgpu {
 
 // Verbose logging flag - controlled by --debug CLI flag or MYSTRAL_DEBUG=1
 static bool g_verboseLogging = false;  // Disabled by default, enable with --debug
+
+// Diagnostic escape hatch: MYSTRAL_NO_GC_RELEASE=1 keeps GC-driven Dawn
+// resource release OFF (leaks views/bind groups instead) — used to bisect
+// native crashes where a resource is collected while still referenced by
+// in-flight command buffers.
+static bool gcReleaseEnabled() {
+    static const bool enabled = std::getenv("MYSTRAL_NO_GC_RELEASE") == nullptr;
+    return enabled;
+}
 
 // Store references to WebGPU objects
 static WGPUAdapter g_adapter = nullptr;
@@ -3580,9 +3590,11 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
                                     auto jsView = g_engine->newObject();
                                     g_engine->setPrivateData(jsView, view);
                                     g_engine->setProperty(jsView, "_type", g_engine->newString("textureView"));
-                                    g_engine->registerRelease(jsView, [view]() {
-                                        wgpuTextureViewRelease(view);
-                                    });
+                                    if (gcReleaseEnabled()) {
+                                        g_engine->registerRelease(jsView, [view]() {
+                                            wgpuTextureViewRelease(view);
+                                        });
+                                    }
 
                                     return jsView;
                                 })
@@ -3918,9 +3930,11 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
 
                             auto jsBindGroup = g_engine->newObject();
                             g_engine->setPrivateData(jsBindGroup, bindGroup);
-                            g_engine->registerRelease(jsBindGroup, [bindGroup]() {
-                                wgpuBindGroupRelease(bindGroup);
-                            });
+                            if (gcReleaseEnabled()) {
+                                g_engine->registerRelease(jsBindGroup, [bindGroup]() {
+                                    wgpuBindGroupRelease(bindGroup);
+                                });
+                            }
 
                             if (g_verboseLogging) std::cout << "[WebGPU] Created bind group with " << entryCount << " entries" << std::endl;
                             return jsBindGroup;
@@ -4071,9 +4085,11 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
                             auto jsView = g_engine->newObject();
                             g_engine->setPrivateData(jsView, view);
                             g_engine->setProperty(jsView, "_type", g_engine->newString("textureView"));
-                            g_engine->registerRelease(jsView, [view]() {
-                                wgpuTextureViewRelease(view);
-                            });
+                            if (gcReleaseEnabled()) {
+                                g_engine->registerRelease(jsView, [view]() {
+                                    wgpuTextureViewRelease(view);
+                                });
+                            }
 
                             if (g_verboseLogging) std::cout << "[WebGPU] Created texture view" << std::endl;
                             return jsView;
