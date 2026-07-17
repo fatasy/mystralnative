@@ -78,6 +78,13 @@ public:
     virtual EvaluationResult evaluateExpression(const std::string& expression) = 0;
 
     /**
+     * Dispatch a semantic agent command and return its JSON result.
+     */
+    virtual EvaluationResult dispatchAgentCommand(
+        const std::string& method,
+        const std::string& paramsJson) = 0;
+
+    /**
      * Observe JavaScript console output.
      */
     virtual void setConsoleCallback(ConsoleCallback callback) = 0;

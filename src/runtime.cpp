@@ -450,6 +450,9 @@ public:
         // Set up DOM event system (document, window, addEventListener, etc.)
         setupDOMEvents();
 
+        // Set up the opt-in semantic inspection/action bridge for agents.
+        setupAgentBridge();
+
         // Set up localStorage/sessionStorage (file-backed persistence)
         setupStorage();
 
@@ -692,6 +695,61 @@ public:
             return {false, "", "Expression result could not be serialized"};
         }
         return {true, std::move(valueJson), ""};
+    }
+
+    EvaluationResult dispatchAgentCommand(
+        const std::string& method,
+        const std::string& paramsJson) override {
+        if (!jsEngine_) {
+            return {false, "", "JavaScript engine is not available"};
+        }
+
+        if (jsEngine_->hasException()) {
+            jsEngine_->getException();
+        }
+
+        const std::string source =
+            "(() => { try {"
+            "const params = JSON.parse(" + quoteJavaScriptString(paramsJson.empty() ? "{}" : paramsJson) + ");"
+            "const value = globalThis.mystralAgent.__dispatch("
+                + quoteJavaScriptString(method) + ", params);"
+            "const seen = new WeakSet();"
+            "const json = JSON.stringify(value, (_key,item) => {"
+            "if (typeof item === 'bigint' || typeof item === 'symbol') return String(item);"
+            "if (typeof item === 'function') return '[Function ' + (item.name || 'anonymous') + ']';"
+            "if (typeof item === 'number' && !Number.isFinite(item)) return String(item);"
+            "if (item && typeof item === 'object') { if (seen.has(item)) return '[Circular]'; seen.add(item); }"
+            "return item;"
+            "});"
+            "return {ok:true,json};"
+            "} catch (error) {"
+            "return {ok:false,error:String(error && error.message || error)};"
+            "} })()";
+
+        js::JSValueHandle result = jsEngine_->evalScriptWithResult(source.c_str(), "<agent-dispatch>");
+        if (!result.ptr || jsEngine_->hasException()) {
+            std::string error = jsEngine_->hasException()
+                ? jsEngine_->getException()
+                : "Agent command failed";
+            return {false, "", error};
+        }
+
+        js::JSValueHandle okValue = jsEngine_->getProperty(result, "ok");
+        bool ok = jsEngine_->toBoolean(okValue);
+        jsEngine_->releaseValue(okValue);
+
+        js::JSValueHandle detailValue = jsEngine_->getProperty(result, ok ? "json" : "error");
+        std::string detail = jsEngine_->toString(detailValue);
+        jsEngine_->releaseValue(detailValue);
+        jsEngine_->releaseValue(result);
+
+        if (!ok) {
+            return {false, "", detail.empty() ? "Agent command failed" : std::move(detail)};
+        }
+        if (detail.empty()) {
+            return {false, "", "Agent command result could not be serialized"};
+        }
+        return {true, std::move(detail), ""};
     }
 
     void setConsoleCallback(ConsoleCallback callback) override {
@@ -1468,6 +1526,141 @@ private:
         );
     }
 #endif // !MYSTRAL_USE_LIBUV_TIMERS
+
+    void setupAgentBridge() {
+        if (!jsEngine_) return;
+
+        const char* source = R"JS(
+(() => {
+    const inspectors = new Map();
+    const actions = new Map();
+
+    function requireId(id, type) {
+        if (typeof id !== 'string' || id.length === 0) {
+            throw new TypeError(type + ' id must be a non-empty string');
+        }
+        return id;
+    }
+
+    function optionsOrEmpty(options) {
+        return options && typeof options === 'object' ? options : {};
+    }
+
+    function compareById(a, b) {
+        return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+    }
+
+    const api = {
+        version: 1,
+
+        exposeInspector(id, inspect, options = {}) {
+            id = requireId(id, 'Inspector');
+            if (typeof inspect !== 'function') {
+                throw new TypeError('Inspector ' + id + ' must be a function');
+            }
+            options = optionsOrEmpty(options);
+            const record = {
+                id,
+                inspect,
+                label: options.label === undefined ? id : String(options.label),
+                kind: options.kind === undefined ? 'entity' : String(options.kind),
+                description: options.description === undefined ? '' : String(options.description)
+            };
+            inspectors.set(id, record);
+            return () => inspectors.get(id) === record && inspectors.delete(id);
+        },
+
+        exposeAction(id, run, options = {}) {
+            id = requireId(id, 'Action');
+            if (typeof run !== 'function') {
+                throw new TypeError('Action ' + id + ' must be a function');
+            }
+            options = optionsOrEmpty(options);
+            const record = {
+                id,
+                run,
+                description: options.description === undefined ? '' : String(options.description),
+                entityId: options.entityId === undefined ? null : String(options.entityId),
+                inputSchema: options.inputSchema === undefined ? null : options.inputSchema
+            };
+            actions.set(id, record);
+            return () => actions.get(id) === record && actions.delete(id);
+        },
+
+        removeInspector(id) {
+            return inspectors.delete(String(id));
+        },
+
+        removeAction(id) {
+            return actions.delete(String(id));
+        },
+
+        clear() {
+            inspectors.clear();
+            actions.clear();
+        }
+    };
+
+    function dispatch(method, params) {
+        params = optionsOrEmpty(params);
+
+        if (method === 'list') {
+            return {
+                entities: Array.from(inspectors.values(), (record) => ({
+                    id: record.id,
+                    label: record.label,
+                    kind: record.kind,
+                    description: record.description
+                })).sort(compareById),
+                actions: Array.from(actions.values(), (record) => ({
+                    id: record.id,
+                    description: record.description,
+                    entityId: record.entityId,
+                    inputSchema: record.inputSchema
+                })).sort(compareById)
+            };
+        }
+
+        if (method === 'inspect') {
+            const id = requireId(params.id, 'Inspector');
+            const record = inspectors.get(id);
+            if (!record) throw new Error('Unknown inspector: ' + id);
+            const snapshot = record.inspect(params.input);
+            if (snapshot && typeof snapshot.then === 'function') {
+                throw new Error('Inspector ' + id + ' returned a Promise; inspectors must be synchronous');
+            }
+            return { id, snapshot: snapshot === undefined ? null : snapshot };
+        }
+
+        if (method === 'act') {
+            const id = requireId(params.id, 'Action');
+            const record = actions.get(id);
+            if (!record) throw new Error('Unknown action: ' + id);
+            const result = record.run(params.input);
+            if (result && typeof result.then === 'function') {
+                throw new Error('Action ' + id + ' returned a Promise; agent actions must be synchronous');
+            }
+            return { id, result: result === undefined ? null : result };
+        }
+
+        throw new Error('Unknown agent method: ' + method);
+    }
+
+    Object.defineProperty(api, '__dispatch', { value: dispatch });
+    Object.freeze(api);
+    Object.defineProperty(globalThis, 'mystralAgent', {
+        value: api,
+        writable: false,
+        configurable: false,
+        enumerable: false
+    });
+})();
+)JS";
+
+        if (!jsEngine_->evalScript(source, "<agent-bridge>")) {
+            std::cerr << "[Mystral] Failed to initialize agent bridge" << std::endl;
+        }
+    }
 
     void setupPerformance() {
         if (!jsEngine_) return;

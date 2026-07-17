@@ -1761,8 +1761,9 @@ int runScript(const CLIOptions& opts) {
                     if (method == "hello" || method == "getCapabilities") {
                         return "{\"protocolVersion\":1,\"runtimeVersion\":\"" +
                             std::string(mystral::getVersion()) +
-                            "\",\"methods\":[\"screenshot\",\"keyboard\",\"mouse\",\"gamepad\","
-                            "\"getFrameCount\",\"evaluate\",\"getLogs\",\"waitForFrame\",\"pause\",\"resume\",\"stepFrames\",\"quit\"]}";
+                            "\",\"agentBridgeVersion\":1,\"methods\":[\"screenshot\",\"keyboard\",\"mouse\",\"gamepad\","
+                            "\"getFrameCount\",\"evaluate\",\"getLogs\",\"waitForFrame\",\"pause\",\"resume\",\"stepFrames\",\"quit\","
+                            "\"agent.list\",\"agent.inspect\",\"agent.act\"]}";
                     }
 
                     // Handle getFrameCount
@@ -2013,6 +2014,16 @@ int runScript(const CLIOptions& opts) {
                         }
                         result += "]}";
                         return result;
+                    }
+
+                    if (method.rfind("agent.", 0) == 0) {
+                        mystral::EvaluationResult result = runtime->dispatchAgentCommand(
+                            method.substr(6),
+                            params.empty() ? "{}" : params);
+                        if (!result.success) {
+                            return fail(result.error);
+                        }
+                        return result.valueJson;
                     }
 
                     return fail("Unknown method: " + method);

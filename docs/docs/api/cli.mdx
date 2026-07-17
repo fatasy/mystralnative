@@ -95,8 +95,44 @@ bun tools/mystral-debug-client.ts pause --port 9222
 bun tools/mystral-debug-client.ts step 3 --port 9222
 bun tools/mystral-debug-client.ts screenshot output.png --port 9222
 bun tools/mystral-debug-client.ts logs --port 9222
+bun tools/mystral-debug-client.ts agent-list --port 9222
+bun tools/mystral-debug-client.ts agent-inspect player --port 9222
+bun tools/mystral-debug-client.ts agent-act player.move '{"x":4,"y":2}' --port 9222
 bun tools/mystral-debug-client.ts quit --port 9222
 ```
+
+Games can expose stable semantic IDs, live snapshots, and safe actions without
+coupling the runtime to a particular scene library:
+
+```js
+mystralAgent.exposeInspector("player", () => ({
+  health: player.health,
+  position: { x: player.x, y: player.y }
+}), {
+  label: "Player",
+  kind: "actor",
+  description: "Current player state"
+});
+
+mystralAgent.exposeAction("player.move", ({ x, y }) => {
+  player.moveTo(x, y);
+  return { accepted: true };
+}, {
+  entityId: "player",
+  description: "Move the player in world coordinates",
+  inputSchema: {
+    type: "object",
+    required: ["x", "y"],
+    properties: { x: { type: "number" }, y: { type: "number" } }
+  }
+});
+```
+
+`exposeInspector()` and `exposeAction()` return cleanup functions. Registering
+the same ID again replaces its previous registration, which keeps IDs stable
+when game systems are rebuilt. Inspectors and actions are synchronous in this
+protocol version; an action can still start asynchronous game work and return
+an immediate acknowledgement.
 
 | Protocol method | Purpose |
 |-----------------|---------|
@@ -104,6 +140,9 @@ bun tools/mystral-debug-client.ts quit --port 9222
 | `screenshot` | Capture the current WebGPU frame as PNG data |
 | `evaluate` | Evaluate JavaScript and return a JSON-safe result, error, and stack |
 | `getLogs` | Read buffered startup and runtime console entries |
+| `agent.list` | Discover exposed entities, actions, descriptions, and input schemas |
+| `agent.inspect` | Read a live JSON-safe snapshot by stable entity ID |
+| `agent.act` | Run an explicitly exposed game action with JSON input |
 | `pause` / `resume` | Pause or resume game-frame execution while debug I/O remains available |
 | `stepFrames` | Execute a bounded number of frames and remain paused |
 | `waitForFrame` | Wait asynchronously for an absolute or relative frame with a timeout |
