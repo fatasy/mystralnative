@@ -154,6 +154,41 @@ The exported `jobs` object contains:
 
 A rising `queueWait.p95Ms` with stable execution time indicates contention. A non-zero `rejected` count means the in-flight backpressure limit was reached. For gameplay, keep frame-critical work short and split large streaming/decode operations into cancellable jobs.
 
+### WebGPU Bridge Profiling
+
+Native builds expose cumulative per-operation bridge measurements through:
+
+```javascript
+const stats = globalThis.__mystralWebGpuStats?.();
+console.log(stats?.profiledBridge);
+```
+
+Each operation reports `calls`, `totalNanoseconds`, and transferred `bytes`. Take snapshots before and after a fixed frame window and subtract them; reading cumulative totals directly mixes startup uploads with steady gameplay. The profiled operations cover command encoder creation/finalization, render and compute passes, queue submits, buffer/texture writes, draw commands, bindings, and render-bundle execution.
+
+Timing is measured inside the native binding, including argument conversion and the backend call. It does not include JavaScript work performed before entering the binding, so compare it with the application's total CPU submission time.
+
+### Batched WebGPU Buffer Writes
+
+Mystral exposes the non-standard `GPUQueue.writeBufferBatch()` extension for renderers that issue many small `writeBuffer()` calls. The argument is a flat array with five entries per write:
+
+```javascript
+const writes = [
+  cameraBuffer, 0, cameraData, undefined, undefined,
+  lightBuffer, 0, lightData, 0, lightData.length,
+];
+
+if (typeof device.queue.writeBufferBatch === 'function') {
+  device.queue.writeBufferBatch(writes);
+} else {
+  device.queue.writeBuffer(cameraBuffer, 0, cameraData);
+  device.queue.writeBuffer(lightBuffer, 0, lightData, 0, lightData.length);
+}
+```
+
+Each group is `[buffer, bufferOffset, data, dataOffset, size]`; `dataOffset` and `size` follow the standard `writeBuffer()` element-count rules and may be `undefined`. Writes execute in array order. Flush a pending batch before `submit()`, `writeTexture()`, `copyExternalImageToTexture()`, or `onSubmittedWorkDone()` so queue ordering remains unchanged.
+
+The bridge profiler reports these calls separately as `queueWriteBufferBatch`, including their total bytes. This extension reduces JS/C++ crossings; it does not combine the underlying WebGPU queue writes.
+
 ### Frame Time
 
 Log frame timing to identify bottlenecks:

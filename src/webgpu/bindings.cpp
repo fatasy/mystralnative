@@ -299,6 +299,7 @@ enum class ProfiledBridgeOp : size_t {
     FinishCommandEncoder,
     QueueSubmit,
     QueueWriteBuffer,
+    QueueWriteBufferBatch,
     QueueWriteTexture,
     RenderSetPipeline,
     RenderSetBindGroup,
@@ -331,6 +332,7 @@ static constexpr std::array<const char*, static_cast<size_t>(ProfiledBridgeOp::C
         "finishCommandEncoder",
         "queueSubmit",
         "queueWriteBuffer",
+        "queueWriteBufferBatch",
         "queueWriteTexture",
         "renderSetPipeline",
         "renderSetBindGroup",
@@ -370,6 +372,75 @@ private:
 
 static void recordBridgeBytes(ProfiledBridgeOp operation, uint64_t bytes) {
     g_profiledBridgeMetrics[static_cast<size_t>(operation)].bytes += bytes;
+}
+
+static bool writeQueueBuffer(js::JSValueHandle bufferHandle,
+                             js::JSValueHandle offsetHandle,
+                             js::JSValueHandle data,
+                             const js::JSValueHandle* dataOffsetHandle,
+                             const js::JSValueHandle* sizeHandle,
+                             ProfiledBridgeOp operation,
+                             const char* apiName) {
+    WGPUBuffer buffer = (WGPUBuffer)g_engine->getPrivateData(bufferHandle);
+    uint64_t offset = (uint64_t)g_engine->toNumber(offsetHandle);
+
+    double bytesPerElement = 1;  // ArrayBuffer/DataView: offsets are bytes
+    void* basePtr = nullptr;
+    size_t viewByteOffset = 0;
+    size_t viewByteLength = 0;
+
+    auto bufferProp = g_engine->getProperty(data, "buffer");
+    if (g_engine->isObject(bufferProp)) {
+        // TypedArray or DataView: resolve against the underlying ArrayBuffer so
+        // engines whose getArrayBufferData ignores view offsets still copy the
+        // right window.
+        auto bpeProp = g_engine->getProperty(data, "BYTES_PER_ELEMENT");
+        if (g_engine->isNumber(bpeProp)) {
+            bytesPerElement = g_engine->toNumber(bpeProp);
+        }
+        size_t baseSize = 0;
+        basePtr = g_engine->getArrayBufferData(bufferProp, &baseSize);
+        auto byteOffsetProp = g_engine->getProperty(data, "byteOffset");
+        auto byteLengthProp = g_engine->getProperty(data, "byteLength");
+        viewByteOffset = (size_t)g_engine->toNumber(byteOffsetProp);
+        viewByteLength = (size_t)g_engine->toNumber(byteLengthProp);
+        g_engine->releaseValue(bpeProp);
+        g_engine->releaseValue(byteOffsetProp);
+        g_engine->releaseValue(byteLengthProp);
+    } else {
+        size_t dataSize = 0;
+        basePtr = g_engine->getArrayBufferData(data, &dataSize);
+        viewByteLength = dataSize;
+    }
+    g_engine->releaseValue(bufferProp);
+
+    if (!basePtr || viewByteLength == 0) {
+        g_engine->throwException((std::string(apiName) + ": invalid data").c_str());
+        return false;
+    }
+
+    size_t dataOffsetBytes = dataOffsetHandle && !g_engine->isUndefined(*dataOffsetHandle)
+        ? (size_t)(g_engine->toNumber(*dataOffsetHandle) * bytesPerElement)
+        : 0;
+    if (dataOffsetBytes > viewByteLength) {
+        g_engine->throwException((std::string(apiName) + ": range out of bounds").c_str());
+        return false;
+    }
+    size_t writeSize = sizeHandle && !g_engine->isUndefined(*sizeHandle)
+        ? (size_t)(g_engine->toNumber(*sizeHandle) * bytesPerElement)
+        : (viewByteLength - dataOffsetBytes);
+
+    if (dataOffsetBytes + writeSize > viewByteLength) {
+        g_engine->throwException((std::string(apiName) + ": range out of bounds").c_str());
+        return false;
+    }
+
+    if (buffer && g_queue) {
+        wgpuQueueWriteBuffer(g_queue, buffer, offset,
+            (uint8_t*)basePtr + viewByteOffset + dataOffsetBytes, writeSize);
+        recordBridgeBytes(operation, writeSize);
+    }
+    return true;
 }
 
 struct TransientMethodCache {
@@ -1500,55 +1571,54 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
                                 return g_engine->newUndefined();
                             }
 
-                            WGPUBuffer buffer = (WGPUBuffer)g_engine->getPrivateData(args[0]);
-                            uint64_t offset = (uint64_t)g_engine->toNumber(args[1]);
-                            auto data = args[2];
+                            const auto* dataOffset = args.size() > 3 ? &args[3] : nullptr;
+                            const auto* size = args.size() > 4 ? &args[4] : nullptr;
+                            writeQueueBuffer(args[0], args[1], args[2], dataOffset, size,
+                                ProfiledBridgeOp::QueueWriteBuffer, "writeBuffer");
 
-                            double bytesPerElement = 1;  // ArrayBuffer/DataView: offsets are bytes
-                            void* basePtr = nullptr;
-                            size_t viewByteOffset = 0;
-                            size_t viewByteLength = 0;
+                            return g_engine->newUndefined();
+                        })
+                    );
 
-                            auto bufferProp = g_engine->getProperty(data, "buffer");
-                            if (g_engine->isObject(bufferProp)) {
-                                // TypedArray or DataView: resolve against the underlying
-                                // ArrayBuffer so engines whose getArrayBufferData ignores
-                                // view offsets still copy the right window
-                                auto bpeProp = g_engine->getProperty(data, "BYTES_PER_ELEMENT");
-                                if (g_engine->isNumber(bpeProp)) {
-                                    bytesPerElement = g_engine->toNumber(bpeProp);
+                    // Mystral extension: queue.writeBufferBatch(flatOperations)
+                    // Each operation occupies five consecutive entries:
+                    // [buffer, offset, data, dataOffset | undefined, size | undefined].
+                    // The application can collect the writes issued between two
+                    // submits and cross the JS/C++ bridge once without changing
+                    // their queue order.
+                    g_engine->setProperty(queue, "writeBufferBatch",
+                        g_engine->newFunction("writeBufferBatch", [](void* ctx, const std::vector<js::JSValueHandle>& args) {
+                            ScopedBridgeMeasurement measurement(ProfiledBridgeOp::QueueWriteBufferBatch);
+                            if (args.empty()) {
+                                g_engine->throwException("writeBufferBatch requires a flat operations array");
+                                return g_engine->newUndefined();
+                            }
+
+                            auto operations = args[0];
+                            auto lengthProp = g_engine->getProperty(operations, "length");
+                            int length = (int)g_engine->toNumber(lengthProp);
+                            g_engine->releaseValue(lengthProp);
+                            if (length < 0 || length % 5 != 0) {
+                                g_engine->throwException("writeBufferBatch operations length must be a multiple of 5");
+                                return g_engine->newUndefined();
+                            }
+
+                            for (int index = 0; index < length; index += 5) {
+                                auto buffer = g_engine->getPropertyIndex(operations, index);
+                                auto offset = g_engine->getPropertyIndex(operations, index + 1);
+                                auto data = g_engine->getPropertyIndex(operations, index + 2);
+                                auto dataOffset = g_engine->getPropertyIndex(operations, index + 3);
+                                auto size = g_engine->getPropertyIndex(operations, index + 4);
+                                const bool written = writeQueueBuffer(buffer, offset, data, &dataOffset, &size,
+                                    ProfiledBridgeOp::QueueWriteBufferBatch, "writeBufferBatch");
+                                g_engine->releaseValue(buffer);
+                                g_engine->releaseValue(offset);
+                                g_engine->releaseValue(data);
+                                g_engine->releaseValue(dataOffset);
+                                g_engine->releaseValue(size);
+                                if (!written) {
+                                    break;
                                 }
-                                size_t baseSize = 0;
-                                basePtr = g_engine->getArrayBufferData(bufferProp, &baseSize);
-                                viewByteOffset = (size_t)g_engine->toNumber(g_engine->getProperty(data, "byteOffset"));
-                                viewByteLength = (size_t)g_engine->toNumber(g_engine->getProperty(data, "byteLength"));
-                            } else {
-                                size_t dataSize = 0;
-                                basePtr = g_engine->getArrayBufferData(data, &dataSize);
-                                viewByteLength = dataSize;
-                            }
-
-                            if (!basePtr || viewByteLength == 0) {
-                                g_engine->throwException("writeBuffer: invalid data");
-                                return g_engine->newUndefined();
-                            }
-
-                            size_t dataOffsetBytes = args.size() > 3
-                                ? (size_t)(g_engine->toNumber(args[3]) * bytesPerElement)
-                                : 0;
-                            size_t writeSize = args.size() > 4
-                                ? (size_t)(g_engine->toNumber(args[4]) * bytesPerElement)
-                                : (viewByteLength - dataOffsetBytes);
-
-                            if (dataOffsetBytes + writeSize > viewByteLength) {
-                                g_engine->throwException("writeBuffer: range out of bounds");
-                                return g_engine->newUndefined();
-                            }
-
-                            if (buffer && g_queue) {
-                                wgpuQueueWriteBuffer(g_queue, buffer, offset,
-                                    (uint8_t*)basePtr + viewByteOffset + dataOffsetBytes, writeSize);
-                                recordBridgeBytes(ProfiledBridgeOp::QueueWriteBuffer, writeSize);
                             }
 
                             return g_engine->newUndefined();
