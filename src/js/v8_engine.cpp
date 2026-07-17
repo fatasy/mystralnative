@@ -109,6 +109,12 @@ public:
             delete ref;
         }
         nativeFunctionRefs_.clear();
+        for (auto* ref : nativeMethodRefs_) {
+            ref->persistent.Reset();
+            delete ref->method;
+            delete ref;
+        }
+        nativeMethodRefs_.clear();
         for (auto& entry : moduleCache_) {
             entry.second.Reset();
         }
@@ -576,6 +582,36 @@ public:
         return {persistent, isolate_};
     }
 
+    JSValueHandle newMethod(const char* name, NativeMethod fn) override {
+        v8::Isolate::Scope isolate_scope(isolate_);
+        v8::HandleScope handle_scope(isolate_);
+        v8::Local<v8::Context> context = context_.Get(isolate_);
+        v8::Context::Scope context_scope(context);
+
+        auto* fnPtr = new NativeMethod(std::move(fn));
+        v8::Local<v8::External> external = v8::External::New(isolate_, fnPtr);
+        v8::Local<v8::Function> func =
+            v8::Function::New(context, nativeMethodCallback, external).ToLocalChecked();
+        func->SetName(v8::String::NewFromUtf8(isolate_, name).ToLocalChecked());
+
+        auto* ref = new NativeMethodRef();
+        ref->persistent.Reset(isolate_, func);
+        ref->method = fnPtr;
+        ref->owner = this;
+        nativeMethodRefs_.insert(ref);
+        ref->persistent.SetWeak(ref, [](const v8::WeakCallbackInfo<NativeMethodRef>& data) {
+            NativeMethodRef* ref = data.GetParameter();
+            ref->owner->nativeMethodRefs_.erase(ref);
+            ref->persistent.Reset();
+            delete ref->method;
+            delete ref;
+        }, v8::WeakCallbackType::kParameter);
+
+        auto* persistent = new v8::Persistent<v8::Value>(isolate_, func);
+        frameHandles_.insert(persistent);
+        return {persistent, isolate_};
+    }
+
     // ========================================================================
     // Value Conversion
     // ========================================================================
@@ -787,6 +823,18 @@ public:
 
     void gc() override {
         isolate_->LowMemoryNotification();
+    }
+
+    MemoryStats getMemoryStats() const override {
+        v8::HeapStatistics heap;
+        isolate_->GetHeapStatistics(&heap);
+        MemoryStats stats;
+        stats.heapUsedBytes = heap.used_heap_size();
+        stats.heapTotalBytes = heap.total_heap_size();
+        stats.heapLimitBytes = heap.heap_size_limit();
+        stats.nativeFunctions = nativeFunctionRefs_.size() + nativeMethodRefs_.size();
+        stats.frameHandles = frameHandles_.size();
+        return stats;
     }
 
     void beginFrame() override {
@@ -1146,6 +1194,50 @@ private:
         }
     }
 
+    static void nativeMethodCallback(const v8::FunctionCallbackInfo<v8::Value>& info) {
+        v8::Isolate* isolate = info.GetIsolate();
+        v8::HandleScope handle_scope(isolate);
+        v8::Local<v8::Context> context = isolate->GetCurrentContext();
+        v8::Context::Scope context_scope(context);
+        auto* engine = static_cast<V8Engine*>(isolate->GetData(0));
+        auto* method = static_cast<NativeMethod*>(info.Data().As<v8::External>()->Value());
+
+        std::vector<JSValueHandle> args;
+        args.reserve(info.Length());
+        for (int i = 0; i < info.Length(); i++) {
+            auto* persistent = new v8::Persistent<v8::Value>(isolate, info[i]);
+            args.push_back({persistent, isolate});
+        }
+        auto* receiverPersistent = new v8::Persistent<v8::Value>(isolate, info.This());
+        JSValueHandle receiver{receiverPersistent, isolate};
+        JSValueHandle result = (*method)(isolate, receiver, args);
+
+        if (result.ptr) {
+            auto* resultPersistent = static_cast<v8::Persistent<v8::Value>*>(result.ptr);
+            info.GetReturnValue().Set(resultPersistent->Get(isolate));
+        }
+
+        auto releaseTemporary = [&](JSValueHandle handle) {
+            if (!handle.ptr || handle.ptr == result.ptr ||
+                g_protectedHandles.find(handle.ptr) != g_protectedHandles.end()) return;
+            auto* persistent = static_cast<v8::Persistent<v8::Value>*>(handle.ptr);
+            persistent->Reset();
+            delete persistent;
+        };
+        for (auto arg : args) releaseTemporary(arg);
+        releaseTemporary(receiver);
+
+        bool resultWasInput = result.ptr == receiver.ptr;
+        for (const auto& arg : args) resultWasInput = resultWasInput || result.ptr == arg.ptr;
+        if (result.ptr && !resultWasInput &&
+            g_protectedHandles.find(result.ptr) == g_protectedHandles.end()) {
+            auto* resultPersistent = static_cast<v8::Persistent<v8::Value>*>(result.ptr);
+            if (engine) engine->frameHandles_.erase(resultPersistent);
+            resultPersistent->Reset();
+            delete resultPersistent;
+        }
+    }
+
     // Weak reference data for GC-triggered Dawn resource cleanup
     struct WeakRef {
         v8::Persistent<v8::Value> persistent;
@@ -1161,6 +1253,12 @@ private:
         V8Engine* owner = nullptr;
     };
 
+    struct NativeMethodRef {
+        v8::Persistent<v8::Function> persistent;
+        NativeMethod* method = nullptr;
+        V8Engine* owner = nullptr;
+    };
+
     v8::Isolate* isolate_ = nullptr;
     v8::ArrayBuffer::Allocator* allocator_ = nullptr;
     v8::Global<v8::Context> context_;
@@ -1171,6 +1269,7 @@ private:
     std::unordered_map<int, std::string> moduleIdToPath_;  // Reverse lookup: module hash -> path
     std::unordered_set<v8::Persistent<v8::Value>*> frameHandles_;  // Handles to free at end of frame
     std::unordered_set<NativeFunctionRef*> nativeFunctionRefs_;  // Weakly owned by JS functions
+    std::unordered_set<NativeMethodRef*> nativeMethodRefs_;  // Weakly owned receiver-aware methods
 };
 
 // Factory function

@@ -11,6 +11,10 @@
 #include <vector>
 #include <thread>
 #include <chrono>
+#include <filesystem>
+#include <fstream>
+#include <mutex>
+#include <cstdlib>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -95,6 +99,106 @@ WGPUBool wgpuDevicePoll(WGPUDevice device, WGPUBool wait, WGPUWrappedSubmissionI
 
 namespace mystral {
 namespace webgpu {
+
+#if defined(MYSTRAL_WEBGPU_DAWN)
+namespace {
+
+struct DawnDiskCache {
+    std::filesystem::path directory;
+    std::mutex mutex;
+};
+
+static DawnDiskCache& dawnDiskCache() {
+    static DawnDiskCache cache;
+    static std::once_flag initialized;
+    std::call_once(initialized, [] {
+#ifdef _WIN32
+        const char* base = std::getenv("LOCALAPPDATA");
+        cache.directory = base && *base
+            ? std::filesystem::path(base) / "Mystral" / "cache" / "dawn"
+            : std::filesystem::temp_directory_path() / "Mystral" / "cache" / "dawn";
+#else
+        const char* xdg = std::getenv("XDG_CACHE_HOME");
+        const char* home = std::getenv("HOME");
+        if (xdg && *xdg) cache.directory = std::filesystem::path(xdg) / "mystral" / "dawn";
+        else if (home && *home) cache.directory = std::filesystem::path(home) / ".cache" / "mystral" / "dawn";
+        else cache.directory = std::filesystem::temp_directory_path() / "mystral" / "dawn";
+#endif
+        std::error_code error;
+        std::filesystem::create_directories(cache.directory, error);
+        std::cout << "[WebGPU] Dawn pipeline cache: " << cache.directory.string() << std::endl;
+    });
+    return cache;
+}
+
+static std::string cacheKeyHex(const void* key, size_t keySize) {
+    static constexpr char hex[] = "0123456789abcdef";
+    const auto* bytes = static_cast<const uint8_t*>(key);
+    std::string value;
+    value.resize(keySize * 2);
+    for (size_t i = 0; i < keySize; ++i) {
+        value[i * 2] = hex[bytes[i] >> 4];
+        value[i * 2 + 1] = hex[bytes[i] & 0x0f];
+    }
+    return value;
+}
+
+static std::filesystem::path cachePath(DawnDiskCache& cache, const void* key, size_t keySize) {
+    return cache.directory / (cacheKeyHex(key, keySize) + ".bin");
+}
+
+static size_t loadDawnCacheData(
+    const void* key, size_t keySize, void* value, size_t valueSize, void* userdata) {
+    auto& cache = *static_cast<DawnDiskCache*>(userdata);
+    std::lock_guard<std::mutex> lock(cache.mutex);
+    const auto path = cachePath(cache, key, keySize);
+    std::error_code error;
+    const auto size = std::filesystem::file_size(path, error);
+    if (error) return 0;
+    if (!value || valueSize < size) return static_cast<size_t>(size);
+    std::ifstream input(path, std::ios::binary);
+    if (!input.read(static_cast<char*>(value), static_cast<std::streamsize>(size))) return 0;
+    return static_cast<size_t>(size);
+}
+
+static void storeDawnCacheData(
+    const void* key, size_t keySize, const void* value, size_t valueSize, void* userdata) {
+    auto& cache = *static_cast<DawnDiskCache*>(userdata);
+    std::lock_guard<std::mutex> lock(cache.mutex);
+    std::error_code error;
+    std::filesystem::create_directories(cache.directory, error);
+    const auto path = cachePath(cache, key, keySize);
+    if (!value || valueSize == 0) {
+        std::filesystem::remove(path, error);
+        return;
+    }
+    auto temporary = path;
+    temporary += ".tmp";
+    {
+        std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
+        if (!output.write(static_cast<const char*>(value), static_cast<std::streamsize>(valueSize))) {
+            std::filesystem::remove(temporary, error);
+            return;
+        }
+    }
+    std::filesystem::remove(path, error);
+    error.clear();
+    std::filesystem::rename(temporary, path, error);
+    if (error) std::filesystem::remove(temporary, error);
+}
+
+static void attachDawnCache(WGPUDeviceDescriptor& deviceDesc,
+                            WGPUDawnCacheDeviceDescriptor& cacheDesc) {
+    cacheDesc = WGPU_DAWN_CACHE_DEVICE_DESCRIPTOR_INIT;
+    cacheDesc.isolationKey = WGPU_STRING_VIEW("mystralnative-dawn-v1");
+    cacheDesc.loadDataFunction = loadDawnCacheData;
+    cacheDesc.storeDataFunction = storeDawnCacheData;
+    cacheDesc.functionUserdata = &dawnDiskCache();
+    deviceDesc.nextInChain = &cacheDesc.chain;
+}
+
+} // namespace
+#endif
 
 // Callback data for async operations
 struct AdapterRequestData {
@@ -370,6 +474,10 @@ bool Context::initializeHeadless() {
     // Request device
     WGPUDeviceDescriptor deviceDesc = {};
     WGPU_SET_LABEL(deviceDesc, "Mystral Headless Device");
+#if defined(MYSTRAL_WEBGPU_DAWN)
+    WGPUDawnCacheDeviceDescriptor cacheDesc;
+    attachDawnCache(deviceDesc, cacheDesc);
+#endif
 
 #if defined(MYSTRAL_WEBGPU_DAWN)
     WGPULimits adapterLimits = {};
@@ -617,6 +725,10 @@ bool Context::createSurface(void* nativeHandle, int platformType) {
     // Request device with required limits
     WGPUDeviceDescriptor deviceDesc = {};
     WGPU_SET_LABEL(deviceDesc, "Mystral Device");
+#if defined(MYSTRAL_WEBGPU_DAWN)
+    WGPUDawnCacheDeviceDescriptor cacheDesc;
+    attachDawnCache(deviceDesc, cacheDesc);
+#endif
 
     // Set up required limits - copy adapter limits and override what we need
     // WebGPU default is 32 bytes per sample, but deferred rendering needs ~40
@@ -802,6 +914,10 @@ bool Context::createSurfaceWithDisplay(void* display, void* window, int platform
     // Request device with required limits - same as createSurface
     WGPUDeviceDescriptor deviceDesc = {};
     WGPU_SET_LABEL(deviceDesc, "Mystral Device");
+#if defined(MYSTRAL_WEBGPU_DAWN)
+    WGPUDawnCacheDeviceDescriptor cacheDesc;
+    attachDawnCache(deviceDesc, cacheDesc);
+#endif
 
 #if defined(MYSTRAL_WEBGPU_DAWN)
     WGPULimits adapterLimits = {};

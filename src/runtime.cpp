@@ -501,19 +501,25 @@ public:
 #ifdef MYSTRAL_USE_LIBUV_TIMERS
         // Clean up libuv timers before shutting down the event loop
         for (auto& [id, ctx] : uvTimers_) {
-            if (ctx && !ctx->cancelled) {
+            if (ctx) {
+                ctx->cancelled = true;
                 uv_timer_stop(&ctx->handle);
-                if (jsEngine_) {
+                if (jsEngine_ && ctx->callbackProtected) {
                     jsEngine_->unprotect(ctx->callback);
+                    ctx->callbackProtected = false;
                 }
-                uv_close(reinterpret_cast<uv_handle_t*>(&ctx->handle), nullptr);
+                if (!uv_is_closing(reinterpret_cast<uv_handle_t*>(&ctx->handle))) {
+                    uv_close(reinterpret_cast<uv_handle_t*>(&ctx->handle), onTimerClose);
+                }
             }
         }
-        uvTimers_.clear();
 #endif
 
         // Shutdown libuv event loop (waits for pending handles to close)
         async::EventLoop::instance().shutdown();
+#ifdef MYSTRAL_USE_LIBUV_TIMERS
+        uvTimers_.clear();
+#endif
 
         // Unprotect all RAF callbacks before clearing
         if (jsEngine_) {
@@ -522,6 +528,7 @@ public:
             }
         }
         rafCallbacks_.clear();
+        clearDOMEventListeners();
 
         // Unprotect all timer callbacks before clearing
 #ifndef MYSTRAL_USE_LIBUV_TIMERS
@@ -571,19 +578,28 @@ public:
         // Store script path for reloading
         scriptPath_ = path;
 
-        // Set up file watching if watch mode is enabled
+        // Watch the containing directory so atomic bundle replacement does
+        // not detach the watch from the old inode/file handle.
         if (config_.watch && fs::getFileWatcher().isReady()) {
             if (watchId_ >= 0) {
                 fs::getFileWatcher().unwatch(watchId_);
             }
-            watchId_ = fs::getFileWatcher().watch(path, [this](const std::string& changedPath, fs::FileChangeType type) {
+            std::error_code pathError;
+            auto absoluteScript = std::filesystem::absolute(path, pathError).lexically_normal();
+            if (pathError) absoluteScript = std::filesystem::path(path).lexically_normal();
+            watchedScriptName_ = absoluteScript.filename().string();
+            auto watchDirectory = absoluteScript.parent_path();
+            if (watchDirectory.empty()) watchDirectory = ".";
+            watchId_ = fs::getFileWatcher().watch(watchDirectory.string(), [this](const std::string& changedPath, fs::FileChangeType type) {
+                if (std::filesystem::path(changedPath).filename().string() != watchedScriptName_) return;
                 if (type == fs::FileChangeType::Modified || type == fs::FileChangeType::Renamed) {
                     std::cout << "[HotReload] File changed: " << changedPath << std::endl;
                     reloadRequested_ = true;
+                    reloadDeadline_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(300);
                 }
             });
             if (watchId_ >= 0) {
-                std::cout << "[HotReload] Watching for changes: " << path << std::endl;
+                std::cout << "[HotReload] Watching for changes: " << absoluteScript.string() << std::endl;
             }
         }
 
@@ -610,6 +626,17 @@ public:
 
         std::cout << "[HotReload] Reloading script: " << scriptPath_ << std::endl;
 
+        // Give the application one synchronous chance to release its scene,
+        // renderer and JS-owned GPU wrappers before native callbacks vanish.
+        auto disposeHook = jsEngine_->getGlobalProperty("__laasHotDispose");
+        if (jsEngine_->isFunction(disposeHook)) {
+            auto result = jsEngine_->call(disposeHook, jsEngine_->newUndefined(), {});
+            if (!result.ptr) {
+                std::cerr << "[HotReload] Application dispose hook failed" << std::endl;
+            }
+        }
+        jsEngine_->setGlobalProperty("__laasHotDispose", jsEngine_->newUndefined());
+
         // Clear all pending timers
         clearAllTimers();
 
@@ -619,10 +646,15 @@ public:
         }
         rafCallbacks_.clear();
 
+        clearDOMEventListeners();
+
         // Clear module caches so script is re-read from disk
         if (moduleSystem_) {
             moduleSystem_->clearCaches();
         }
+
+        jsEngine_->gc();
+        jsEngine_->gc();
 
         // Reload the script
         bool success = moduleSystem_->loadEntry(scriptPath_);
@@ -641,11 +673,16 @@ private:
 #ifdef MYSTRAL_USE_LIBUV_TIMERS
         // Stop and clean up all libuv timers
         for (auto& [id, ctx] : uvTimers_) {
-            if (ctx && !ctx->cancelled) {
+            if (ctx) {
                 ctx->cancelled = true;
                 uv_timer_stop(&ctx->handle);
-                jsEngine_->unprotect(ctx->callback);
-                uv_close(reinterpret_cast<uv_handle_t*>(&ctx->handle), onTimerClose);
+                if (ctx->callbackProtected) {
+                    jsEngine_->unprotect(ctx->callback);
+                    ctx->callbackProtected = false;
+                }
+                if (!uv_is_closing(reinterpret_cast<uv_handle_t*>(&ctx->handle))) {
+                    uv_close(reinterpret_cast<uv_handle_t*>(&ctx->handle), onTimerClose);
+                }
             }
         }
         // Note: Don't clear uvTimers_ here - onTimerClose will do that
@@ -666,7 +703,8 @@ private:
         timerCallbacks_.clear();
         cancelledTimerIds_.clear();
 #endif
-        nextTimerId_ = 1;
+        // IDs remain monotonic: libuv close callbacks erase old timers on a
+        // later loop turn, so reusing IDs here could erase a new timer.
     }
 
 public:
@@ -776,7 +814,7 @@ public:
         fs::getFileWatcher().processPendingEvents();
 
         // Check if hot reload was requested
-        if (reloadRequested_) {
+        if (reloadRequested_ && std::chrono::steady_clock::now() >= reloadDeadline_) {
             reloadRequested_ = false;
             reloadScript();
         }
@@ -1018,6 +1056,7 @@ private:
         ctx->callback = callback;
         ctx->intervalMs = intervalMs;
         ctx->cancelled = false;
+        ctx->callbackProtected = true;
         ctx->runtime = this;
         ctx->handle.data = ctx.get();
 
@@ -1052,7 +1091,10 @@ private:
             ctx->cancelled = true;
             cancelledTimerIds_.insert(id);
             uv_timer_stop(&ctx->handle);
-            jsEngine_->unprotect(ctx->callback);
+            if (ctx->callbackProtected) {
+                jsEngine_->unprotect(ctx->callback);
+                ctx->callbackProtected = false;
+            }
             uv_close(reinterpret_cast<uv_handle_t*>(&ctx->handle), onTimerClose);
         }
     }
@@ -1276,6 +1318,21 @@ private:
         // process.env - environment variables (empty object for now, could populate later)
         auto env = jsEngine_->newObject();
         jsEngine_->setProperty(process, "env", env);
+
+        // process.memoryUsage() - native harness diagnostics. Field names are
+        // explicit rather than pretending every engine exposes Node's full set.
+        jsEngine_->setProperty(process, "memoryUsage",
+            jsEngine_->newFunction("memoryUsage", [this](void* ctx, const std::vector<js::JSValueHandle>& args) {
+                const auto stats = jsEngine_->getMemoryStats();
+                auto result = jsEngine_->newObject();
+                jsEngine_->setProperty(result, "heapUsedBytes", jsEngine_->newNumber((double)stats.heapUsedBytes));
+                jsEngine_->setProperty(result, "heapTotalBytes", jsEngine_->newNumber((double)stats.heapTotalBytes));
+                jsEngine_->setProperty(result, "heapLimitBytes", jsEngine_->newNumber((double)stats.heapLimitBytes));
+                jsEngine_->setProperty(result, "nativeFunctions", jsEngine_->newNumber((double)stats.nativeFunctions));
+                jsEngine_->setProperty(result, "frameHandles", jsEngine_->newNumber((double)stats.frameHandles));
+                return result;
+            })
+        );
 
         jsEngine_->setGlobalProperty("process", process);
     }
@@ -3256,7 +3313,10 @@ globalThis.__mystralNativeDecodeDracoAsync = function(buffer, attrs) {
             if (pending.intervalMs == 0) {
                 auto it = uvTimers_.find(pending.id);
                 if (it != uvTimers_.end()) {
-                    jsEngine_->unprotect(it->second->callback);
+                    if (it->second->callbackProtected) {
+                        jsEngine_->unprotect(it->second->callback);
+                        it->second->callbackProtected = false;
+                    }
                     // uv_close is async - onTimerClose will erase from map when done
                     uv_close(reinterpret_cast<uv_handle_t*>(&it->second->handle), onTimerClose);
                 }
@@ -3397,6 +3457,7 @@ globalThis.__mystralNativeDecodeDracoAsync = function(buffer, attrs) {
         js::JSValueHandle callback;
         int intervalMs;  // 0 for setTimeout, >0 for setInterval
         bool cancelled;
+        bool callbackProtected;
         RuntimeImpl* runtime;  // Back-reference for callback
     };
     std::map<int, std::unique_ptr<UvTimerContext>> uvTimers_;
@@ -3470,8 +3531,32 @@ globalThis.__mystralNativeDecodeDracoAsync = function(buffer, attrs) {
 
     // Hot reload state
     std::string scriptPath_;  // Path to the currently loaded script
+    std::string watchedScriptName_;
     int watchId_ = -1;        // File watcher ID (-1 if not watching)
     bool reloadRequested_ = false;  // Set when a file change is detected
+    std::chrono::steady_clock::time_point reloadDeadline_{};
+
+    void clearDOMEventListeners() {
+        if (!jsEngine_) {
+            eventListeners_.clear();
+            return;
+        }
+        size_t count = 0;
+        for (auto& [target, byType] : eventListeners_) {
+            for (auto& [type, listeners] : byType) {
+                for (auto& listener : listeners) {
+                    if (listener.callback.ptr) {
+                        jsEngine_->unprotect(listener.callback);
+                        count++;
+                    }
+                }
+            }
+        }
+        eventListeners_.clear();
+        if (count > 0) {
+            std::cout << "[HotReload] Released " << count << " DOM listeners" << std::endl;
+        }
+    }
 
     void setupDOMEvents() {
         if (!jsEngine_) return;

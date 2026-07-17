@@ -19,6 +19,7 @@ namespace js {
 
 // Store native function callbacks (since we can't capture lambdas in JSC callbacks)
 static std::unordered_map<void*, NativeFunction> g_nativeFunctions;
+static std::unordered_map<void*, NativeMethod> g_nativeMethods;
 
 class JSCEngine : public Engine {
 public:
@@ -42,6 +43,9 @@ public:
 
     ~JSCEngine() override {
         std::cout << "[JSC] Destroying engine..." << std::endl;
+
+        g_nativeFunctions.clear();
+        g_nativeMethods.clear();
 
         if (context_) {
             JSGlobalContextRelease(context_);
@@ -359,6 +363,15 @@ public:
         return {(void*)funcObj, context_};
     }
 
+    JSValueHandle newMethod(const char* name, NativeMethod fn) override {
+        JSStringRef nameStr = JSStringCreateWithUTF8CString(name);
+        JSObjectRef funcObj = JSObjectMakeFunctionWithCallback(
+            context_, nameStr, &nativeMethodCallback);
+        g_nativeMethods[(void*)funcObj] = std::move(fn);
+        JSStringRelease(nameStr);
+        return {(void*)funcObj, context_};
+    }
+
     // ========================================================================
     // Value Conversion
     // ========================================================================
@@ -489,6 +502,12 @@ public:
 
     void gc() override {
         JSGarbageCollect(context_);
+    }
+
+    MemoryStats getMemoryStats() const override {
+        MemoryStats stats;
+        stats.nativeFunctions = g_nativeFunctions.size() + g_nativeMethods.size();
+        return stats;
     }
 
     // ========================================================================
@@ -636,6 +655,21 @@ private:
         // Call the native function
         JSValueHandle result = it->second((void*)ctx, args);
         return (JSValueRef)result.ptr;
+    }
+
+    static JSValueRef nativeMethodCallback(JSContextRef ctx, JSObjectRef function,
+                                           JSObjectRef thisObject, size_t argumentCount,
+                                           const JSValueRef arguments[], JSValueRef* exception) {
+        auto it = g_nativeMethods.find((void*)function);
+        if (it == g_nativeMethods.end()) return JSValueMakeUndefined(ctx);
+        std::vector<JSValueHandle> args;
+        args.reserve(argumentCount);
+        for (size_t i = 0; i < argumentCount; i++) {
+            args.push_back({(void*)arguments[i], (void*)ctx});
+        }
+        JSValueHandle receiver{(void*)thisObject, (void*)ctx};
+        JSValueHandle result = it->second((void*)ctx, receiver, args);
+        return result.ptr ? (JSValueRef)result.ptr : JSValueMakeUndefined(ctx);
     }
 
     JSContextGroupRef contextGroup_ = nullptr;

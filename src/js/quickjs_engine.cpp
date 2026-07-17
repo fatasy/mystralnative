@@ -146,6 +146,10 @@ public:
                 delete fn;
             }
             allocatedFunctions_.clear();
+            for (auto* method : allocatedMethods_) {
+                delete method;
+            }
+            allocatedMethods_.clear();
 
             // Clear private data map
             privateDataMap_.clear();
@@ -456,6 +460,16 @@ public:
         return {stored, context_};
     }
 
+    JSValueHandle newMethod(const char* name, NativeMethod fn) override {
+        auto* fnPtr = new NativeMethod(std::move(fn));
+        allocatedMethods_.push_back(fnPtr);
+        JSValue ptrValue = JS_NewBigInt64(context_, (int64_t)(uintptr_t)fnPtr);
+        JSValue func = JS_NewCFunctionData(context_, &nativeMethodCallback, 0, 0, 1, &ptrValue);
+        JS_FreeValue(context_, ptrValue);
+        JSValue* stored = new JSValue(func);
+        return {stored, context_};
+    }
+
     // ========================================================================
     // Value Conversion
     // ========================================================================
@@ -602,6 +616,16 @@ public:
 
     void gc() override {
         JS_RunGC(runtime_);
+    }
+
+    MemoryStats getMemoryStats() const override {
+        JSMemoryUsage usage = {};
+        JS_ComputeMemoryUsage(runtime_, &usage);
+        MemoryStats stats;
+        stats.heapUsedBytes = usage.memory_used_size;
+        stats.heapTotalBytes = usage.malloc_size;
+        stats.nativeFunctions = allocatedFunctions_.size() + allocatedMethods_.size();
+        return stats;
     }
 
     // ========================================================================
@@ -751,6 +775,40 @@ private:
         return JS_UNDEFINED;
     }
 
+    static JSValue nativeMethodCallback(JSContext* ctx, JSValueConst this_val,
+                                        int argc, JSValueConst* argv, int magic,
+                                        JSValue* func_data) {
+        int64_t ptrVal;
+        if (JS_ToBigInt64(ctx, &ptrVal, func_data[0]) < 0) return JS_UNDEFINED;
+        auto* method = reinterpret_cast<NativeMethod*>(static_cast<uintptr_t>(ptrVal));
+        if (!method) return JS_UNDEFINED;
+
+        std::vector<JSValueHandle> args;
+        args.reserve(argc);
+        for (int i = 0; i < argc; i++) {
+            auto* stored = new JSValue(JS_DupValue(ctx, argv[i]));
+            args.push_back({stored, ctx});
+        }
+        auto* receiverValue = new JSValue(JS_DupValue(ctx, this_val));
+        JSValueHandle receiver{receiverValue, ctx};
+        JSValueHandle result = (*method)(ctx, receiver, args);
+
+        for (auto& arg : args) {
+            if (g_protectedHandles.find(arg.ptr) != g_protectedHandles.end() ||
+                arg.ptr == result.ptr) continue;
+            auto* value = static_cast<JSValue*>(arg.ptr);
+            JS_FreeValue(ctx, *value);
+            delete value;
+        }
+        if (receiver.ptr != result.ptr &&
+            g_protectedHandles.find(receiver.ptr) == g_protectedHandles.end()) {
+            JS_FreeValue(ctx, *receiverValue);
+            delete receiverValue;
+        }
+        if (result.ptr) return *static_cast<JSValue*>(result.ptr);
+        return JS_UNDEFINED;
+    }
+
     // Console functions - helper to build message string
     static std::string buildConsoleMessage(JSContext* ctx, int argc, JSValueConst* argv) {
         std::ostringstream oss;
@@ -815,6 +873,7 @@ private:
     std::chrono::high_resolution_clock::time_point startTime_;
     std::unordered_map<void*, void*> privateDataMap_;  // Map JS object ptr to native data
     std::vector<NativeFunction*> allocatedFunctions_;  // Track allocated function pointers
+    std::vector<NativeMethod*> allocatedMethods_;  // Track receiver-aware callbacks
 
     static QuickJSEngine* engineInstance_;  // For performance.now access
 };

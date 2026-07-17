@@ -31,6 +31,21 @@ struct JSValueHandle {
  */
 using NativeFunction = std::function<JSValueHandle(void* ctx, const std::vector<JSValueHandle>& args)>;
 
+/** Native method signature. Unlike NativeFunction, this receives the actual
+ * JavaScript `this` value so one callback can be shared by many wrappers. */
+using NativeMethod = std::function<JSValueHandle(
+    void* ctx,
+    JSValueHandle receiver,
+    const std::vector<JSValueHandle>& args)>;
+
+struct MemoryStats {
+    uint64_t heapUsedBytes = 0;
+    uint64_t heapTotalBytes = 0;
+    uint64_t heapLimitBytes = 0;
+    uint64_t nativeFunctions = 0;
+    uint64_t frameHandles = 0;
+};
+
 /**
  * Engine type enumeration
  */
@@ -182,6 +197,9 @@ public:
      */
     virtual JSValueHandle newFunction(const char* name, NativeFunction fn) = 0;
 
+    /** Create a receiver-aware function suitable for shared prototype/method use. */
+    virtual JSValueHandle newMethod(const char* name, NativeMethod fn) = 0;
+
     // ========================================================================
     // Value Conversion
     // ========================================================================
@@ -236,6 +254,9 @@ public:
      * Run garbage collection (if supported)
      */
     virtual void gc() = 0;
+
+    /** Lightweight runtime diagnostics used by native performance harnesses. */
+    virtual MemoryStats getMemoryStats() const { return {}; }
 
     /**
      * Signal the start of a new animation frame.
