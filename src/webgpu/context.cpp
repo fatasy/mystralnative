@@ -11,6 +11,7 @@
 #include <vector>
 #include <thread>
 #include <chrono>
+#include <cstdlib>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -95,6 +96,45 @@ WGPUBool wgpuDevicePoll(WGPUDevice device, WGPUBool wait, WGPUWrappedSubmissionI
 
 namespace mystral {
 namespace webgpu {
+
+#if defined(MYSTRAL_WEBGPU_DAWN) && defined(_WIN32)
+namespace {
+
+class DawnWindowsDeviceOptions {
+public:
+    explicit DawnWindowsDeviceOptions(WGPUDeviceDescriptor& descriptor) {
+        const char* configured = std::getenv("MYSTRAL_USE_DXC");
+        if (configured && std::strcmp(configured, "0") == 0) {
+            std::cout << "[WebGPU] DXC disabled by MYSTRAL_USE_DXC=0; using Dawn default compiler" << std::endl;
+            return;
+        }
+
+        HMODULE dxcompiler = LoadLibraryW(L"dxcompiler.dll");
+        HMODULE dxil = LoadLibraryW(L"dxil.dll");
+        if (!dxcompiler || !dxil) {
+            if (dxcompiler) FreeLibrary(dxcompiler);
+            if (dxil) FreeLibrary(dxil);
+            std::cout << "[WebGPU] DXC runtime not found; using Dawn default compiler" << std::endl;
+            return;
+        }
+        FreeLibrary(dxcompiler);
+        FreeLibrary(dxil);
+
+        enabledToggles_[0] = "use_dxc";
+        toggles_.chain.sType = WGPUSType_DawnTogglesDescriptor;
+        toggles_.enabledToggleCount = 1;
+        toggles_.enabledToggles = enabledToggles_;
+        descriptor.nextInChain = &toggles_.chain;
+        std::cout << "[WebGPU] DXC shader compiler enabled" << std::endl;
+    }
+
+private:
+    const char* enabledToggles_[1] = {};
+    WGPUDawnTogglesDescriptor toggles_ = {};
+};
+
+} // namespace
+#endif
 
 // Callback data for async operations
 struct AdapterRequestData {
@@ -371,6 +411,10 @@ bool Context::initializeHeadless() {
     WGPUDeviceDescriptor deviceDesc = {};
     WGPU_SET_LABEL(deviceDesc, "Mystral Headless Device");
 
+#if defined(MYSTRAL_WEBGPU_DAWN) && defined(_WIN32)
+    DawnWindowsDeviceOptions dawnDeviceOptions(deviceDesc);
+#endif
+
 #if defined(MYSTRAL_WEBGPU_DAWN)
     WGPULimits adapterLimits = {};
     wgpuAdapterGetLimits(adapter_, &adapterLimits);
@@ -618,6 +662,10 @@ bool Context::createSurface(void* nativeHandle, int platformType) {
     WGPUDeviceDescriptor deviceDesc = {};
     WGPU_SET_LABEL(deviceDesc, "Mystral Device");
 
+#if defined(MYSTRAL_WEBGPU_DAWN) && defined(_WIN32)
+    DawnWindowsDeviceOptions dawnDeviceOptions(deviceDesc);
+#endif
+
     // Set up required limits - copy adapter limits and override what we need
     // WebGPU default is 32 bytes per sample, but deferred rendering needs ~40
     // Chrome defaults: https://www.w3.org/TR/webgpu/#limits
@@ -802,6 +850,10 @@ bool Context::createSurfaceWithDisplay(void* display, void* window, int platform
     // Request device with required limits - same as createSurface
     WGPUDeviceDescriptor deviceDesc = {};
     WGPU_SET_LABEL(deviceDesc, "Mystral Device");
+
+#if defined(MYSTRAL_WEBGPU_DAWN) && defined(_WIN32)
+    DawnWindowsDeviceOptions dawnDeviceOptions(deviceDesc);
+#endif
 
 #if defined(MYSTRAL_WEBGPU_DAWN)
     WGPULimits adapterLimits = {};
