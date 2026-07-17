@@ -23,6 +23,14 @@ struct RuntimeConfig {
     bool debug = false;  // Enable verbose debug logging
 };
 
+struct EvaluationResult {
+    bool success = false;
+    std::string valueJson;
+    std::string error;
+};
+
+using ConsoleCallback = std::function<void(const std::string& type, const std::string& message)>;
+
 /**
  * Mystral Native Runtime
  *
@@ -65,6 +73,16 @@ public:
     virtual bool evalScript(const std::string& code, const std::string& filename = "<eval>") = 0;
 
     /**
+     * Evaluate an expression and return a JSON-safe description of its value.
+     */
+    virtual EvaluationResult evaluateExpression(const std::string& expression) = 0;
+
+    /**
+     * Observe JavaScript console output.
+     */
+    virtual void setConsoleCallback(ConsoleCallback callback) = 0;
+
+    /**
      * Reload the currently loaded script (for hot reload)
      * Clears timers and requestAnimationFrame callbacks, then re-evaluates the script.
      * @return true on success
@@ -86,6 +104,16 @@ public:
      * @return false if the runtime should quit
      */
     virtual bool pollEvents() = 0;
+
+    /** Pause game callbacks while keeping the native/debug event loop alive. */
+    virtual void setPaused(bool paused) = 0;
+
+    virtual bool isPaused() const = 0;
+
+    /** Execute a bounded number of game frames, then remain paused. */
+    virtual void stepFrames(uint32_t count) = 0;
+
+    virtual uint64_t getFrameCount() const = 0;
 
     /**
      * Request the runtime to quit

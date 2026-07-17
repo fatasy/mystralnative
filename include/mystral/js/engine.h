@@ -30,6 +30,7 @@ struct JSValueHandle {
  * Called from JavaScript with arguments, returns a value
  */
 using NativeFunction = std::function<JSValueHandle(void* ctx, const std::vector<JSValueHandle>& args)>;
+using ConsoleCallback = std::function<void(const std::string& type, const std::string& message)>;
 
 /** Native method signature. Unlike NativeFunction, this receives the actual
  * JavaScript `this` value so one callback can be shared by many wrappers. */
@@ -251,6 +252,11 @@ public:
     virtual void unprotect(JSValueHandle value) = 0;
 
     /**
+     * Release a temporary value returned by an engine operation.
+     */
+    virtual void releaseValue(JSValueHandle value) = 0;
+
+    /**
      * Run garbage collection (if supported)
      */
     virtual void gc() = 0;
@@ -279,6 +285,11 @@ public:
      */
     virtual void suspendFrameTracking() {}
     virtual void resumeFrameTracking() {}
+
+    /**
+     * Observe console output while preserving the normal stdout/stderr output.
+     */
+    virtual void setConsoleCallback(ConsoleCallback callback) = 0;
 
     /**
      * Register a release callback on a JS object wrapper.

@@ -14,6 +14,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <chrono>
+#include <sstream>
 
 #if defined(MYSTRAL_JS_V8)
 
@@ -26,9 +27,6 @@ namespace js {
 // V8 platform (shared across all isolates)
 static std::unique_ptr<v8::Platform> g_platform;
 static bool g_initialized = false;
-
-// Global set of protected handles that should not be deleted by nativeCallback cleanup
-static std::unordered_set<void*> g_protectedHandles;
 
 /**
  * Initialize V8 (call once at startup)
@@ -97,10 +95,27 @@ public:
         std::cout << "[V8] Destroying engine..." << std::endl;
         // Clean up any remaining frame handles
         for (auto* handle : frameHandles_) {
+            if (protectedHandles_.find(handle) == protectedHandles_.end()) {
+                handle->Reset();
+                delete handle;
+            }
+        }
+        frameHandles_.clear();
+        for (void* rawHandle : protectedHandles_) {
+            auto* handle = static_cast<v8::Persistent<v8::Value>*>(rawHandle);
             handle->Reset();
             delete handle;
         }
-        frameHandles_.clear();
+        protectedHandles_.clear();
+        // Weak callbacks do not run once isolate shutdown begins. Execute the
+        // native resource releases while their owning device is still alive.
+        for (auto* ref : weakRefs_) {
+            ref->callback();
+            isolate_->AdjustAmountOfExternalAllocatedMemory(-kExternalResourceSize);
+            ref->persistent.Reset();
+            delete ref;
+        }
+        weakRefs_.clear();
         // Weak callbacks do not run after the isolate starts shutting down.
         // Release the native callbacks still owned by live JS functions now.
         for (auto* ref : nativeFunctionRefs_) {
@@ -809,16 +824,29 @@ public:
     void protect(JSValueHandle value) override {
         // Mark this handle as protected in the global set.
         // nativeCallback will check this set and skip deletion for protected handles.
-        g_protectedHandles.insert(value.ptr);
+        protectedHandles_.insert(value.ptr);
     }
 
     void unprotect(JSValueHandle value) override {
         // Remove from protected set, frame handles, and delete
-        g_protectedHandles.erase(value.ptr);
+        protectedHandles_.erase(value.ptr);
         frameHandles_.erase((v8::Persistent<v8::Value>*)value.ptr);
         v8::Persistent<v8::Value>* persistent = (v8::Persistent<v8::Value>*)value.ptr;
         persistent->Reset();
         delete persistent;
+    }
+
+    void releaseValue(JSValueHandle value) override {
+        if (!value.ptr) return;
+        protectedHandles_.erase(value.ptr);
+        frameHandles_.erase((v8::Persistent<v8::Value>*)value.ptr);
+        auto* persistent = (v8::Persistent<v8::Value>*)value.ptr;
+        persistent->Reset();
+        delete persistent;
+    }
+
+    void setConsoleCallback(ConsoleCallback callback) override {
+        consoleCallback_ = std::move(callback);
     }
 
     void gc() override {
@@ -843,7 +871,7 @@ public:
 
     void clearFrameHandles() override {
         for (auto* handle : frameHandles_) {
-            if (g_protectedHandles.find(handle) == g_protectedHandles.end()) {
+            if (protectedHandles_.find(handle) == protectedHandles_.end()) {
                 handle->Reset();
                 delete handle;
             }
@@ -874,11 +902,13 @@ public:
         // resource, but it ensures V8's own GC heuristics trigger major
         // collections frequently enough to fire weak callbacks and release
         // Dawn resources before they accumulate significantly.
-        static constexpr int64_t kExternalResourceSize = 16384;
         isolate_->AdjustAmountOfExternalAllocatedMemory(kExternalResourceSize);
+        weakData->owner = this;
+        weakRefs_.insert(weakData);
 
         weakData->persistent.SetWeak(weakData, [](const v8::WeakCallbackInfo<WeakRef>& data) {
             WeakRef* ref = data.GetParameter();
+            ref->owner->weakRefs_.erase(ref);
             ref->callback();  // Release the Dawn resource
             ref->isolate->AdjustAmountOfExternalAllocatedMemory(-kExternalResourceSize);
             ref->persistent.Reset();
@@ -1048,13 +1078,17 @@ private:
                 v8::Local<v8::String> prefixStr = info.Data().As<v8::String>();
                 v8::String::Utf8Value prefixUtf8(isolate, prefixStr);
 
-                std::cout << "[" << *prefixUtf8 << "] ";
+                std::ostringstream message;
                 for (int i = 0; i < info.Length(); i++) {
                     v8::String::Utf8Value str(isolate, info[i]);
-                    std::cout << (*str ? *str : "");
-                    if (i < info.Length() - 1) std::cout << " ";
+                    message << (*str ? *str : "");
+                    if (i < info.Length() - 1) message << " ";
                 }
-                std::cout << std::endl;
+                std::cout << "[" << *prefixUtf8 << "] " << message.str() << std::endl;
+                auto* engine = static_cast<V8Engine*>(isolate->GetData(0));
+                if (engine && engine->consoleCallback_) {
+                    engine->consoleCallback_(*prefixUtf8 ? *prefixUtf8 : "log", message.str());
+                }
             }, v8::String::NewFromUtf8(isolate_, prefix).ToLocalChecked())->GetFunction(context).ToLocalChecked();
         };
 
@@ -1162,7 +1196,7 @@ private:
         // Clean up argument handles (but skip protected ones and the result if it's an arg)
         for (auto& arg : args) {
             // Check if this handle was protected by the native function
-            if (g_protectedHandles.find(arg.ptr) != g_protectedHandles.end()) {
+            if (engine && engine->protectedHandles_.find(arg.ptr) != engine->protectedHandles_.end()) {
                 // Skip - the native function wants to keep this handle
                 continue;
             }
@@ -1183,7 +1217,8 @@ private:
                 break;
             }
         }
-        if (result.ptr && !resultWasArg && g_protectedHandles.find(result.ptr) == g_protectedHandles.end()) {
+        if (result.ptr && !resultWasArg &&
+            (!engine || engine->protectedHandles_.find(result.ptr) == engine->protectedHandles_.end())) {
             v8::Persistent<v8::Value>* resPersistent = (v8::Persistent<v8::Value>*)result.ptr;
             // Remove from frame handles to avoid double-free in clearFrameHandles()
             if (engine) {
@@ -1219,7 +1254,7 @@ private:
 
         auto releaseTemporary = [&](JSValueHandle handle) {
             if (!handle.ptr || handle.ptr == result.ptr ||
-                g_protectedHandles.find(handle.ptr) != g_protectedHandles.end()) return;
+                (engine && engine->protectedHandles_.find(handle.ptr) != engine->protectedHandles_.end())) return;
             auto* persistent = static_cast<v8::Persistent<v8::Value>*>(handle.ptr);
             persistent->Reset();
             delete persistent;
@@ -1230,7 +1265,7 @@ private:
         bool resultWasInput = result.ptr == receiver.ptr;
         for (const auto& arg : args) resultWasInput = resultWasInput || result.ptr == arg.ptr;
         if (result.ptr && !resultWasInput &&
-            g_protectedHandles.find(result.ptr) == g_protectedHandles.end()) {
+            (!engine || engine->protectedHandles_.find(result.ptr) == engine->protectedHandles_.end())) {
             auto* resultPersistent = static_cast<v8::Persistent<v8::Value>*>(result.ptr);
             if (engine) engine->frameHandles_.erase(resultPersistent);
             resultPersistent->Reset();
@@ -1243,6 +1278,7 @@ private:
         v8::Persistent<v8::Value> persistent;
         std::function<void()> callback;
         v8::Isolate* isolate = nullptr;
+        V8Engine* owner = nullptr;
     };
 
     // Keeps the C++ callback behind a v8::External alive exactly as long as
@@ -1268,8 +1304,12 @@ private:
     std::unordered_map<std::string, v8::Global<v8::Module>> moduleCache_;
     std::unordered_map<int, std::string> moduleIdToPath_;  // Reverse lookup: module hash -> path
     std::unordered_set<v8::Persistent<v8::Value>*> frameHandles_;  // Handles to free at end of frame
+    std::unordered_set<void*> protectedHandles_;  // Explicit roots owned by this engine
+    std::unordered_set<WeakRef*> weakRefs_;  // Native releases owned by weak JS wrappers
     std::unordered_set<NativeFunctionRef*> nativeFunctionRefs_;  // Weakly owned by JS functions
     std::unordered_set<NativeMethodRef*> nativeMethodRefs_;  // Weakly owned receiver-aware methods
+    ConsoleCallback consoleCallback_;
+    static constexpr int64_t kExternalResourceSize = 16384;
 };
 
 // Factory function

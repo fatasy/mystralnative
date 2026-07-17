@@ -32,6 +32,7 @@
 #include <regex>
 #include <queue>
 #include <array>
+#include <deque>
 
 // WebP animation encoding (for video recording)
 #ifdef MYSTRAL_HAS_WEBP_MUX
@@ -243,10 +244,59 @@ static std::string extractJsonString(const std::string& json, const std::string&
     size_t quoteStart = json.find('"', colonPos);
     if (quoteStart == std::string::npos) return "";
 
-    size_t quoteEnd = json.find('"', quoteStart + 1);
-    if (quoteEnd == std::string::npos) return "";
+    std::string result;
+    bool escaped = false;
+    for (size_t i = quoteStart + 1; i < json.size(); i++) {
+        char c = json[i];
+        if (escaped) {
+            switch (c) {
+                case '"': result.push_back('"'); break;
+                case '\\': result.push_back('\\'); break;
+                case '/': result.push_back('/'); break;
+                case 'b': result.push_back('\b'); break;
+                case 'f': result.push_back('\f'); break;
+                case 'n': result.push_back('\n'); break;
+                case 'r': result.push_back('\r'); break;
+                case 't': result.push_back('\t'); break;
+                default: result.push_back(c); break;
+            }
+            escaped = false;
+        } else if (c == '\\') {
+            escaped = true;
+        } else if (c == '"') {
+            return result;
+        } else {
+            result.push_back(c);
+        }
+    }
+    return "";
+}
 
-    return json.substr(quoteStart + 1, quoteEnd - quoteStart - 1);
+static std::string escapeJson(const std::string& value) {
+    static const char hex[] = "0123456789abcdef";
+    std::string result;
+    result.reserve(value.size());
+    for (unsigned char c : value) {
+        switch (c) {
+            case '"': result += "\\\""; break;
+            case '\\': result += "\\\\"; break;
+            case '\b': result += "\\b"; break;
+            case '\f': result += "\\f"; break;
+            case '\n': result += "\\n"; break;
+            case '\r': result += "\\r"; break;
+            case '\t': result += "\\t"; break;
+            default:
+                if (c < 0x20) {
+                    result += "\\u00";
+                    result.push_back(hex[(c >> 4) & 0x0f]);
+                    result.push_back(hex[c & 0x0f]);
+                } else {
+                    result.push_back(static_cast<char>(c));
+                }
+                break;
+        }
+    }
+    return result;
 }
 
 /**
@@ -1340,11 +1390,45 @@ int runScript(const CLIOptions& opts) {
     config.watch = opts.watch;
     config.debug = debugMode;
 
+    struct DebugLogEntry {
+        uint64_t sequence;
+        std::string type;
+        std::string message;
+    };
+    struct PendingFrameWait {
+        int clientId;
+        int requestId;
+        uint64_t targetFrame;
+        std::chrono::steady_clock::time_point deadline;
+    };
+
+    std::unique_ptr<mystral::debug::DebugServer> debugServer;
+    std::deque<DebugLogEntry> debugLogs;
+    std::vector<PendingFrameWait> pendingFrameWaits;
+    uint64_t nextLogSequence = 1;
+    int quitDelayPolls = -1;
+    constexpr size_t maxDebugLogs = 1000;
+
     auto runtime = mystral::Runtime::create(config);
     if (!runtime) {
         std::cerr << "Error: Failed to create runtime!" << std::endl;
         return 1;
     }
+
+    runtime->setConsoleCallback([&](const std::string& type, const std::string& message) {
+        DebugLogEntry entry{nextLogSequence++, type, message};
+        debugLogs.push_back(entry);
+        if (debugLogs.size() > maxDebugLogs) {
+            debugLogs.pop_front();
+        }
+        if (debugServer && debugServer->isRunning()) {
+            debugServer->broadcastEvent(
+                "console",
+                "{\"sequence\":" + std::to_string(entry.sequence) +
+                ",\"type\":\"" + escapeJson(entry.type) +
+                "\",\"message\":\"" + escapeJson(entry.message) + "\"}");
+        }
+    });
 
     // Load and execute the script
     if (!runtime->loadScript(opts.scriptPath)) {
@@ -1660,8 +1744,6 @@ int runScript(const CLIOptions& opts) {
     } else {
         // Normal mode: run main loop until quit
         // If debug server is enabled, we need to use a manual loop
-        std::unique_ptr<mystral::debug::DebugServer> debugServer;
-        int frameCount = 0;
 
         if (opts.debugPort > 0) {
             debugServer = std::make_unique<mystral::debug::DebugServer>(opts.debugPort);
@@ -1670,10 +1752,48 @@ int runScript(const CLIOptions& opts) {
                 debugServer.reset();
             } else {
                 // Set up command handler
-                debugServer->setCommandHandler([&](const std::string& method, const std::string& params) -> std::string {
+                debugServer->setCommandHandler([&](int clientId, int requestId, const std::string& method, const std::string& params) -> std::string {
+                    auto fail = [&](const std::string& message) {
+                        debugServer->sendError(clientId, requestId, message);
+                        return std::string{};
+                    };
+
+                    if (method == "hello" || method == "getCapabilities") {
+                        return "{\"protocolVersion\":1,\"runtimeVersion\":\"" +
+                            std::string(mystral::getVersion()) +
+                            "\",\"methods\":[\"screenshot\",\"keyboard\",\"mouse\",\"gamepad\","
+                            "\"getFrameCount\",\"evaluate\",\"getLogs\",\"waitForFrame\",\"pause\",\"resume\",\"stepFrames\",\"quit\"]}";
+                    }
+
                     // Handle getFrameCount
                     if (method == "getFrameCount") {
-                        return "{\"frame\":" + std::to_string(frameCount) + "}";
+                        return "{\"frame\":" + std::to_string(runtime->getFrameCount()) +
+                            ",\"paused\":" + (runtime->isPaused() ? "true" : "false") + "}";
+                    }
+
+                    if (method == "pause") {
+                        runtime->setPaused(true);
+                        return "{\"frame\":" + std::to_string(runtime->getFrameCount()) + ",\"paused\":true}";
+                    }
+
+                    if (method == "resume") {
+                        runtime->setPaused(false);
+                        return "{\"frame\":" + std::to_string(runtime->getFrameCount()) + ",\"paused\":false}";
+                    }
+
+                    if (method == "quit") {
+                        quitDelayPolls = 2;
+                        return "{\"quitting\":true}";
+                    }
+
+                    if (method == "stepFrames") {
+                        int count = static_cast<int>(extractJsonNumber(params, "count", 1));
+                        if (count < 1) {
+                            return fail("count must be at least 1");
+                        }
+                        uint64_t targetFrame = runtime->getFrameCount() + static_cast<uint64_t>(count);
+                        runtime->stepFrames(static_cast<uint32_t>(count));
+                        return "{\"targetFrame\":" + std::to_string(targetFrame) + ",\"paused\":true}";
                     }
 
                     // Handle screenshot
@@ -1688,9 +1808,9 @@ int runScript(const CLIOptions& opts) {
                                 std::string base64 = base64Encode(pngData.data(), pngData.size());
                                 return "{\"data\":\"" + base64 + "\",\"width\":" + std::to_string(width) + ",\"height\":" + std::to_string(height) + "}";
                             }
-                            return "{\"error\":\"Failed to encode PNG\"}";
+                            return fail("Failed to encode PNG");
                         }
-                        return "{\"error\":\"Failed to capture frame\"}";
+                        return fail("Failed to capture frame");
                     }
 
                     // Handle keyboard.press, keyboard.down, keyboard.up, keyboard.type
@@ -1701,7 +1821,7 @@ int runScript(const CLIOptions& opts) {
                         if (subMethod == "press") {
                             SDL_Scancode scancode = keyNameToScancode(keyName);
                             if (scancode == SDL_SCANCODE_UNKNOWN) {
-                                return "{\"error\":\"Unknown key: " + keyName + "\"}";
+                                return fail("Unknown key: " + keyName);
                             }
                             injectKeyboardEvent(scancode, true);
                             injectKeyboardEvent(scancode, false);
@@ -1710,7 +1830,7 @@ int runScript(const CLIOptions& opts) {
                         if (subMethod == "down") {
                             SDL_Scancode scancode = keyNameToScancode(keyName);
                             if (scancode == SDL_SCANCODE_UNKNOWN) {
-                                return "{\"error\":\"Unknown key: " + keyName + "\"}";
+                                return fail("Unknown key: " + keyName);
                             }
                             injectKeyboardEvent(scancode, true);
                             return "{}";
@@ -1718,7 +1838,7 @@ int runScript(const CLIOptions& opts) {
                         if (subMethod == "up") {
                             SDL_Scancode scancode = keyNameToScancode(keyName);
                             if (scancode == SDL_SCANCODE_UNKNOWN) {
-                                return "{\"error\":\"Unknown key: " + keyName + "\"}";
+                                return fail("Unknown key: " + keyName);
                             }
                             injectKeyboardEvent(scancode, false);
                             return "{}";
@@ -1735,7 +1855,7 @@ int runScript(const CLIOptions& opts) {
                             }
                             return "{}";
                         }
-                        return "{\"error\":\"Unknown keyboard method: " + subMethod + "\"}";
+                        return fail("Unknown keyboard method: " + subMethod);
                     }
 
                     // Handle mouse.move, mouse.click, mouse.down, mouse.up
@@ -1765,7 +1885,7 @@ int runScript(const CLIOptions& opts) {
                             injectMouseButton(x, y, button, false);
                             return "{}";
                         }
-                        return "{\"error\":\"Unknown mouse method: " + subMethod + "\"}";
+                        return fail("Unknown mouse method: " + subMethod);
                     }
 
                     // Handle gamepad.press, gamepad.axis
@@ -1793,7 +1913,7 @@ int runScript(const CLIOptions& opts) {
                             else if (buttonStr == "DPadRight") button = SDL_GAMEPAD_BUTTON_DPAD_RIGHT;
 
                             if (button == SDL_GAMEPAD_BUTTON_INVALID) {
-                                return "{\"error\":\"Unknown gamepad button: " + buttonStr + "\"}";
+                                return fail("Unknown gamepad button: " + buttonStr);
                             }
 
                             // Inject button press and release
@@ -1825,7 +1945,7 @@ int runScript(const CLIOptions& opts) {
                             }
 
                             if (axisX == SDL_GAMEPAD_AXIS_INVALID) {
-                                return "{\"error\":\"Unknown gamepad axis: " + axisStr + "\"}";
+                                return fail("Unknown gamepad axis: " + axisStr);
                             }
 
                             // Inject axis events (values are -32768 to 32767)
@@ -1841,23 +1961,61 @@ int runScript(const CLIOptions& opts) {
                             SDL_PushEvent(&event);
                             return "{}";
                         }
-                        return "{\"error\":\"Unknown gamepad method: " + subMethod + "\"}";
+                        return fail("Unknown gamepad method: " + subMethod);
                     }
 
                     // Handle waitForFrame - returns empty to signal async handling
                     if (method == "waitForFrame") {
-                        // This would need to be handled asynchronously
-                        // For now, immediately return current frame
-                        return "{\"frame\":" + std::to_string(frameCount) + "}";
+                        double absoluteFrame = extractJsonNumber(params, "frame", -1);
+                        int count = static_cast<int>(extractJsonNumber(params, "count", 1));
+                        int timeoutMs = static_cast<int>(extractJsonNumber(params, "timeoutMs", 5000));
+                        uint64_t currentFrame = runtime->getFrameCount();
+                        uint64_t targetFrame = absoluteFrame >= 0
+                            ? static_cast<uint64_t>(absoluteFrame)
+                            : currentFrame + static_cast<uint64_t>(count > 0 ? count : 0);
+                        if (targetFrame <= currentFrame) {
+                            return "{\"frame\":" + std::to_string(currentFrame) + "}";
+                        }
+                        pendingFrameWaits.push_back({
+                            clientId,
+                            requestId,
+                            targetFrame,
+                            std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs > 0 ? timeoutMs : 1)
+                        });
+                        return "";
                     }
 
                     // Handle evaluate - execute JS in the runtime
                     if (method == "evaluate") {
-                        // Would need to call runtime->evaluate() if available
-                        return "{\"error\":\"evaluate not yet implemented\"}";
+                        std::string expression = extractJsonString(params, "expression");
+                        if (params.find("\"expression\"") == std::string::npos) {
+                            return fail("Missing expression");
+                        }
+                        mystral::EvaluationResult evaluation = runtime->evaluateExpression(expression);
+                        if (!evaluation.success) {
+                            return fail(evaluation.error);
+                        }
+                        return evaluation.valueJson;
                     }
 
-                    return "{\"error\":\"Unknown method: " + method + "\"}";
+                    if (method == "getLogs") {
+                        double sinceValue = extractJsonNumber(params, "since", 0);
+                        uint64_t since = static_cast<uint64_t>(sinceValue > 0 ? sinceValue : 0);
+                        std::string result = "{\"entries\":[";
+                        bool first = true;
+                        for (const auto& entry : debugLogs) {
+                            if (entry.sequence <= since) continue;
+                            if (!first) result += ",";
+                            first = false;
+                            result += "{\"sequence\":" + std::to_string(entry.sequence) +
+                                ",\"type\":\"" + escapeJson(entry.type) +
+                                "\",\"message\":\"" + escapeJson(entry.message) + "\"}";
+                        }
+                        result += "]}";
+                        return result;
+                    }
+
+                    return fail("Unknown method: " + method);
                 });
 
                 if (!opts.quiet) {
@@ -1868,12 +2026,35 @@ int runScript(const CLIOptions& opts) {
 
         if (debugServer) {
             // Manual loop with debug server
+            uint64_t lastBroadcastFrame = runtime->getFrameCount();
             while (runtime->pollEvents()) {
-                frameCount++;
+                uint64_t currentFrame = runtime->getFrameCount();
 
                 // Broadcast frameRendered event to connected clients
-                if (debugServer->getClientCount() > 0) {
-                    debugServer->broadcastEvent("frameRendered", "{\"frame\":" + std::to_string(frameCount) + "}");
+                if (currentFrame != lastBroadcastFrame && debugServer->getClientCount() > 0) {
+                    debugServer->broadcastEvent("frameRendered", "{\"frame\":" + std::to_string(currentFrame) + "}");
+                }
+                lastBroadcastFrame = currentFrame;
+
+                auto now = std::chrono::steady_clock::now();
+                for (auto it = pendingFrameWaits.begin(); it != pendingFrameWaits.end();) {
+                    if (currentFrame >= it->targetFrame) {
+                        debugServer->sendResponse(
+                            it->clientId,
+                            it->requestId,
+                            "{\"frame\":" + std::to_string(currentFrame) + "}");
+                        it = pendingFrameWaits.erase(it);
+                    } else if (now >= it->deadline) {
+                        debugServer->sendError(it->clientId, it->requestId, "waitForFrame timed out");
+                        it = pendingFrameWaits.erase(it);
+                    } else {
+                        ++it;
+                    }
+                }
+
+                if (quitDelayPolls >= 0 && --quitDelayPolls <= 0) {
+                    runtime->quit();
+                    break;
                 }
 
                 // Small delay to prevent CPU spin

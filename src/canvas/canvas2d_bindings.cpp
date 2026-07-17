@@ -13,8 +13,13 @@
 namespace mystral {
 namespace canvas {
 
-// Global storage for Canvas2D contexts (prevents them from being destroyed)
-static std::unordered_map<void*, std::unique_ptr<Canvas2DContext>> g_canvas2dContexts;
+struct Canvas2DEntry {
+    std::unique_ptr<Canvas2DContext> context;
+    js::JSValueHandle jsHandle;
+};
+
+// Global storage for Canvas2D contexts and their protected JS wrappers.
+static std::unordered_map<void*, Canvas2DEntry> g_canvas2dContexts;
 
 // Store reference to JS engine for callbacks
 static js::Engine* g_jsEngine = nullptr;
@@ -588,7 +593,7 @@ js::JSValueHandle createCanvas2DContext(js::Engine* engine, int width, int heigh
     auto jsCtx = createCanvas2DJSObject(engine, ctxPtr);
 
     // Store the native context to prevent deletion
-    g_canvas2dContexts[ctxPtr] = std::move(nativeCtx);
+    g_canvas2dContexts[ctxPtr] = {std::move(nativeCtx), jsCtx};
 
     // Protect the JS object from garbage collection
     engine->protect(jsCtx);
@@ -739,6 +744,21 @@ js::JSValueHandle createCanvas2DContext(js::Engine* engine, int width, int heigh
     engine->eval(setupPropertyInterceptors, "canvas2d-setup");
 
     return jsCtx;
+}
+
+void releaseReloadContexts(js::Engine* engine) {
+    if (!engine) return;
+    for (auto& entry : g_canvas2dContexts) {
+        if (entry.second.jsHandle.ptr) {
+            engine->unprotect(entry.second.jsHandle);
+        }
+    }
+    g_canvas2dContexts.clear();
+    g_jsEngine = nullptr;
+}
+
+size_t canvas2DContextCount() {
+    return g_canvas2dContexts.size();
 }
 
 /**

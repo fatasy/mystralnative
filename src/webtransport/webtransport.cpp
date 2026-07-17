@@ -1170,6 +1170,15 @@ bool initBindings(js::Engine* engine) {
     return true;
 }
 
+void resetBindings() {
+    if (g_hasDispatch && g_engine) {
+        g_engine->unprotect(g_dispatch);
+    }
+    g_dispatch = {};
+    g_hasDispatch = false;
+    g_engine = nullptr;
+}
+
 }  // namespace webtransport
 }  // namespace mystral
 
@@ -1207,6 +1216,8 @@ globalThis.WebTransport = class WebTransport {
     engine->eval(stub, "<webtransport-stub>");
     return true;
 }
+
+void resetBindings() {}
 
 }  // namespace webtransport
 }  // namespace mystral

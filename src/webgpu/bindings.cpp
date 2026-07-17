@@ -29,6 +29,7 @@
 #include <thread>
 #include <chrono>
 #include <utility>
+#include <memory>
 
 // stb_image for image loading (implementation in stb_impl.cpp)
 #include "stb_image.h"
@@ -48,6 +49,8 @@
 namespace mystral {
 namespace canvas {
     js::JSValueHandle createCanvas2DContext(js::Engine* engine, int width, int height);
+    void releaseReloadContexts(js::Engine* engine);
+    size_t canvas2DContextCount();
 }
 }
 
@@ -374,9 +377,12 @@ struct TextureInfo {
     uint32_t depthOrArrayLayers;
     uint32_t mipLevelCount;
     WGPUTextureDimension dimension;  // 1D, 2D, or 3D
+    bool ownsReference;
+    bool destroyOnReload;
 };
 static std::unordered_map<uint64_t, TextureInfo> g_textureRegistry;
 static uint64_t g_nextTextureId = 1;
+static uint64_t g_currentTextureId = 0;
 
 // Buffer registry for tracking buffers (needed for mapping operations)
 struct BufferInfo {
@@ -396,6 +402,40 @@ static std::unordered_map<uint64_t, WGPUComputePipeline> g_computePipelineRegist
 static uint64_t g_nextComputePipelineId = 1;
 static std::unordered_map<uint64_t, WGPURenderPipeline> g_renderPipelineRegistry;
 static uint64_t g_nextRenderPipelineId = 1;
+
+static void releaseBuffer(uint64_t id, bool destroy) {
+    auto it = g_bufferRegistry.find(id);
+    if (it == g_bufferRegistry.end()) return;
+    if (destroy) wgpuBufferDestroy(it->second.buffer);
+    wgpuBufferRelease(it->second.buffer);
+    g_bufferRegistry.erase(it);
+}
+
+static void releaseTexture(uint64_t id, bool destroy) {
+    auto it = g_textureRegistry.find(id);
+    if (it == g_textureRegistry.end()) return;
+    if (destroy && it->second.destroyOnReload) {
+        wgpuTextureDestroy(it->second.texture);
+    }
+    if (it->second.ownsReference) {
+        wgpuTextureRelease(it->second.texture);
+    }
+    g_textureRegistry.erase(it);
+}
+
+static void releaseRenderPipeline(uint64_t id) {
+    auto it = g_renderPipelineRegistry.find(id);
+    if (it == g_renderPipelineRegistry.end()) return;
+    wgpuRenderPipelineRelease(it->second);
+    g_renderPipelineRegistry.erase(it);
+}
+
+static void releaseComputePipeline(uint64_t id) {
+    auto it = g_computePipelineRegistry.find(id);
+    if (it == g_computePipelineRegistry.end()) return;
+    wgpuComputePipelineRelease(it->second);
+    g_computePipelineRegistry.erase(it);
+}
 
 // Dawn resource cleanup is handled via Engine::registerRelease(), which sets up
 // V8 weak callbacks. When the JS wrapper object is garbage collected (no more
@@ -740,7 +780,12 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
 
                     // Register in texture registry so createView can find it
                     uint64_t textureId = g_nextTextureId++;
-                    g_textureRegistry[textureId] = {texture, g_surfaceFormat, g_canvasWidth, g_canvasHeight, 1, 1, WGPUTextureDimension_2D};
+                    const bool ownsSurfaceReference = g_surface != nullptr;
+                    g_textureRegistry[textureId] = {
+                        texture, g_surfaceFormat, g_canvasWidth, g_canvasHeight, 1, 1,
+                        WGPUTextureDimension_2D, ownsSurfaceReference, false
+                    };
+                    g_currentTextureId = textureId;
 
                     // Create JS wrapper for texture
                     auto jsTexture = g_engine->newObject();
@@ -1006,7 +1051,12 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
 
                                 // Register in texture registry so createView can find it
                                 uint64_t textureId = g_nextTextureId++;
-                                g_textureRegistry[textureId] = {texture, g_surfaceFormat, g_canvasWidth, g_canvasHeight, 1, 1, WGPUTextureDimension_2D};
+                                const bool ownsSurfaceReference = g_surface != nullptr;
+                                g_textureRegistry[textureId] = {
+                                    texture, g_surfaceFormat, g_canvasWidth, g_canvasHeight, 1, 1,
+                                    WGPUTextureDimension_2D, ownsSurfaceReference, false
+                                };
+                                g_currentTextureId = textureId;
 
                                 // Create JS wrapper for texture
                                 auto jsTexture = g_engine->newObject();
@@ -1328,6 +1378,10 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
                                 }
 
                                 // Null out the textures since they're now invalid after present
+                                if (g_currentTextureId != 0) {
+                                    releaseTexture(g_currentTextureId, false);
+                                    g_currentTextureId = 0;
+                                }
                                 g_currentTexture = nullptr;
                                 g_currentViewSourceTexture = nullptr;
                             }
@@ -1997,15 +2051,16 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
                             // Capture bufferId in closure to identify the correct buffer
                             g_engine->setProperty(jsBuffer, "destroy",
                                 g_engine->newFunction("destroy", [bufferId](void* ctx, const std::vector<js::JSValueHandle>& args) {
-                                    auto it = g_bufferRegistry.find(bufferId);
-                                    if (it != g_bufferRegistry.end()) {
-                                        wgpuBufferDestroy(it->second.buffer);
-                                        wgpuBufferRelease(it->second.buffer);
-                                        g_bufferRegistry.erase(it);
-                                    }
+                                    releaseBuffer(bufferId, true);
                                     return g_engine->newUndefined();
                                 })
                             );
+
+                            if (gcReleaseEnabled()) {
+                                g_engine->registerRelease(jsBuffer, [bufferId]() {
+                                    releaseBuffer(bufferId, false);
+                                });
+                            }
 
                             return jsBuffer;
                         })
@@ -2037,6 +2092,11 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
 
                             auto jsShader = g_engine->newObject();
                             g_engine->setPrivateData(jsShader, shaderModule);
+                            if (gcReleaseEnabled()) {
+                                g_engine->registerRelease(jsShader, [shaderModule]() {
+                                    wgpuShaderModuleRelease(shaderModule);
+                                });
+                            }
 
                             return jsShader;
                         })
@@ -2488,10 +2548,21 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
                                     auto jsLayout = g_engine->newObject();
                                     g_engine->setPrivateData(jsLayout, layout);
                                     g_engine->setProperty(jsLayout, "_type", g_engine->newString("bindGroupLayout"));
+                                    if (gcReleaseEnabled()) {
+                                        g_engine->registerRelease(jsLayout, [layout]() {
+                                            wgpuBindGroupLayoutRelease(layout);
+                                        });
+                                    }
 
                                     return jsLayout;
                                 })
                             );
+
+                            if (gcReleaseEnabled()) {
+                                g_engine->registerRelease(jsPipeline, [pipelineId]() {
+                                    releaseRenderPipeline(pipelineId);
+                                });
+                            }
 
                             if (g_verboseLogging) std::cout << "[WebGPU] Render pipeline created (id=" << pipelineId << ")" << std::endl;
                             return jsPipeline;
@@ -2581,10 +2652,21 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
                                     auto jsLayout = g_engine->newObject();
                                     g_engine->setPrivateData(jsLayout, layout);
                                     g_engine->setProperty(jsLayout, "_type", g_engine->newString("bindGroupLayout"));
+                                    if (gcReleaseEnabled()) {
+                                        g_engine->registerRelease(jsLayout, [layout]() {
+                                            wgpuBindGroupLayoutRelease(layout);
+                                        });
+                                    }
 
                                     return jsLayout;
                                 })
                             );
+
+                            if (gcReleaseEnabled()) {
+                                g_engine->registerRelease(jsPipeline, [pipelineId]() {
+                                    releaseComputePipeline(pipelineId);
+                                });
+                            }
 
                             if (g_verboseLogging) std::cout << "[WebGPU] Compute pipeline created (id=" << pipelineId << ")" << std::endl;
                             return jsPipeline;
@@ -3579,7 +3661,10 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
 
                             // Register texture for lookup by createView
                             uint64_t textureId = g_nextTextureId++;
-                            g_textureRegistry[textureId] = {texture, format, width, height, depthOrArrayLayers, mipLevelCount, dimension};
+                            g_textureRegistry[textureId] = {
+                                texture, format, width, height, depthOrArrayLayers, mipLevelCount,
+                                dimension, true, true
+                            };
 
                             // Store texture ID for lookup
                             g_engine->setProperty(jsTexture, "_textureId", g_engine->newNumber((double)textureId));
@@ -3727,12 +3812,16 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
 
                             // texture.destroy()
                             g_engine->setProperty(jsTexture, "destroy",
-                                g_engine->newFunction("destroy", [](void* ctx, const std::vector<js::JSValueHandle>& args) {
-                                    // TODO: Get texture from context and destroy
-                                    // Would need to look up by ID and call wgpuTextureDestroy
+                                g_engine->newFunction("destroy", [textureId](void* ctx, const std::vector<js::JSValueHandle>& args) {
+                                    releaseTexture(textureId, true);
                                     return g_engine->newUndefined();
                                 })
                             );
+                            if (gcReleaseEnabled()) {
+                                g_engine->registerRelease(jsTexture, [textureId]() {
+                                    releaseTexture(textureId, false);
+                                });
+                            }
 
                             if (g_verboseLogging) std::cout << "[WebGPU] Created texture " << width << "x" << height << " format=" << formatStr << " (id=" << textureId << ")" << std::endl;
                             return jsTexture;
@@ -3814,6 +3903,11 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
                             auto jsSampler = g_engine->newObject();
                             g_engine->setPrivateData(jsSampler, sampler);
                             g_engine->setProperty(jsSampler, "_type", g_engine->newString("sampler"));
+                            if (gcReleaseEnabled()) {
+                                g_engine->registerRelease(jsSampler, [sampler]() {
+                                    wgpuSamplerRelease(sampler);
+                                });
+                            }
 
                             if (g_verboseLogging) std::cout << "[WebGPU] Created sampler" << std::endl;
                             return jsSampler;
@@ -3945,6 +4039,11 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
 
                             auto jsLayout = g_engine->newObject();
                             g_engine->setPrivateData(jsLayout, layout);
+                            if (gcReleaseEnabled()) {
+                                g_engine->registerRelease(jsLayout, [layout]() {
+                                    wgpuBindGroupLayoutRelease(layout);
+                                });
+                            }
 
                             if (g_verboseLogging) std::cout << "[WebGPU] Created bind group layout with " << entryCount << " entries" << std::endl;
                             return jsLayout;
@@ -4096,6 +4195,11 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
 
                             auto jsLayout = g_engine->newObject();
                             g_engine->setPrivateData(jsLayout, pipelineLayout);
+                            if (gcReleaseEnabled()) {
+                                g_engine->registerRelease(jsLayout, [pipelineLayout]() {
+                                    wgpuPipelineLayoutRelease(pipelineLayout);
+                                });
+                            }
 
                             if (g_verboseLogging) std::cout << "[WebGPU] Created pipeline layout with " << layoutCount << " bind group layouts" << std::endl;
                             return jsLayout;
@@ -4278,6 +4382,14 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
 
                             // Capture for closures
                             WGPURenderBundleEncoder capturedEncoder = bundleEncoder;
+                            auto bundleEncoderAlive = std::make_shared<bool>(true);
+                            if (gcReleaseEnabled()) {
+                                g_engine->registerRelease(jsEncoder, [capturedEncoder, bundleEncoderAlive]() {
+                                    if (!*bundleEncoderAlive) return;
+                                    *bundleEncoderAlive = false;
+                                    wgpuRenderBundleEncoderRelease(capturedEncoder);
+                                });
+                            }
 
                             // renderBundleEncoder.setPipeline(pipeline)
                             g_engine->setProperty(jsEncoder, "setPipeline",
@@ -4368,13 +4480,24 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
 
                             // renderBundleEncoder.finish(descriptor?)
                             g_engine->setProperty(jsEncoder, "finish",
-                                g_engine->newFunction("finish", [capturedEncoder](void* ctx, const std::vector<js::JSValueHandle>& args) {
+                                g_engine->newFunction("finish", [capturedEncoder, bundleEncoderAlive](void* ctx, const std::vector<js::JSValueHandle>& args) {
+                                    if (!*bundleEncoderAlive) {
+                                        g_engine->throwException("Render bundle encoder is already finished");
+                                        return g_engine->newUndefined();
+                                    }
                                     WGPURenderBundleDescriptor desc = {};
                                     WGPURenderBundle bundle = wgpuRenderBundleEncoderFinish(capturedEncoder, &desc);
+                                    *bundleEncoderAlive = false;
+                                    wgpuRenderBundleEncoderRelease(capturedEncoder);
 
                                     auto jsBundle = g_engine->newObject();
                                     g_engine->setPrivateData(jsBundle, bundle);
                                     g_engine->setProperty(jsBundle, "_type", g_engine->newString("renderBundle"));
+                                    if (bundle && gcReleaseEnabled()) {
+                                        g_engine->registerRelease(jsBundle, [bundle]() {
+                                            wgpuRenderBundleRelease(bundle);
+                                        });
+                                    }
 
                                     if (g_verboseLogging) std::cout << "[WebGPU] Render bundle finished" << std::endl;
                                     return jsBundle;
@@ -5044,6 +5167,12 @@ globalThis.OffscreenCanvas = OffscreenCanvas;
             set("activeCommandEncoders", g_liveCommandEncoders.size());
             set("activeRenderPasses", g_liveRenderPasses.size());
             set("activeComputePasses", g_liveComputePasses.size());
+            set("activeBuffers", g_bufferRegistry.size());
+            set("activeTextures", g_textureRegistry.size());
+            set("activeRenderPipelines", g_renderPipelineRegistry.size());
+            set("activeComputePipelines", g_computePipelineRegistry.size());
+            set("activeOffscreenCanvases", g_offscreenCanvases.size());
+            set("activeCanvas2DContexts", canvas::canvas2DContextCount());
             return result;
         })
     );
@@ -5122,6 +5251,59 @@ void beginDawnFrame() {
     // No-op: Dawn resource cleanup is handled by V8 weak callbacks
     // via Engine::registerRelease() — resources are released when
     // their JS wrapper objects are garbage collected.
+}
+
+void releaseReloadResources() {
+    // A full bundle reload has no live application session. Release the
+    // registry-owned resources now instead of waiting for library-level JS
+    // caches to become collectible. Weak callbacks use the same registries,
+    // so their later cleanup attempts remain idempotent.
+    for (auto& entry : g_bufferRegistry) {
+        wgpuBufferDestroy(entry.second.buffer);
+        wgpuBufferRelease(entry.second.buffer);
+    }
+    g_bufferRegistry.clear();
+
+    for (auto& entry : g_textureRegistry) {
+        auto& info = entry.second;
+        if (info.destroyOnReload) {
+            wgpuTextureDestroy(info.texture);
+        }
+        if (info.ownsReference) {
+            wgpuTextureRelease(info.texture);
+        }
+    }
+    g_textureRegistry.clear();
+
+    for (auto& entry : g_renderPipelineRegistry) {
+        wgpuRenderPipelineRelease(entry.second);
+    }
+    g_renderPipelineRegistry.clear();
+
+    for (auto& entry : g_computePipelineRegistry) {
+        wgpuComputePipelineRelease(entry.second);
+    }
+    g_computePipelineRegistry.clear();
+
+    for (const auto& entry : g_offscreenCanvases) {
+        const std::string globalName = "__offscreenCanvas_" + std::to_string(entry.first);
+        g_engine->setGlobalProperty(globalName.c_str(), g_engine->newUndefined());
+    }
+    g_offscreenCanvases.clear();
+    canvas::releaseReloadContexts(g_engine);
+    g_mainCanvas2DContext = nullptr;
+
+    g_currentTexture = nullptr;
+    g_currentViewSourceTexture = nullptr;
+    g_currentTextureId = 0;
+}
+
+void resetSessionBindings() {
+    // These handles belong to the JavaScript engine being replaced. The
+    // engine destructor owns their protected persistents; only clear the
+    // native cache here so the next engine creates methods in its context.
+    g_transientMethods = {};
+    g_engine = nullptr;
 }
 
 // Canvas 2D compositing resources

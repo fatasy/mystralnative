@@ -77,6 +77,43 @@ mystral run game.js --headless --video demo.mp4 --end-frame 600
 mystral run game.js --debug
 ```
 
+### Agent and Test Automation
+
+Start a live game with the local WebSocket debug protocol enabled:
+
+```bash
+mystral run game.js --headless --debug-port 9222
+```
+
+The repository includes a Bun client so an agent or test can control the running
+process without a browser:
+
+```bash
+bun tools/mystral-debug-client.ts hello --port 9222
+bun tools/mystral-debug-client.ts evaluate "globalThis.score" --port 9222
+bun tools/mystral-debug-client.ts pause --port 9222
+bun tools/mystral-debug-client.ts step 3 --port 9222
+bun tools/mystral-debug-client.ts screenshot output.png --port 9222
+bun tools/mystral-debug-client.ts logs --port 9222
+bun tools/mystral-debug-client.ts quit --port 9222
+```
+
+| Protocol method | Purpose |
+|-----------------|---------|
+| `hello` / `getCapabilities` | Negotiate the protocol version and supported methods |
+| `screenshot` | Capture the current WebGPU frame as PNG data |
+| `evaluate` | Evaluate JavaScript and return a JSON-safe result, error, and stack |
+| `getLogs` | Read buffered startup and runtime console entries |
+| `pause` / `resume` | Pause or resume game-frame execution while debug I/O remains available |
+| `stepFrames` | Execute a bounded number of frames and remain paused |
+| `waitForFrame` | Wait asynchronously for an absolute or relative frame with a timeout |
+| `keyboard.*`, `mouse.*`, `gamepad.*` | Inject native input through SDL |
+| `quit` | Stop the controlled runtime cleanly |
+
+The server only listens on `127.0.0.1`. Protocol messages are JSON objects sent
+over WebSocket and use numeric request IDs, allowing multiple clients to reuse
+the same request IDs safely.
+
 ## mystral compile
 
 Bundle a game into a single distributable executable.

@@ -146,12 +146,43 @@ static void installCrashHandlers() {
     signal(SIGILL, crashSignalHandler);
 }
 
+static std::string quoteJavaScriptString(const std::string& value) {
+    static const char hex[] = "0123456789abcdef";
+    std::string result;
+    result.reserve(value.size() + 2);
+    result.push_back('"');
+    for (unsigned char c : value) {
+        switch (c) {
+            case '"': result += "\\\""; break;
+            case '\\': result += "\\\\"; break;
+            case '\b': result += "\\b"; break;
+            case '\f': result += "\\f"; break;
+            case '\n': result += "\\n"; break;
+            case '\r': result += "\\r"; break;
+            case '\t': result += "\\t"; break;
+            default:
+                if (c < 0x20) {
+                    result += "\\u00";
+                    result.push_back(hex[(c >> 4) & 0x0f]);
+                    result.push_back(hex[c & 0x0f]);
+                } else {
+                    result.push_back(static_cast<char>(c));
+                }
+                break;
+        }
+    }
+    result.push_back('"');
+    return result;
+}
+
 // Forward declaration for WebGPU bindings
 namespace webgpu {
     bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, void* wgpuDevice, void* wgpuQueue, void* wgpuSurface, uint32_t surfaceFormat, uint32_t width, uint32_t height, bool debug = false);
     void setOffscreenTexture(void* texture, void* textureView);
     void beginDawnFrame();
     void endDawnFrame();
+    void releaseReloadResources();
+    void resetSessionBindings();
 }
 
 /**
@@ -380,7 +411,7 @@ public:
     }
 
     // Helper method to initialize JS engine and bindings (shared by SDL and no-SDL paths)
-    bool initializeJSAndBindings() {
+    bool initializeJSAndBindings(bool initializeServices = true) {
         // Initialize JavaScript engine
         LOGI("Creating JavaScript engine...");
         jsEngine_ = js::createEngine();
@@ -457,20 +488,22 @@ public:
         // (Metal/WebGPU use signals during setup that we shouldn't intercept)
         installCrashHandlers();
 
-        // Initialize libuv event loop for async I/O (HTTP, file, timers)
-        async::EventLoop::instance().init();
+        if (initializeServices) {
+            // Initialize libuv event loop for async I/O (HTTP, file, timers)
+            async::EventLoop::instance().init();
 
-        // Initialize async HTTP client (uses libuv for non-blocking requests)
-        http::getAsyncHttpClient().init();
+            // Initialize async HTTP client (uses libuv for non-blocking I/O)
+            http::getAsyncHttpClient().init();
 
-        // Initialize async file reader (uses libuv thread pool for non-blocking file I/O)
-        fs::getAsyncFileReader().init();
+            // Initialize async file reader (uses libuv thread pool)
+            fs::getAsyncFileReader().init();
 
-        // Initialize file watcher (uses libuv fs_event for hot reload)
-        fs::getFileWatcher().init();
+            // Initialize file watcher (uses libuv fs_event for hot reload)
+            fs::getFileWatcher().init();
 
-        // Initialize WebTransport subsystem (QUIC sockets are created lazily)
-        webtransport::init();
+            // Initialize WebTransport subsystem (sockets are created lazily)
+            webtransport::init();
+        }
 
         std::cout << "[Mystral] Runtime initialized" << std::endl;
         return true;
@@ -596,6 +629,7 @@ public:
                     std::cout << "[HotReload] File changed: " << changedPath << std::endl;
                     reloadRequested_ = true;
                     reloadDeadline_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(300);
+                    reloadCandidateObserved_ = false;
                 }
             });
             if (watchId_ >= 0) {
@@ -618,6 +652,54 @@ public:
         return jsEngine_->evalScript(code.c_str(), filename.c_str());
     }
 
+    EvaluationResult evaluateExpression(const std::string& expression) override {
+        if (!jsEngine_) {
+            return {false, "", "JavaScript engine is not available"};
+        }
+
+        if (jsEngine_->hasException()) {
+            jsEngine_->getException();
+        }
+
+        const std::string source =
+            "(() => { try {"
+            "const value = (0, eval)(" + quoteJavaScriptString(expression) + ");"
+            "const seen = new WeakSet();"
+            "return JSON.stringify({ok:true,type:typeof value,value:value,description:String(value)},"
+            "(_key,item) => {"
+            "if (typeof item === 'bigint' || typeof item === 'symbol') return String(item);"
+            "if (typeof item === 'function') return '[Function ' + (item.name || 'anonymous') + ']';"
+            "if (typeof item === 'number' && !Number.isFinite(item)) return String(item);"
+            "if (item && typeof item === 'object') { if (seen.has(item)) return '[Circular]'; seen.add(item); }"
+            "return item;"
+            "});"
+            "} catch (error) {"
+            "return JSON.stringify({ok:false,error:{message:String(error && error.message || error),"
+            "stack:String(error && error.stack || '')}});"
+            "} })()";
+
+        js::JSValueHandle value = jsEngine_->evalScriptWithResult(source.c_str(), "<debug-evaluate>");
+        if (!value.ptr || jsEngine_->hasException()) {
+            std::string error = jsEngine_->hasException()
+                ? jsEngine_->getException()
+                : "Expression evaluation failed";
+            return {false, "", error};
+        }
+
+        std::string valueJson = jsEngine_->toString(value);
+        jsEngine_->releaseValue(value);
+        if (valueJson.empty()) {
+            return {false, "", "Expression result could not be serialized"};
+        }
+        return {true, std::move(valueJson), ""};
+    }
+
+    void setConsoleCallback(ConsoleCallback callback) override {
+        if (jsEngine_) {
+            jsEngine_->setConsoleCallback(std::move(callback));
+        }
+    }
+
     bool reloadScript() override {
         if (scriptPath_.empty()) {
             std::cerr << "[HotReload] No script loaded to reload" << std::endl;
@@ -625,6 +707,7 @@ public:
         }
 
         std::cout << "[HotReload] Reloading script: " << scriptPath_ << std::endl;
+        logHotReloadStats("before dispose");
 
         // Give the application one synchronous chance to release its scene,
         // renderer and JS-owned GPU wrappers before native callbacks vanish.
@@ -653,8 +736,20 @@ public:
             moduleSystem_->clearCaches();
         }
 
+        webgpu::releaseReloadResources();
+
+        // Native binding calls made by the dispose hook leave temporary V8
+        // handles in the current frame set. Drop those roots before forcing
+        // GC, otherwise the old Three texture/material graph survives until
+        // after the new bundle has already allocated its replacement.
+        jsEngine_->clearFrameHandles();
         jsEngine_->gc();
         jsEngine_->gc();
+        logHotReloadStats("after GC");
+
+        if (!recreateJavaScriptEngine()) {
+            return false;
+        }
 
         // Reload the script
         bool success = moduleSystem_->loadEntry(scriptPath_);
@@ -669,6 +764,53 @@ public:
     }
 
 private:
+    void logHotReloadStats(const char* phase) {
+        const auto memory = jsEngine_->getMemoryStats();
+        std::cout << "[HotReload] " << phase
+                  << ": heap=" << (memory.heapUsedBytes / (1024 * 1024)) << " MB"
+                  << ", nativeFunctions=" << memory.nativeFunctions;
+        auto statsFunction = jsEngine_->getGlobalProperty("__mystralWebGpuStats");
+        if (jsEngine_->isFunction(statsFunction)) {
+            auto stats = jsEngine_->call(statsFunction, jsEngine_->newUndefined(), {});
+            if (stats.ptr) {
+                const auto number = [this, stats](const char* name) -> uint64_t {
+                    return static_cast<uint64_t>(jsEngine_->toNumber(jsEngine_->getProperty(stats, name)));
+                };
+                std::cout << ", buffers=" << number("activeBuffers")
+                          << ", textures=" << number("activeTextures")
+                          << ", renderPipelines=" << number("activeRenderPipelines")
+                          << ", computePipelines=" << number("activeComputePipelines")
+                          << ", offscreenCanvases=" << number("activeOffscreenCanvases")
+                          << ", canvas2DContexts=" << number("activeCanvas2DContexts")
+                          << ", encoders=" << number("activeCommandEncoders")
+                          << ", passes=" << (number("activeRenderPasses") + number("activeComputePasses"));
+            }
+        }
+        std::cout << std::endl;
+    }
+
+    bool reloadFileIsStable(std::chrono::steady_clock::time_point now) {
+        std::error_code error;
+        const auto size = std::filesystem::file_size(scriptPath_, error);
+        if (error || size == 0) {
+            reloadCandidateObserved_ = false;
+            return false;
+        }
+        const auto writeTime = std::filesystem::last_write_time(scriptPath_, error);
+        if (error) {
+            reloadCandidateObserved_ = false;
+            return false;
+        }
+        if (!reloadCandidateObserved_ || size != reloadCandidateSize_ || writeTime != reloadCandidateWriteTime_) {
+            reloadCandidateObserved_ = true;
+            reloadCandidateSize_ = size;
+            reloadCandidateWriteTime_ = writeTime;
+            reloadCandidateSince_ = now;
+            return false;
+        }
+        return now - reloadCandidateSince_ >= std::chrono::milliseconds(300);
+    }
+
     void clearAllTimers() {
 #ifdef MYSTRAL_USE_LIBUV_TIMERS
         // Stop and clean up all libuv timers
@@ -705,6 +847,42 @@ private:
 #endif
         // IDs remain monotonic: libuv close callbacks erase old timers on a
         // later loop turn, so reusing IDs here could erase a new timer.
+    }
+
+    bool recreateJavaScriptEngine() {
+        // Bindings with native-side JS handles must detach before the engine
+        // destroys its context. The Dawn context/device and SDL window remain.
+        audio::cleanupAudioBindings();
+#ifdef MYSTRAL_HAS_RAYTRACING
+        rt::cleanupRTBindings();
+#endif
+        webtransport::resetBindings();
+
+        if (moduleSystem_) {
+            moduleSystem_->clearCaches();
+            js::setModuleSystem(nullptr);
+            moduleSystem_.reset();
+        }
+
+        while (!pendingFileCallbacks_.empty()) pendingFileCallbacks_.pop();
+#ifdef MYSTRAL_HAS_DRACO
+        {
+            std::lock_guard<std::mutex> lock(dracoMutex_);
+            while (!pendingDracoCallbacks_.empty()) pendingDracoCallbacks_.pop();
+        }
+#endif
+
+        canvasElement_ = {};
+        webgpu::resetSessionBindings();
+        ++jsGeneration_;
+        jsEngine_.reset();
+
+        if (!initializeJSAndBindings(false)) {
+            std::cerr << "[HotReload] Failed to recreate JavaScript engine" << std::endl;
+            return false;
+        }
+        logHotReloadStats("new engine");
+        return true;
     }
 
 public:
@@ -798,6 +976,10 @@ public:
         // This handles async HTTP requests, file I/O, and libuv-based timers
         async::EventLoop::instance().runOnce();
 
+        if (paused_ && stepFramesRemaining_ == 0) {
+            return running_;
+        }
+
         // Process completed async HTTP requests (invoke their JS callbacks)
         // This must be called after runOnce() to invoke callbacks safely on the main thread
         http::getAsyncHttpClient().processCompletedRequests();
@@ -814,8 +996,10 @@ public:
         fs::getFileWatcher().processPendingEvents();
 
         // Check if hot reload was requested
-        if (reloadRequested_ && std::chrono::steady_clock::now() >= reloadDeadline_) {
+        const auto reloadNow = std::chrono::steady_clock::now();
+        if (reloadRequested_ && reloadNow >= reloadDeadline_ && reloadFileIsStable(reloadNow)) {
             reloadRequested_ = false;
+            reloadCandidateObserved_ = false;
             reloadScript();
         }
 
@@ -844,10 +1028,35 @@ public:
         jsEngine_->clearFrameHandles();
         webgpu::endDawnFrame();
 
+        frameCount_++;
+        if (paused_ && stepFramesRemaining_ > 0) {
+            stepFramesRemaining_--;
+        }
+
         // TODO: Translate to Web events via InputShim
         // TODO: Dispatch to JS
 
         return running_;
+    }
+
+    void setPaused(bool paused) override {
+        paused_ = paused;
+        if (!paused_) {
+            stepFramesRemaining_ = 0;
+        }
+    }
+
+    bool isPaused() const override {
+        return paused_;
+    }
+
+    void stepFrames(uint32_t count) override {
+        paused_ = true;
+        stepFramesRemaining_ = count;
+    }
+
+    uint64_t getFrameCount() const override {
+        return frameCount_;
     }
 
     void quit() override {
@@ -1609,8 +1818,7 @@ private:
                 auto callback = args[1];
                 jsEngine_->protect(callback);
 
-                // Capture jsEngine pointer for the callback
-                auto* engine = jsEngine_.get();
+                const uint64_t generation = jsGeneration_;
 
                 // Check embedded bundle first (synchronously - it's fast)
                 std::vector<uint8_t> embeddedData;
@@ -1628,7 +1836,8 @@ private:
 
                 // Use the async file reader with libuv thread pool
                 // The callback will be queued and invoked during processCompletedReads()
-                fs::getAsyncFileReader().readFile(path, [this, callback](std::vector<uint8_t> data, std::string error) {
+                fs::getAsyncFileReader().readFile(path, [this, callback, generation](std::vector<uint8_t> data, std::string error) {
+                    if (generation != jsGeneration_) return;
                     // This callback runs on the main thread during processCompletedReads()
                     // Queue the callback with data for processing in the main loop
                     pendingFileCallbacks_.push({
@@ -1757,12 +1966,14 @@ private:
                 auto callback = args[2];
                 jsEngine_->protect(callback);
 
-                // Capture jsEngine pointer for the callback
-                auto* engine = jsEngine_.get();
+                const uint64_t generation = jsGeneration_;
 
                 // Start async request
                 http::getAsyncHttpClient().request(method, url, body,
-                    [engine, callback](http::HttpResponse response) {
+                    [this, callback, generation](http::HttpResponse response) {
+                        if (generation != jsGeneration_) return;
+                        auto* engine = jsEngine_.get();
+                        if (!engine) return;
                         // This runs on the main thread when the response arrives
                         // Create result object
                         auto result = engine->newObject();
@@ -3103,6 +3314,7 @@ globalThis.loadGLTF = loadGLTF;
                 decCtx->uvAttrId = uvAttrId;
                 decCtx->callback = callback;
                 decCtx->runtime = this;
+                decCtx->generation = jsGeneration_;
 
                 // Queue decoding on libuv thread pool
                 uv_queue_work(
@@ -3186,6 +3398,10 @@ globalThis.loadGLTF = loadGLTF;
                     // After-work callback — runs on main thread (libuv loop iteration)
                     [](uv_work_t* req, int status) {
                         auto* dc = static_cast<DracoDecodeContext*>(req->data);
+                        if (dc->generation != dc->runtime->jsGeneration_) {
+                            delete dc;
+                            return;
+                        }
                         // Queue the result for processing on the JS main thread
                         std::lock_guard<std::mutex> lock(dc->runtime->dracoMutex_);
                         dc->runtime->pendingDracoCallbacks_.push(std::unique_ptr<DracoDecodeContext>(dc));
@@ -3237,6 +3453,7 @@ globalThis.__mystralNativeDecodeDracoAsync = function(buffer, attrs) {
         while (!toProcess.empty()) {
             auto dc = std::move(toProcess.front());
             toProcess.pop();
+            if (dc->generation != jsGeneration_) continue;
 
             if (!dc->error.empty()) {
                 // Error — call callback(null, errorString)
@@ -3432,6 +3649,9 @@ globalThis.__mystralNativeDecodeDracoAsync = function(buffer, attrs) {
     RuntimeConfig config_;
     bool running_;
     int exitCode_ = 0;  // Exit code set by process.exit()
+    bool paused_ = false;
+    uint32_t stepFramesRemaining_ = 0;
+    uint64_t frameCount_ = 0;
     int width_;
     int height_;
 
@@ -3449,6 +3669,8 @@ globalThis.__mystralNativeDecodeDracoAsync = function(buffer, attrs) {
     int nextRafId_ = 1;
 
     // setTimeout/setInterval state
+    uint64_t jsGeneration_ = 1;
+
 #ifdef MYSTRAL_USE_LIBUV_TIMERS
     // libuv-based timer context
     struct UvTimerContext {
@@ -3512,6 +3734,7 @@ globalThis.__mystralNativeDecodeDracoAsync = function(buffer, attrs) {
         // JS callback + back-reference
         js::JSValueHandle callback;
         RuntimeImpl* runtime = nullptr;
+        uint64_t generation = 0;
     };
     std::queue<std::unique_ptr<DracoDecodeContext>> pendingDracoCallbacks_;
     std::mutex dracoMutex_;
@@ -3535,6 +3758,10 @@ globalThis.__mystralNativeDecodeDracoAsync = function(buffer, attrs) {
     int watchId_ = -1;        // File watcher ID (-1 if not watching)
     bool reloadRequested_ = false;  // Set when a file change is detected
     std::chrono::steady_clock::time_point reloadDeadline_{};
+    bool reloadCandidateObserved_ = false;
+    uintmax_t reloadCandidateSize_ = 0;
+    std::filesystem::file_time_type reloadCandidateWriteTime_{};
+    std::chrono::steady_clock::time_point reloadCandidateSince_{};
 
     void clearDOMEventListeners() {
         if (!jsEngine_) {

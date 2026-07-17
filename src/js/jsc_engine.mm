@@ -9,6 +9,7 @@
 #include <iostream>
 #include <unordered_map>
 #include <chrono>
+#include <sstream>
 
 #if defined(MYSTRAL_JS_JSC) && defined(__APPLE__)
 
@@ -500,6 +501,14 @@ public:
         JSValueUnprotect(context_, (JSValueRef)value.ptr);
     }
 
+    void releaseValue(JSValueHandle value) override {
+        (void)value;
+    }
+
+    void setConsoleCallback(ConsoleCallback callback) override {
+        consoleCallback_ = std::move(callback);
+    }
+
     void gc() override {
         JSGarbageCollect(context_);
     }
@@ -574,21 +583,24 @@ private:
         setGlobalProperty("console", {(void*)console, context_});
 
         auto consoleFn = [this](const char* prefix) {
-            return newFunction(prefix, [prefix](void* ctx, const std::vector<JSValueHandle>& args) {
+            return newFunction(prefix, [this, prefix](void* ctx, const std::vector<JSValueHandle>& args) {
                 JSGlobalContextRef context = (JSGlobalContextRef)ctx;
-                std::cout << "[" << prefix << "] ";
+                std::ostringstream message;
                 for (size_t i = 0; i < args.size(); i++) {
                     JSStringRef str = JSValueToStringCopy(context, (JSValueRef)args[i].ptr, nullptr);
                     if (str) {
                         size_t maxSize = JSStringGetMaximumUTF8CStringSize(str);
                         std::string result(maxSize, '\0');
                         JSStringGetUTF8CString(str, &result[0], maxSize);
-                        std::cout << result.c_str();
-                        if (i < args.size() - 1) std::cout << " ";
+                        message << result.c_str();
+                        if (i < args.size() - 1) message << " ";
                         JSStringRelease(str);
                     }
                 }
-                std::cout << std::endl;
+                std::cout << "[" << prefix << "] " << message.str() << std::endl;
+                if (consoleCallback_) {
+                    consoleCallback_(prefix, message.str());
+                }
                 return JSValueHandle{(void*)JSValueMakeUndefined(context), ctx};
             });
         };
@@ -675,6 +687,7 @@ private:
     JSContextGroupRef contextGroup_ = nullptr;
     JSGlobalContextRef context_ = nullptr;
     JSValueRef lastException_ = nullptr;
+    ConsoleCallback consoleCallback_;
     std::unordered_map<JSObjectRef, void*> privateDataMap_;
     std::chrono::high_resolution_clock::time_point startTime_;
 };

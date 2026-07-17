@@ -614,6 +614,18 @@ public:
         delete val;
     }
 
+    void releaseValue(JSValueHandle value) override {
+        if (!value.ptr) return;
+        JSValue* val = (JSValue*)value.ptr;
+        JS_FreeValue(context_, *val);
+        g_protectedHandles.erase(value.ptr);
+        delete val;
+    }
+
+    void setConsoleCallback(ConsoleCallback callback) override {
+        consoleCallback_ = std::move(callback);
+    }
+
     void gc() override {
         JS_RunGC(runtime_);
     }
@@ -693,9 +705,9 @@ private:
         JS_SetPropertyStr(context_, console, "error",
             JS_NewCFunction(context_, js_console_error, "error", 1));
         JS_SetPropertyStr(context_, console, "info",
-            JS_NewCFunction(context_, js_console_log, "info", 1));
+            JS_NewCFunction(context_, js_console_info, "info", 1));
         JS_SetPropertyStr(context_, console, "debug",
-            JS_NewCFunction(context_, js_console_log, "debug", 1));
+            JS_NewCFunction(context_, js_console_debug, "debug", 1));
         JS_SetPropertyStr(context_, global, "console", console);
 
         // performance.now()
@@ -826,6 +838,9 @@ private:
     static JSValue js_console_log(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
         std::string msg = buildConsoleMessage(ctx, argc, argv);
         std::cout << "[log] " << msg << std::endl;
+        if (engineInstance_ && engineInstance_->consoleCallback_) {
+            engineInstance_->consoleCallback_("log", msg);
+        }
 #ifdef __ANDROID__
         LOGI("[log] %s", msg.c_str());
 #endif
@@ -835,15 +850,39 @@ private:
     static JSValue js_console_warn(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
         std::string msg = buildConsoleMessage(ctx, argc, argv);
         std::cout << "[warn] " << msg << std::endl;
+        if (engineInstance_ && engineInstance_->consoleCallback_) {
+            engineInstance_->consoleCallback_("warn", msg);
+        }
 #ifdef __ANDROID__
         LOGW("[warn] %s", msg.c_str());
 #endif
         return JS_UNDEFINED;
     }
 
+    static JSValue js_console_info(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+        std::string msg = buildConsoleMessage(ctx, argc, argv);
+        std::cout << "[info] " << msg << std::endl;
+        if (engineInstance_ && engineInstance_->consoleCallback_) {
+            engineInstance_->consoleCallback_("info", msg);
+        }
+        return JS_UNDEFINED;
+    }
+
+    static JSValue js_console_debug(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+        std::string msg = buildConsoleMessage(ctx, argc, argv);
+        std::cout << "[debug] " << msg << std::endl;
+        if (engineInstance_ && engineInstance_->consoleCallback_) {
+            engineInstance_->consoleCallback_("debug", msg);
+        }
+        return JS_UNDEFINED;
+    }
+
     static JSValue js_console_error(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
         std::string msg = buildConsoleMessage(ctx, argc, argv);
         std::cerr << "[error] " << msg << std::endl;
+        if (engineInstance_ && engineInstance_->consoleCallback_) {
+            engineInstance_->consoleCallback_("error", msg);
+        }
 #ifdef __ANDROID__
         LOGE("[error] %s", msg.c_str());
 #endif
@@ -870,6 +909,7 @@ private:
     JSRuntime* runtime_ = nullptr;
     JSContext* context_ = nullptr;
     JSValue lastException_ = JS_UNDEFINED;
+    ConsoleCallback consoleCallback_;
     std::chrono::high_resolution_clock::time_point startTime_;
     std::unordered_map<void*, void*> privateDataMap_;  // Map JS object ptr to native data
     std::vector<NativeFunction*> allocatedFunctions_;  // Track allocated function pointers
