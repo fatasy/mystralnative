@@ -11,6 +11,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <chrono>
+#include <atomic>
 #include <cstring>
 #include <sstream>
 
@@ -34,11 +35,21 @@
 namespace mystral {
 namespace js {
 
-// Store native function callbacks
-static std::unordered_map<JSValue*, NativeFunction> g_nativeFunctions;
-
 // Global set of protected handles that should not be deleted by nativeCallback cleanup
-static std::unordered_set<void*> g_protectedHandles;
+thread_local std::unordered_set<void*> g_protectedHandles;
+
+struct QuickJSTransferredBacking {
+    std::shared_ptr<void> owner;
+    bool detaching = false;
+    bool finalized = false;
+};
+
+static void freeQuickJSTransferredBacking(JSRuntime*, void* opaque, void*) {
+    auto* backing = static_cast<QuickJSTransferredBacking*>(opaque);
+    if (!backing) return;
+    backing->owner.reset();
+    if (!backing->detaching) backing->finalized = true;
+}
 
 static char* quickjsModuleNormalize(JSContext* ctx,
                                     const char* module_base_name,
@@ -106,6 +117,8 @@ public:
             return;
         }
 
+        JS_SetInterruptHandler(runtime_, &QuickJSEngine::interruptHandler, this);
+
         context_ = JS_NewContext(runtime_);
         if (!context_) {
             std::cerr << "[QuickJS] Failed to create context" << std::endl;
@@ -134,18 +147,27 @@ public:
             for (void* ptr : g_protectedHandles) {
                 JSValue* val = (JSValue*)ptr;
                 JS_FreeValue(context_, *val);
+                allocatedHandles_.erase(ptr);
                 delete val;
             }
             g_protectedHandles.clear();
 
-            // Clean up native function pointers stored in g_nativeFunctions
-            g_nativeFunctions.clear();
+            for (void* ptr : allocatedHandles_) {
+                auto* value = static_cast<JSValue*>(ptr);
+                JS_FreeValue(context_, *value);
+                delete value;
+            }
+            allocatedHandles_.clear();
 
             // Delete all allocated function objects
             for (auto* fn : allocatedFunctions_) {
                 delete fn;
             }
             allocatedFunctions_.clear();
+            for (auto* method : allocatedMethods_) {
+                delete method;
+            }
+            allocatedMethods_.clear();
 
             // Clear private data map
             privateDataMap_.clear();
@@ -222,6 +244,7 @@ public:
 
         // Store the result (caller must free)
         JSValue* stored = new JSValue(result);
+        allocatedHandles_.insert(stored);
         return {stored, context_};
     }
 
@@ -254,6 +277,7 @@ public:
 
         executePendingJobs();
         JSValue* stored = new JSValue(result);
+        allocatedHandles_.insert(stored);
         return {stored, context_};
     }
 
@@ -264,6 +288,7 @@ public:
     JSValueHandle getGlobal() override {
         JSValue global = JS_GetGlobalObject(context_);
         JSValue* stored = new JSValue(global);
+        allocatedHandles_.insert(stored);
         return {stored, context_};
     }
 
@@ -280,6 +305,7 @@ public:
         JSValue result = JS_GetPropertyStr(context_, global, name);
         JS_FreeValue(context_, global);
         JSValue* stored = new JSValue(result);
+        allocatedHandles_.insert(stored);
         return {stored, context_};
     }
 
@@ -289,41 +315,49 @@ public:
 
     JSValueHandle newUndefined() override {
         JSValue* val = new JSValue(JS_UNDEFINED);
+        allocatedHandles_.insert(val);
         return {val, context_};
     }
 
     JSValueHandle newNull() override {
         JSValue* val = new JSValue(JS_NULL);
+        allocatedHandles_.insert(val);
         return {val, context_};
     }
 
     JSValueHandle newBoolean(bool value) override {
         JSValue* val = new JSValue(JS_NewBool(context_, value));
+        allocatedHandles_.insert(val);
         return {val, context_};
     }
 
     JSValueHandle newNumber(double value) override {
         JSValue* val = new JSValue(JS_NewFloat64(context_, value));
+        allocatedHandles_.insert(val);
         return {val, context_};
     }
 
     JSValueHandle newString(const char* value) override {
         JSValue* val = new JSValue(JS_NewString(context_, value));
+        allocatedHandles_.insert(val);
         return {val, context_};
     }
 
     JSValueHandle newObject() override {
         JSValue* val = new JSValue(JS_NewObject(context_));
+        allocatedHandles_.insert(val);
         return {val, context_};
     }
 
     JSValueHandle newArray(size_t length) override {
         JSValue* val = new JSValue(JS_NewArray(context_));
+        allocatedHandles_.insert(val);
         return {val, context_};
     }
 
     JSValueHandle newArrayBuffer(const uint8_t* data, size_t length) override {
         JSValue* val = new JSValue(JS_NewArrayBufferCopy(context_, data, length));
+        allocatedHandles_.insert(val);
         return {val, context_};
     }
 
@@ -331,8 +365,75 @@ public:
         // Create an ArrayBuffer that directly references external memory (no copy)
         // Pass nullptr for free_func since we don't own this memory (GPU manages it)
         JSValue* val = new JSValue(JS_NewArrayBuffer(context_, (uint8_t*)data, length, nullptr, nullptr, false));
+        allocatedHandles_.insert(val);
         return {val, context_};
     }
+
+    bool transferArrayBuffer(JSValueHandle value, TransferredArrayBuffer& result) override {
+        auto* stored = static_cast<JSValue*>(value.ptr);
+        if (!stored || !JS_IsArrayBuffer(*stored)) return false;
+        size_t length = 0;
+        uint8_t* data = JS_GetArrayBuffer(context_, &length, *stored);
+        if (!data && length != 0) return false;
+        auto bytes = std::make_shared<std::vector<uint8_t>>();
+        if (length > 0) bytes->assign(data, data + length);
+        result.data = bytes->data();
+        result.size = bytes->size();
+        result.owner = std::static_pointer_cast<void>(bytes);
+        auto backingIt = transferredBackingOwners_.find(JS_VALUE_GET_PTR(*stored));
+        std::shared_ptr<QuickJSTransferredBacking> backing;
+        if (backingIt != transferredBackingOwners_.end()) {
+            backing = backingIt->second;
+            backing->detaching = true;
+        }
+        JS_DetachArrayBuffer(context_, *stored);
+        if (backing) backing->detaching = false;
+        return true;
+    }
+
+    JSValueHandle newTransferredArrayBuffer(const TransferredArrayBuffer& buffer) override {
+        pruneTransferredBackingOwners();
+        auto backing = std::make_shared<QuickJSTransferredBacking>();
+        backing->owner = buffer.owner;
+        JSValue value = JS_NewArrayBuffer(
+            context_,
+            static_cast<uint8_t*>(buffer.data),
+            buffer.size,
+            freeQuickJSTransferredBacking,
+            backing.get(),
+            false);
+        if (JS_IsException(value)) {
+            return {};
+        }
+        transferredBackingOwners_[JS_VALUE_GET_PTR(value)] = std::move(backing);
+        auto* stored = new JSValue(value);
+        allocatedHandles_.insert(stored);
+        return {stored, context_};
+    }
+
+    JSValueHandle newSharedArrayBuffer(void* data,
+                                       size_t length,
+                                       std::shared_ptr<void> owner) override {
+        auto* retainedOwner = new std::shared_ptr<void>(std::move(owner));
+        JSValue value = JS_NewArrayBuffer(
+            context_,
+            static_cast<uint8_t*>(data),
+            length,
+            [](JSRuntime*, void* opaque, void*) {
+                delete static_cast<std::shared_ptr<void>*>(opaque);
+            },
+            retainedOwner,
+            true);
+        if (JS_IsException(value)) {
+            delete retainedOwner;
+            return {};
+        }
+        auto* stored = new JSValue(value);
+        allocatedHandles_.insert(stored);
+        return {stored, context_};
+    }
+
+    bool supportsSharedArrayBuffer() const override { return true; }
 
     void* getArrayBufferData(JSValueHandle value, size_t* size) override {
         JSValue* val = (JSValue*)value.ptr;
@@ -382,6 +483,7 @@ public:
         JS_FreeValue(context_, buffer);
 
         JSValue* val = new JSValue(typedArray);
+        allocatedHandles_.insert(val);
         return {val, context_};
     }
 
@@ -402,6 +504,7 @@ public:
         JS_FreeValue(context_, buffer);
 
         JSValue* val = new JSValue(typedArray);
+        allocatedHandles_.insert(val);
         return {val, context_};
     }
 
@@ -420,6 +523,7 @@ public:
         JS_FreeValue(context_, buffer);
 
         JSValue* val = new JSValue(typedArray);
+        allocatedHandles_.insert(val);
         return {val, context_};
     }
 
@@ -437,6 +541,7 @@ public:
         JS_FreeValue(context_, buffer);
 
         JSValue* val = new JSValue(typedArray);
+        allocatedHandles_.insert(val);
         return {val, context_};
     }
 
@@ -452,7 +557,18 @@ public:
         JS_FreeValue(context_, ptrValue);  // JS_NewCFunctionData dups the values
 
         JSValue* stored = new JSValue(func);
-        g_nativeFunctions[stored] = fn;
+        allocatedHandles_.insert(stored);
+        return {stored, context_};
+    }
+
+    JSValueHandle newMethod(const char* name, NativeMethod fn) override {
+        auto* fnPtr = new NativeMethod(std::move(fn));
+        allocatedMethods_.push_back(fnPtr);
+        JSValue ptrValue = JS_NewBigInt64(context_, (int64_t)(uintptr_t)fnPtr);
+        JSValue func = JS_NewCFunctionData(context_, &nativeMethodCallback, 0, 0, 1, &ptrValue);
+        JS_FreeValue(context_, ptrValue);
+        JSValue* stored = new JSValue(func);
+        allocatedHandles_.insert(stored);
         return {stored, context_};
     }
 
@@ -536,6 +652,7 @@ public:
         JSValue* objVal = (JSValue*)obj.ptr;
         JSValue result = JS_GetPropertyStr(context_, *objVal, name);
         JSValue* stored = new JSValue(result);
+        allocatedHandles_.insert(stored);
         return {stored, context_};
     }
 
@@ -550,6 +667,7 @@ public:
         JSValue* arrVal = (JSValue*)arr.ptr;
         JSValue result = JS_GetPropertyUint32(context_, *arrVal, index);
         JSValue* stored = new JSValue(result);
+        allocatedHandles_.insert(stored);
         return {stored, context_};
     }
 
@@ -578,6 +696,7 @@ public:
         executePendingJobs();
 
         JSValue* stored = new JSValue(result);
+        allocatedHandles_.insert(stored);
         return {stored, context_};
     }
 
@@ -586,9 +705,8 @@ public:
     // ========================================================================
 
     void protect(JSValueHandle value) override {
-        JSValue* val = (JSValue*)value.ptr;
-        JS_DupValue(context_, *val);
-        // Mark this handle as protected so nativeCallback won't clean it up
+        // The handle already owns a QuickJS reference. Mark callback arguments
+        // so nativeCallback leaves that reference alive until unprotect().
         g_protectedHandles.insert(value.ptr);
     }
 
@@ -597,11 +715,40 @@ public:
         JS_FreeValue(context_, *val);
         // Remove from protected set and clean up
         g_protectedHandles.erase(value.ptr);
+        allocatedHandles_.erase(value.ptr);
         delete val;
+    }
+
+    void releaseValue(JSValueHandle value) override {
+        if (!value.ptr) return;
+        JSValue* val = (JSValue*)value.ptr;
+        JS_FreeValue(context_, *val);
+        g_protectedHandles.erase(value.ptr);
+        allocatedHandles_.erase(value.ptr);
+        delete val;
+    }
+
+    void setConsoleCallback(ConsoleCallback callback) override {
+        consoleCallback_ = std::move(callback);
     }
 
     void gc() override {
         JS_RunGC(runtime_);
+    }
+
+    MemoryStats getMemoryStats() const override {
+        JSMemoryUsage usage = {};
+        JS_ComputeMemoryUsage(runtime_, &usage);
+        MemoryStats stats;
+        stats.heapUsedBytes = usage.memory_used_size;
+        stats.heapTotalBytes = usage.malloc_size;
+        stats.nativeFunctions = allocatedFunctions_.size() + allocatedMethods_.size();
+        return stats;
+    }
+
+    bool requestTermination() override {
+        terminationRequested_.store(true, std::memory_order_release);
+        return runtime_ != nullptr;
     }
 
     // ========================================================================
@@ -657,6 +804,22 @@ public:
     }
 
 private:
+    void pruneTransferredBackingOwners() {
+        for (auto it = transferredBackingOwners_.begin();
+             it != transferredBackingOwners_.end();) {
+            if (it->second->finalized) {
+                it = transferredBackingOwners_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    static int interruptHandler(JSRuntime*, void* opaque) {
+        auto* engine = static_cast<QuickJSEngine*>(opaque);
+        return engine && engine->terminationRequested_.load(std::memory_order_acquire) ? 1 : 0;
+    }
+
     void setupGlobals() {
         JSValue global = JS_GetGlobalObject(context_);
 
@@ -669,9 +832,9 @@ private:
         JS_SetPropertyStr(context_, console, "error",
             JS_NewCFunction(context_, js_console_error, "error", 1));
         JS_SetPropertyStr(context_, console, "info",
-            JS_NewCFunction(context_, js_console_log, "info", 1));
+            JS_NewCFunction(context_, js_console_info, "info", 1));
         JS_SetPropertyStr(context_, console, "debug",
-            JS_NewCFunction(context_, js_console_log, "debug", 1));
+            JS_NewCFunction(context_, js_console_debug, "debug", 1));
         JS_SetPropertyStr(context_, global, "console", console);
 
         // performance.now()
@@ -694,6 +857,7 @@ private:
     }
 
     void reportException(JSValue exception) {
+        if (terminationRequested_.load(std::memory_order_acquire)) return;
         const char* str = JS_ToCString(context_, exception);
         std::cerr << "[QuickJS] Error: " << (str ? str : "unknown") << std::endl;
         if (str) JS_FreeCString(context_, str);
@@ -746,7 +910,55 @@ private:
 
         if (result.ptr) {
             JSValue* val = (JSValue*)result.ptr;
-            return *val;
+            JSValue returned = JS_DupValue(ctx, *val);
+            if (engineInstance_ &&
+                engineInstance_->allocatedHandles_.find(result.ptr) != engineInstance_->allocatedHandles_.end() &&
+                g_protectedHandles.find(result.ptr) == g_protectedHandles.end()) {
+                engineInstance_->releaseValue(result);
+            }
+            return returned;
+        }
+        return JS_UNDEFINED;
+    }
+
+    static JSValue nativeMethodCallback(JSContext* ctx, JSValueConst this_val,
+                                        int argc, JSValueConst* argv, int magic,
+                                        JSValue* func_data) {
+        int64_t ptrVal;
+        if (JS_ToBigInt64(ctx, &ptrVal, func_data[0]) < 0) return JS_UNDEFINED;
+        auto* method = reinterpret_cast<NativeMethod*>(static_cast<uintptr_t>(ptrVal));
+        if (!method) return JS_UNDEFINED;
+
+        std::vector<JSValueHandle> args;
+        args.reserve(argc);
+        for (int i = 0; i < argc; i++) {
+            auto* stored = new JSValue(JS_DupValue(ctx, argv[i]));
+            args.push_back({stored, ctx});
+        }
+        auto* receiverValue = new JSValue(JS_DupValue(ctx, this_val));
+        JSValueHandle receiver{receiverValue, ctx};
+        JSValueHandle result = (*method)(ctx, receiver, args);
+
+        for (auto& arg : args) {
+            if (g_protectedHandles.find(arg.ptr) != g_protectedHandles.end() ||
+                arg.ptr == result.ptr) continue;
+            auto* value = static_cast<JSValue*>(arg.ptr);
+            JS_FreeValue(ctx, *value);
+            delete value;
+        }
+        if (receiver.ptr != result.ptr &&
+            g_protectedHandles.find(receiver.ptr) == g_protectedHandles.end()) {
+            JS_FreeValue(ctx, *receiverValue);
+            delete receiverValue;
+        }
+        if (result.ptr) {
+            JSValue returned = JS_DupValue(ctx, *static_cast<JSValue*>(result.ptr));
+            if (engineInstance_ &&
+                engineInstance_->allocatedHandles_.find(result.ptr) != engineInstance_->allocatedHandles_.end() &&
+                g_protectedHandles.find(result.ptr) == g_protectedHandles.end()) {
+                engineInstance_->releaseValue(result);
+            }
+            return returned;
         }
         return JS_UNDEFINED;
     }
@@ -768,6 +980,9 @@ private:
     static JSValue js_console_log(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
         std::string msg = buildConsoleMessage(ctx, argc, argv);
         std::cout << "[log] " << msg << std::endl;
+        if (engineInstance_ && engineInstance_->consoleCallback_) {
+            engineInstance_->consoleCallback_("log", msg);
+        }
 #ifdef __ANDROID__
         LOGI("[log] %s", msg.c_str());
 #endif
@@ -777,15 +992,39 @@ private:
     static JSValue js_console_warn(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
         std::string msg = buildConsoleMessage(ctx, argc, argv);
         std::cout << "[warn] " << msg << std::endl;
+        if (engineInstance_ && engineInstance_->consoleCallback_) {
+            engineInstance_->consoleCallback_("warn", msg);
+        }
 #ifdef __ANDROID__
         LOGW("[warn] %s", msg.c_str());
 #endif
         return JS_UNDEFINED;
     }
 
+    static JSValue js_console_info(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+        std::string msg = buildConsoleMessage(ctx, argc, argv);
+        std::cout << "[info] " << msg << std::endl;
+        if (engineInstance_ && engineInstance_->consoleCallback_) {
+            engineInstance_->consoleCallback_("info", msg);
+        }
+        return JS_UNDEFINED;
+    }
+
+    static JSValue js_console_debug(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+        std::string msg = buildConsoleMessage(ctx, argc, argv);
+        std::cout << "[debug] " << msg << std::endl;
+        if (engineInstance_ && engineInstance_->consoleCallback_) {
+            engineInstance_->consoleCallback_("debug", msg);
+        }
+        return JS_UNDEFINED;
+    }
+
     static JSValue js_console_error(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
         std::string msg = buildConsoleMessage(ctx, argc, argv);
         std::cerr << "[error] " << msg << std::endl;
+        if (engineInstance_ && engineInstance_->consoleCallback_) {
+            engineInstance_->consoleCallback_("error", msg);
+        }
 #ifdef __ANDROID__
         LOGE("[error] %s", msg.c_str());
 #endif
@@ -811,15 +1050,20 @@ private:
 
     JSRuntime* runtime_ = nullptr;
     JSContext* context_ = nullptr;
+    std::atomic<bool> terminationRequested_{false};
     JSValue lastException_ = JS_UNDEFINED;
+    ConsoleCallback consoleCallback_;
     std::chrono::high_resolution_clock::time_point startTime_;
     std::unordered_map<void*, void*> privateDataMap_;  // Map JS object ptr to native data
     std::vector<NativeFunction*> allocatedFunctions_;  // Track allocated function pointers
+    std::vector<NativeMethod*> allocatedMethods_;  // Track receiver-aware callbacks
+    std::unordered_set<void*> allocatedHandles_;
+    std::unordered_map<void*, std::shared_ptr<QuickJSTransferredBacking>> transferredBackingOwners_;
 
-    static QuickJSEngine* engineInstance_;  // For performance.now access
+    static thread_local QuickJSEngine* engineInstance_;  // For performance.now access
 };
 
-QuickJSEngine* QuickJSEngine::engineInstance_ = nullptr;
+thread_local QuickJSEngine* QuickJSEngine::engineInstance_ = nullptr;
 
 // Factory function
 std::unique_ptr<Engine> createQuickJSEngine() {

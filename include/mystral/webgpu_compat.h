@@ -93,6 +93,10 @@ inline void setupShaderModuleWGSL(WGPUShaderModuleDescriptor* desc,
 // Vertex/Fragment state uses const char* for entryPoint
 #define WGPU_SET_ENTRY_POINT(state, entry) (state).entryPoint = (entry)
 
+// Omitted entry point (spec: implementation selects the module's single
+// entry point) — wgpu-native takes nullptr
+#define WGPU_SET_ENTRY_POINT_AUTO(state) (state).entryPoint = nullptr
+
 // Label setting - wgpu uses const char*
 #define WGPU_SET_LABEL(desc, str) (desc).label = (str)
 
@@ -200,6 +204,11 @@ inline void setupShaderModuleWGSL(WGPUShaderModuleDescriptor* desc,
 // Vertex/Fragment state uses WGPUStringView for entryPoint
 // Use this macro to set entry points
 #define WGPU_SET_ENTRY_POINT(state, entry) (state).entryPoint = WGPU_STRING_VIEW(entry)
+
+// Omitted entry point (spec: implementation selects the module's single
+// entry point). NOTE: Dawn's "not provided" sentinel is {nullptr, WGPU_STRLEN};
+// a zero-init {nullptr, 0} means EMPTY STRING and fails validation.
+#define WGPU_SET_ENTRY_POINT_AUTO(state) (state).entryPoint = WGPUStringView{ nullptr, WGPU_STRLEN }
 
 // Label setting - Dawn uses WGPUStringView (use compound literal for C++)
 #define WGPU_SET_LABEL(desc, str) do { \

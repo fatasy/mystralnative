@@ -115,7 +115,7 @@ Enable Metal API validation in Xcode's scheme settings for debugging graphics is
 │    ├── SDL3 (windowing, input, Metal surface)    │
 │    ├── wgpu-native (WebGPU via Metal)            │
 │    ├── Skia (Canvas 2D)                          │
-│    └── JavaScriptCore (JS engine)                │
+│    └── QuickJS (JS engine)                       │
 ├──────────────────────────────────────────────────┤
 │  gltf-viewer.js                                   │
 │    ├── WebGPU rendering code                     │

@@ -16,10 +16,9 @@ iOS support allows you to embed Mystral Native.js in native iOS applications. Ga
 
 | JS Engine | WebGPU Backend | Notes |
 |-----------|----------------|-------|
-| JSC | wgpu-native | Uses system JavaScriptCore, smallest binary |
 | QuickJS | wgpu-native | Standalone, no system dependencies |
 
-**JavaScriptCore (JSC)** is recommended for iOS as it uses the system JavaScript engine, reducing binary size.
+QuickJS is currently the supported JavaScript engine for iOS.
 
 ## Integration
 
@@ -88,7 +87,7 @@ cmake -B build-ios \
     -DCMAKE_SYSTEM_NAME=iOS \
     -DCMAKE_OSX_ARCHITECTURES=arm64 \
     -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 \
-    -DMYSTRAL_USE_JSC=ON \
+    -DMYSTRAL_USE_QUICKJS=ON \
     -DMYSTRAL_USE_WGPU=ON
 
 cmake --build build-ios
@@ -166,7 +165,7 @@ NotificationCenter.default.addObserver(
 
 ## Performance Tips
 
-- Use JSC for smaller binary size
+- Use QuickJS for a compact runtime binary
 - Optimize JavaScript for mobile performance
 - Consider reducing render resolution on older devices
 - Use texture compression (ASTC) for assets

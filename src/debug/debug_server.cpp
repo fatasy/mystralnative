@@ -14,6 +14,7 @@
 #include <cstring>
 #include <algorithm>
 #include <array>
+#include <cctype>
 
 // ============================================================================
 // Simple SHA1 implementation (for WebSocket handshake)
@@ -291,11 +292,10 @@ public:
         }
     }
 
-    void sendResponse(int requestId, const std::string& result) {
+    void sendResponse(int clientId, int requestId, const std::string& result) {
         std::string json = "{\"id\":" + std::to_string(requestId) + ",\"result\":" + result + "}";
-        // Find the client that made this request
         for (auto& client : clients_) {
-            if (client->pendingRequests.count(requestId)) {
+            if (client->id == clientId && client->pendingRequests.count(requestId)) {
                 client->pendingRequests.erase(requestId);
                 sendWebSocketFrame(client.get(), json);
                 return;
@@ -303,10 +303,10 @@ public:
         }
     }
 
-    void sendError(int requestId, const std::string& errorMessage) {
+    void sendError(int clientId, int requestId, const std::string& errorMessage) {
         std::string json = "{\"id\":" + std::to_string(requestId) + ",\"error\":{\"message\":\"" + escapeJson(errorMessage) + "\"}}";
         for (auto& client : clients_) {
-            if (client->pendingRequests.count(requestId)) {
+            if (client->id == clientId && client->pendingRequests.count(requestId)) {
                 client->pendingRequests.erase(requestId);
                 sendWebSocketFrame(client.get(), json);
                 return;
@@ -429,14 +429,16 @@ private:
 
         // Parse Sec-WebSocket-Key
         std::string wsKey;
-        size_t keyPos = headers.find("Sec-WebSocket-Key:");
+        std::string lowerHeaders = headers;
+        std::transform(lowerHeaders.begin(), lowerHeaders.end(), lowerHeaders.begin(),
+            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        size_t keyPos = lowerHeaders.find("sec-websocket-key:");
         if (keyPos != std::string::npos) {
             size_t start = keyPos + 18;
             while (start < headers.size() && headers[start] == ' ') start++;
             size_t end = headers.find("\r\n", start);
-            if (end != std::string::npos) {
-                wsKey = headers.substr(start, end - start);
-            }
+            if (end == std::string::npos) end = headers.size();
+            wsKey = headers.substr(start, end - start);
         }
 
         if (wsKey.empty()) {
@@ -595,10 +597,26 @@ private:
                     char closeChar = (openChar == '{') ? '}' : (openChar == '[') ? ']' : '\0';
                     if (closeChar) {
                         int depth = 1;
+                        bool inString = false;
+                        bool escaped = false;
                         size_t end = start + 1;
                         while (end < message.size() && depth > 0) {
-                            if (message[end] == openChar) depth++;
-                            else if (message[end] == closeChar) depth--;
+                            char current = message[end];
+                            if (inString) {
+                                if (escaped) {
+                                    escaped = false;
+                                } else if (current == '\\') {
+                                    escaped = true;
+                                } else if (current == '"') {
+                                    inString = false;
+                                }
+                            } else if (current == '"') {
+                                inString = true;
+                            } else if (current == openChar) {
+                                depth++;
+                            } else if (current == closeChar) {
+                                depth--;
+                            }
                             end++;
                         }
                         params = message.substr(start, end - start);
@@ -608,7 +626,7 @@ private:
         }
 
         if (method.empty()) {
-            sendError(requestId, "Missing method");
+            sendError(client->id, requestId, "Missing method");
             return;
         }
 
@@ -617,7 +635,7 @@ private:
 
         // Call command handler
         if (commandHandler_) {
-            std::string result = commandHandler_(method, params);
+            std::string result = commandHandler_(client->id, requestId, method, params);
             if (!result.empty()) {
                 // Immediate response
                 client->pendingRequests.erase(requestId);
@@ -626,7 +644,7 @@ private:
             }
             // If result is empty, handler will call sendResponse/sendError later
         } else {
-            sendError(requestId, "No command handler");
+            sendError(client->id, requestId, "No command handler");
         }
     }
 
@@ -730,8 +748,8 @@ bool DebugServer::isRunning() const { return impl_->isRunning(); }
 void DebugServer::poll() { impl_->poll(); }
 void DebugServer::setCommandHandler(CommandHandler handler) { impl_->setCommandHandler(handler); }
 void DebugServer::broadcastEvent(const std::string& eventName, const std::string& params) { impl_->broadcastEvent(eventName, params); }
-void DebugServer::sendResponse(int requestId, const std::string& result) { impl_->sendResponse(requestId, result); }
-void DebugServer::sendError(int requestId, const std::string& errorMessage) { impl_->sendError(requestId, errorMessage); }
+void DebugServer::sendResponse(int clientId, int requestId, const std::string& result) { impl_->sendResponse(clientId, requestId, result); }
+void DebugServer::sendError(int clientId, int requestId, const std::string& errorMessage) { impl_->sendError(clientId, requestId, errorMessage); }
 int DebugServer::getClientCount() const { return impl_->getClientCount(); }
 int DebugServer::getPort() const { return impl_->getPort(); }
 

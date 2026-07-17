@@ -1,113 +1,71 @@
 #pragma once
 
-/**
- * WorkerRegistry - Singleton managing all web workers
- *
- * Provides the interface between the main thread's JS engine
- * and worker threads. Handles message routing and worker lifecycle.
- *
- * Usage:
- *   // Create a worker
- *   int id = WorkerRegistry::instance().createWorker(code);
- *
- *   // Send messages
- *   WorkerRegistry::instance().postToWorker(id, msg);
- *
- *   // Process messages from workers (call each frame)
- *   WorkerRegistry::instance().processWorkerMessages(mainEngine);
- *
- *   // Cleanup
- *   WorkerRegistry::instance().terminateWorker(id);
- */
-
 #include "mystral/workers/worker_thread.h"
-#include "mystral/js/engine.h"
-#include <unordered_map>
+
 #include <functional>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <unordered_map>
 
-namespace mystral {
-namespace workers {
+namespace mystral::workers {
 
-/**
- * Callback type for delivering messages to JS Worker objects
- */
-using JSWorkerCallback = std::function<void(int workerId, const WorkerMessage& msg)>;
+struct WorkerRegistryStats {
+    uint64_t createdWorkers = 0;
+    uint64_t activeWorkers = 0;
+    uint64_t processedMessages = 0;
+    uint64_t processedTimerCallbacks = 0;
+    uint64_t busyNanoseconds = 0;
+    uint64_t rejectedInputMessages = 0;
+    uint64_t rejectedOutputMessages = 0;
+    uint64_t queuedInputMessages = 0;
+    uint64_t queuedInputBytes = 0;
+    uint64_t queuedOutputMessages = 0;
+    uint64_t queuedOutputBytes = 0;
+    uint64_t peakQueuedInputBytes = 0;
+    uint64_t peakQueuedOutputBytes = 0;
+};
 
-/**
- * WorkerRegistry - Manages all worker threads
- */
 class WorkerRegistry {
 public:
-    /**
-     * Get the singleton instance
-     */
-    static WorkerRegistry& instance();
+    using MessageCallback = std::function<void(int, const WorkerMessage&)>;
 
-    /**
-     * Create a new worker
-     * @param code JavaScript code to execute
-     * @return Worker ID (positive) or -1 on error
-     */
-    int createWorker(const std::string& code);
+    WorkerRegistry(js::EngineType engineType,
+                   std::string rootDir,
+                   std::shared_ptr<SharedBufferRegistry> sharedBuffers);
+    ~WorkerRegistry();
 
-    /**
-     * Post a message to a worker
-     * @param id Worker ID
-     * @param msg Message to send
-     */
-    void postToWorker(int id, WorkerMessage msg);
-
-    /**
-     * Terminate a worker
-     * @param id Worker ID
-     */
+    int createWorker(WorkerSourceKind sourceKind,
+                     const std::string& source,
+                     const std::string& name = {});
+    WorkerPostStatus postToWorker(
+        int id,
+        std::string payload,
+        std::vector<js::TransferredArrayBuffer> transfers = {});
     void terminateWorker(int id);
-
-    /**
-     * Register a callback for receiving messages from a worker
-     * @param id Worker ID
-     * @param callback Function to call when worker sends a message
-     */
-    void registerCallback(int id, JSWorkerCallback callback);
-
-    /**
-     * Unregister callback for a worker
-     * @param id Worker ID
-     */
-    void unregisterCallback(int id);
-
-    /**
-     * Process messages from all workers
-     * Should be called once per frame from the main loop
-     * @param mainEngine Main thread's JS engine (for callback invocation)
-     * @return true if any messages were processed
-     */
-    bool processWorkerMessages(js::Engine* mainEngine);
-
-    /**
-     * Shutdown all workers
-     */
+    bool drainMessages(const MessageCallback& callback);
     void shutdown();
+    size_t size() const;
+    WorkerRegistryStats stats() const;
 
-    /**
-     * Check if workers are available (libuv/threading support)
-     */
-    bool isAvailable() const;
-
-    // Prevent copying
     WorkerRegistry(const WorkerRegistry&) = delete;
     WorkerRegistry& operator=(const WorkerRegistry&) = delete;
 
 private:
-    WorkerRegistry();
-    ~WorkerRegistry();
-
+    js::EngineType engineType_ = js::EngineType::Unknown;
+    std::string rootDir_;
+    std::shared_ptr<SharedBufferRegistry> sharedBuffers_;
     std::unordered_map<int, std::unique_ptr<WorkerThread>> workers_;
-    std::unordered_map<int, JSWorkerCallback> callbacks_;
     int nextId_ = 1;
+    uint64_t createdWorkers_ = 0;
+    uint64_t completedMessages_ = 0;
+    uint64_t completedTimerCallbacks_ = 0;
+    uint64_t completedBusyNanoseconds_ = 0;
+    uint64_t completedRejectedInputMessages_ = 0;
+    uint64_t completedRejectedOutputMessages_ = 0;
+    uint64_t peakQueuedInputBytes_ = 0;
+    uint64_t peakQueuedOutputBytes_ = 0;
     mutable std::mutex mutex_;
-    bool initialized_ = false;
 };
 
-}  // namespace workers
-}  // namespace mystral
+}  // namespace mystral::workers

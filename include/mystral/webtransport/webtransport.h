@@ -48,6 +48,9 @@ void shutdown();
  */
 bool initBindings(js::Engine* engine);
 
+/** Release JS handles before replacing the engine while keeping native sessions. */
+void resetBindings();
+
 /**
  * Drive QUIC I/O for all sessions and dispatch any queued events to JS.
  * Must be called once per frame from the runtime poll loop. This polls each

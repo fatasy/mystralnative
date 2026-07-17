@@ -28,6 +28,7 @@ const sidebarItems = [
       { label: 'Bundling & Building Apps', path: 'guides/bundling' },
       { label: 'Input Events', path: 'guides/input-events' },
       { label: 'WebTransport', path: 'guides/webtransport' },
+      { label: 'Workers & Shared Memory', path: 'guides/workers-shared-memory' },
       { label: 'Building from Source', path: 'guides/building' },
       { label: 'Configuration', path: 'guides/configuration' },
     ],

@@ -14,6 +14,8 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <chrono>
+#include <mutex>
+#include <sstream>
 
 #if defined(MYSTRAL_JS_V8)
 
@@ -25,37 +27,30 @@ namespace js {
 
 // V8 platform (shared across all isolates)
 static std::unique_ptr<v8::Platform> g_platform;
+static std::once_flag g_initializeOnce;
 static bool g_initialized = false;
-
-// Store native function callbacks
-static std::unordered_map<void*, NativeFunction> g_nativeFunctions;
-
-// Global set of protected handles that should not be deleted by nativeCallback cleanup
-static std::unordered_set<void*> g_protectedHandles;
 
 /**
  * Initialize V8 (call once at startup)
  */
 static bool initializeV8() {
-    if (g_initialized) {
-        return true;
-    }
+    std::call_once(g_initializeOnce, []() {
+        std::cout << "[V8] Initializing V8 JavaScript engine..." << std::endl;
 
-    std::cout << "[V8] Initializing V8 JavaScript engine..." << std::endl;
+        v8::V8::InitializeICUDefaultLocation("");
+        v8::V8::InitializeExternalStartupData("");
 
-    // Initialize V8
-    v8::V8::InitializeICUDefaultLocation("");
-    v8::V8::InitializeExternalStartupData("");
+        g_platform = v8::platform::NewDefaultPlatform();
+        v8::V8::InitializePlatform(g_platform.get());
+        g_initialized = v8::V8::Initialize();
 
-    g_platform = v8::platform::NewDefaultPlatform();
-    v8::V8::InitializePlatform(g_platform.get());
-    v8::V8::Initialize();
+        if (g_initialized) {
+            std::cout << "[V8] V8 initialized successfully" << std::endl;
+            std::cout << "[V8] Version: " << v8::V8::GetVersion() << std::endl;
+        }
+    });
 
-    g_initialized = true;
-    std::cout << "[V8] V8 initialized successfully" << std::endl;
-    std::cout << "[V8] Version: " << v8::V8::GetVersion() << std::endl;
-
-    return true;
+    return g_initialized;
 }
 
 class V8Engine : public Engine {
@@ -63,8 +58,9 @@ public:
     V8Engine() {
         std::cout << "[V8] Creating engine..." << std::endl;
 
-        if (!g_initialized) {
-            initializeV8();
+        if (!initializeV8()) {
+            std::cerr << "[V8] Failed to initialize V8" << std::endl;
+            return;
         }
 
         // Create isolate
@@ -100,14 +96,41 @@ public:
         std::cout << "[V8] Destroying engine..." << std::endl;
         // Clean up any remaining frame handles
         for (auto* handle : frameHandles_) {
+            if (protectedHandles_.find(handle) == protectedHandles_.end()) {
+                handle->Reset();
+                delete handle;
+            }
+        }
+        frameHandles_.clear();
+        for (void* rawHandle : protectedHandles_) {
+            auto* handle = static_cast<v8::Persistent<v8::Value>*>(rawHandle);
             handle->Reset();
             delete handle;
         }
-        frameHandles_.clear();
-        for (auto* fn : frameNativeFunctions_) {
-            delete fn;
+        protectedHandles_.clear();
+        // Weak callbacks do not run once isolate shutdown begins. Execute the
+        // native resource releases while their owning device is still alive.
+        for (auto* ref : weakRefs_) {
+            ref->callback();
+            isolate_->AdjustAmountOfExternalAllocatedMemory(-kExternalResourceSize);
+            ref->persistent.Reset();
+            delete ref;
         }
-        frameNativeFunctions_.clear();
+        weakRefs_.clear();
+        // Weak callbacks do not run after the isolate starts shutting down.
+        // Release the native callbacks still owned by live JS functions now.
+        for (auto* ref : nativeFunctionRefs_) {
+            ref->persistent.Reset();
+            delete ref->function;
+            delete ref;
+        }
+        nativeFunctionRefs_.clear();
+        for (auto* ref : nativeMethodRefs_) {
+            ref->persistent.Reset();
+            delete ref->method;
+            delete ref;
+        }
+        nativeMethodRefs_.clear();
         for (auto& entry : moduleCache_) {
             entry.second.Reset();
         }
@@ -437,6 +460,77 @@ public:
         return {persistent, isolate_};
     }
 
+    bool transferArrayBuffer(JSValueHandle value, TransferredArrayBuffer& result) override {
+        v8::Isolate::Scope isolateScope(isolate_);
+        v8::HandleScope handleScope(isolate_);
+        auto* persistent = static_cast<v8::Persistent<v8::Value>*>(value.ptr);
+        if (!persistent) return false;
+        v8::Local<v8::Value> local = persistent->Get(isolate_);
+        if (!local->IsArrayBuffer()) return false;
+        auto arrayBuffer = local.As<v8::ArrayBuffer>();
+        if (!arrayBuffer->IsDetachable() || arrayBuffer->WasDetached()) return false;
+        auto backingStore = arrayBuffer->GetBackingStore();
+        result.data = backingStore->Data();
+        result.size = backingStore->ByteLength();
+        result.owner = std::make_shared<std::shared_ptr<v8::BackingStore>>(std::move(backingStore));
+        arrayBuffer->Detach();
+        return true;
+    }
+
+    JSValueHandle newTransferredArrayBuffer(const TransferredArrayBuffer& buffer) override {
+        v8::Isolate::Scope isolateScope(isolate_);
+        v8::HandleScope handleScope(isolate_);
+        v8::Local<v8::Context> context = context_.Get(isolate_);
+        v8::Context::Scope contextScope(context);
+        auto* retainedOwner = new std::shared_ptr<void>(buffer.owner);
+        auto backingStore = v8::ArrayBuffer::NewBackingStore(
+            buffer.data,
+            buffer.size,
+            [](void*, size_t, void* deleterData) {
+                delete static_cast<std::shared_ptr<void>*>(deleterData);
+            },
+            retainedOwner);
+        if (!backingStore) {
+            delete retainedOwner;
+            return {};
+        }
+        auto arrayBuffer = v8::ArrayBuffer::New(isolate_, std::move(backingStore));
+        auto* persistent = new v8::Persistent<v8::Value>(isolate_, arrayBuffer);
+        frameHandles_.insert(persistent);
+        return {persistent, isolate_};
+    }
+
+    JSValueHandle newSharedArrayBuffer(void* data,
+                                       size_t length,
+                                       std::shared_ptr<void> owner) override {
+        v8::Isolate::Scope isolate_scope(isolate_);
+        v8::HandleScope handle_scope(isolate_);
+        v8::Local<v8::Context> context = context_.Get(isolate_);
+        v8::Context::Scope context_scope(context);
+
+        auto* retainedOwner = new std::shared_ptr<void>(std::move(owner));
+        std::unique_ptr<v8::BackingStore> backingStore =
+            v8::SharedArrayBuffer::NewBackingStore(
+                data,
+                length,
+                [](void*, size_t, void* deleterData) {
+                    delete static_cast<std::shared_ptr<void>*>(deleterData);
+                },
+                retainedOwner);
+        if (!backingStore) {
+            delete retainedOwner;
+            return {};
+        }
+
+        v8::Local<v8::SharedArrayBuffer> arrayBuffer =
+            v8::SharedArrayBuffer::New(isolate_, std::move(backingStore));
+        auto* persistent = new v8::Persistent<v8::Value>(isolate_, arrayBuffer);
+        frameHandles_.insert(persistent);
+        return {persistent, isolate_};
+    }
+
+    bool supportsSharedArrayBuffer() const override { return true; }
+
     void* getArrayBufferData(JSValueHandle value, size_t* size) override {
         v8::Isolate::Scope isolate_scope(isolate_);
         v8::HandleScope handle_scope(isolate_);
@@ -547,23 +641,60 @@ public:
         v8::Local<v8::Context> context = context_.Get(isolate_);
         v8::Context::Scope context_scope(context);
 
-        // Store the callback
+        // The External embedded in the JS function stores this pointer. Its
+        // lifetime must therefore follow the JS function, not the animation
+        // frame in which the wrapper happened to be created.
         auto* fnPtr = new NativeFunction(fn);
         v8::Local<v8::External> external = v8::External::New(isolate_, fnPtr);
-
-        // Track per-frame NativeFunction allocations for cleanup
-        // Init-time functions (created before beginFrame) are NOT tracked
-        // and persist for the lifetime of the engine
-        // Also skip tracking when suspended (for cached wrapper creation)
-        if (inFrame_ && !frameTrackingSuspended_) {
-            frameNativeFunctions_.push_back(fnPtr);
-        }
 
         // Use Function::New instead of FunctionTemplate::New — lighter weight,
         // avoids SharedFunctionInfo/FeedbackVector accumulation that prevents GC
         v8::Local<v8::Function> func = v8::Function::New(context, nativeCallback, external).ToLocalChecked();
 
+        auto* ref = new NativeFunctionRef();
+        ref->persistent.Reset(isolate_, func);
+        ref->function = fnPtr;
+        ref->owner = this;
+        nativeFunctionRefs_.insert(ref);
+        ref->persistent.SetWeak(ref, [](const v8::WeakCallbackInfo<NativeFunctionRef>& data) {
+            NativeFunctionRef* ref = data.GetParameter();
+            ref->owner->nativeFunctionRefs_.erase(ref);
+            ref->persistent.Reset();
+            delete ref->function;
+            delete ref;
+        }, v8::WeakCallbackType::kParameter);
+
         v8::Persistent<v8::Value>* persistent = new v8::Persistent<v8::Value>(isolate_, func);
+        frameHandles_.insert(persistent);
+        return {persistent, isolate_};
+    }
+
+    JSValueHandle newMethod(const char* name, NativeMethod fn) override {
+        v8::Isolate::Scope isolate_scope(isolate_);
+        v8::HandleScope handle_scope(isolate_);
+        v8::Local<v8::Context> context = context_.Get(isolate_);
+        v8::Context::Scope context_scope(context);
+
+        auto* fnPtr = new NativeMethod(std::move(fn));
+        v8::Local<v8::External> external = v8::External::New(isolate_, fnPtr);
+        v8::Local<v8::Function> func =
+            v8::Function::New(context, nativeMethodCallback, external).ToLocalChecked();
+        func->SetName(v8::String::NewFromUtf8(isolate_, name).ToLocalChecked());
+
+        auto* ref = new NativeMethodRef();
+        ref->persistent.Reset(isolate_, func);
+        ref->method = fnPtr;
+        ref->owner = this;
+        nativeMethodRefs_.insert(ref);
+        ref->persistent.SetWeak(ref, [](const v8::WeakCallbackInfo<NativeMethodRef>& data) {
+            NativeMethodRef* ref = data.GetParameter();
+            ref->owner->nativeMethodRefs_.erase(ref);
+            ref->persistent.Reset();
+            delete ref->method;
+            delete ref;
+        }, v8::WeakCallbackType::kParameter);
+
+        auto* persistent = new v8::Persistent<v8::Value>(isolate_, func);
         frameHandles_.insert(persistent);
         return {persistent, isolate_};
     }
@@ -765,43 +896,59 @@ public:
     void protect(JSValueHandle value) override {
         // Mark this handle as protected in the global set.
         // nativeCallback will check this set and skip deletion for protected handles.
-        g_protectedHandles.insert(value.ptr);
+        protectedHandles_.insert(value.ptr);
     }
 
     void unprotect(JSValueHandle value) override {
         // Remove from protected set, frame handles, and delete
-        g_protectedHandles.erase(value.ptr);
+        protectedHandles_.erase(value.ptr);
         frameHandles_.erase((v8::Persistent<v8::Value>*)value.ptr);
         v8::Persistent<v8::Value>* persistent = (v8::Persistent<v8::Value>*)value.ptr;
         persistent->Reset();
         delete persistent;
     }
 
+    void releaseValue(JSValueHandle value) override {
+        if (!value.ptr) return;
+        protectedHandles_.erase(value.ptr);
+        frameHandles_.erase((v8::Persistent<v8::Value>*)value.ptr);
+        auto* persistent = (v8::Persistent<v8::Value>*)value.ptr;
+        persistent->Reset();
+        delete persistent;
+    }
+
+    void setConsoleCallback(ConsoleCallback callback) override {
+        consoleCallback_ = std::move(callback);
+    }
+
     void gc() override {
         isolate_->LowMemoryNotification();
     }
 
+    MemoryStats getMemoryStats() const override {
+        v8::HeapStatistics heap;
+        isolate_->GetHeapStatistics(&heap);
+        MemoryStats stats;
+        stats.heapUsedBytes = heap.used_heap_size();
+        stats.heapTotalBytes = heap.total_heap_size();
+        stats.heapLimitBytes = heap.heap_size_limit();
+        stats.nativeFunctions = nativeFunctionRefs_.size() + nativeMethodRefs_.size();
+        stats.frameHandles = frameHandles_.size();
+        return stats;
+    }
+
     void beginFrame() override {
-        inFrame_ = true;
         isolate_->SetIdle(false);
     }
 
     void clearFrameHandles() override {
         for (auto* handle : frameHandles_) {
-            if (g_protectedHandles.find(handle) == g_protectedHandles.end()) {
+            if (protectedHandles_.find(handle) == protectedHandles_.end()) {
                 handle->Reset();
                 delete handle;
             }
         }
         frameHandles_.clear();
-
-        // Free NativeFunction allocations created during this frame
-        for (auto* fn : frameNativeFunctions_) {
-            delete fn;
-        }
-        frameNativeFunctions_.clear();
-
-        inFrame_ = false;
 
         // Tell V8 we're idle between frames so it can do deferred GC work
         // (incremental marking, sweeping, weak callback processing).
@@ -809,12 +956,10 @@ public:
         isolate_->SetIdle(true);
     }
 
-    void suspendFrameTracking() override {
-        frameTrackingSuspended_ = true;
-    }
-
-    void resumeFrameTracking() override {
-        frameTrackingSuspended_ = false;
+    bool requestTermination() override {
+        if (!isolate_) return false;
+        isolate_->TerminateExecution();
+        return true;
     }
 
     void registerRelease(JSValueHandle obj, std::function<void()> callback) override {
@@ -835,11 +980,13 @@ public:
         // resource, but it ensures V8's own GC heuristics trigger major
         // collections frequently enough to fire weak callbacks and release
         // Dawn resources before they accumulate significantly.
-        static constexpr int64_t kExternalResourceSize = 16384;
         isolate_->AdjustAmountOfExternalAllocatedMemory(kExternalResourceSize);
+        weakData->owner = this;
+        weakRefs_.insert(weakData);
 
         weakData->persistent.SetWeak(weakData, [](const v8::WeakCallbackInfo<WeakRef>& data) {
             WeakRef* ref = data.GetParameter();
+            ref->owner->weakRefs_.erase(ref);
             ref->callback();  // Release the Dawn resource
             ref->isolate->AdjustAmountOfExternalAllocatedMemory(-kExternalResourceSize);
             ref->persistent.Reset();
@@ -1009,13 +1156,17 @@ private:
                 v8::Local<v8::String> prefixStr = info.Data().As<v8::String>();
                 v8::String::Utf8Value prefixUtf8(isolate, prefixStr);
 
-                std::cout << "[" << *prefixUtf8 << "] ";
+                std::ostringstream message;
                 for (int i = 0; i < info.Length(); i++) {
                     v8::String::Utf8Value str(isolate, info[i]);
-                    std::cout << (*str ? *str : "");
-                    if (i < info.Length() - 1) std::cout << " ";
+                    message << (*str ? *str : "");
+                    if (i < info.Length() - 1) message << " ";
                 }
-                std::cout << std::endl;
+                std::cout << "[" << *prefixUtf8 << "] " << message.str() << std::endl;
+                auto* engine = static_cast<V8Engine*>(isolate->GetData(0));
+                if (engine && engine->consoleCallback_) {
+                    engine->consoleCallback_(*prefixUtf8 ? *prefixUtf8 : "log", message.str());
+                }
             }, v8::String::NewFromUtf8(isolate_, prefix).ToLocalChecked())->GetFunction(context).ToLocalChecked();
         };
 
@@ -1066,6 +1217,10 @@ private:
 
     void reportException(v8::TryCatch& try_catch) {
         v8::HandleScope handle_scope(isolate_);
+        if (try_catch.HasTerminated()) {
+            lastException_ = "Execution terminated";
+            return;
+        }
         v8::String::Utf8Value exception(isolate_, try_catch.Exception());
         const char* exception_string = *exception ? *exception : "<string conversion failed>";
 
@@ -1123,7 +1278,7 @@ private:
         // Clean up argument handles (but skip protected ones and the result if it's an arg)
         for (auto& arg : args) {
             // Check if this handle was protected by the native function
-            if (g_protectedHandles.find(arg.ptr) != g_protectedHandles.end()) {
+            if (engine && engine->protectedHandles_.find(arg.ptr) != engine->protectedHandles_.end()) {
                 // Skip - the native function wants to keep this handle
                 continue;
             }
@@ -1144,7 +1299,8 @@ private:
                 break;
             }
         }
-        if (result.ptr && !resultWasArg && g_protectedHandles.find(result.ptr) == g_protectedHandles.end()) {
+        if (result.ptr && !resultWasArg &&
+            (!engine || engine->protectedHandles_.find(result.ptr) == engine->protectedHandles_.end())) {
             v8::Persistent<v8::Value>* resPersistent = (v8::Persistent<v8::Value>*)result.ptr;
             // Remove from frame handles to avoid double-free in clearFrameHandles()
             if (engine) {
@@ -1155,11 +1311,70 @@ private:
         }
     }
 
+    static void nativeMethodCallback(const v8::FunctionCallbackInfo<v8::Value>& info) {
+        v8::Isolate* isolate = info.GetIsolate();
+        v8::HandleScope handle_scope(isolate);
+        v8::Local<v8::Context> context = isolate->GetCurrentContext();
+        v8::Context::Scope context_scope(context);
+        auto* engine = static_cast<V8Engine*>(isolate->GetData(0));
+        auto* method = static_cast<NativeMethod*>(info.Data().As<v8::External>()->Value());
+
+        std::vector<JSValueHandle> args;
+        args.reserve(info.Length());
+        for (int i = 0; i < info.Length(); i++) {
+            auto* persistent = new v8::Persistent<v8::Value>(isolate, info[i]);
+            args.push_back({persistent, isolate});
+        }
+        auto* receiverPersistent = new v8::Persistent<v8::Value>(isolate, info.This());
+        JSValueHandle receiver{receiverPersistent, isolate};
+        JSValueHandle result = (*method)(isolate, receiver, args);
+
+        if (result.ptr) {
+            auto* resultPersistent = static_cast<v8::Persistent<v8::Value>*>(result.ptr);
+            info.GetReturnValue().Set(resultPersistent->Get(isolate));
+        }
+
+        auto releaseTemporary = [&](JSValueHandle handle) {
+            if (!handle.ptr || handle.ptr == result.ptr ||
+                (engine && engine->protectedHandles_.find(handle.ptr) != engine->protectedHandles_.end())) return;
+            auto* persistent = static_cast<v8::Persistent<v8::Value>*>(handle.ptr);
+            persistent->Reset();
+            delete persistent;
+        };
+        for (auto arg : args) releaseTemporary(arg);
+        releaseTemporary(receiver);
+
+        bool resultWasInput = result.ptr == receiver.ptr;
+        for (const auto& arg : args) resultWasInput = resultWasInput || result.ptr == arg.ptr;
+        if (result.ptr && !resultWasInput &&
+            (!engine || engine->protectedHandles_.find(result.ptr) == engine->protectedHandles_.end())) {
+            auto* resultPersistent = static_cast<v8::Persistent<v8::Value>*>(result.ptr);
+            if (engine) engine->frameHandles_.erase(resultPersistent);
+            resultPersistent->Reset();
+            delete resultPersistent;
+        }
+    }
+
     // Weak reference data for GC-triggered Dawn resource cleanup
     struct WeakRef {
         v8::Persistent<v8::Value> persistent;
         std::function<void()> callback;
         v8::Isolate* isolate = nullptr;
+        V8Engine* owner = nullptr;
+    };
+
+    // Keeps the C++ callback behind a v8::External alive exactly as long as
+    // its JavaScript Function. The persistent is weak and does not root it.
+    struct NativeFunctionRef {
+        v8::Persistent<v8::Function> persistent;
+        NativeFunction* function = nullptr;
+        V8Engine* owner = nullptr;
+    };
+
+    struct NativeMethodRef {
+        v8::Persistent<v8::Function> persistent;
+        NativeMethod* method = nullptr;
+        V8Engine* owner = nullptr;
     };
 
     v8::Isolate* isolate_ = nullptr;
@@ -1171,9 +1386,12 @@ private:
     std::unordered_map<std::string, v8::Global<v8::Module>> moduleCache_;
     std::unordered_map<int, std::string> moduleIdToPath_;  // Reverse lookup: module hash -> path
     std::unordered_set<v8::Persistent<v8::Value>*> frameHandles_;  // Handles to free at end of frame
-    std::vector<NativeFunction*> frameNativeFunctions_;  // NativeFunction allocations to free at end of frame
-    bool inFrame_ = false;  // True during animation frame execution
-    bool frameTrackingSuspended_ = false;  // When true, skip frame tracking for new allocations
+    std::unordered_set<void*> protectedHandles_;  // Explicit roots owned by this engine
+    std::unordered_set<WeakRef*> weakRefs_;  // Native releases owned by weak JS wrappers
+    std::unordered_set<NativeFunctionRef*> nativeFunctionRefs_;  // Weakly owned by JS functions
+    std::unordered_set<NativeMethodRef*> nativeMethodRefs_;  // Weakly owned receiver-aware methods
+    ConsoleCallback consoleCallback_;
+    static constexpr int64_t kExternalResourceSize = 16384;
 };
 
 // Factory function

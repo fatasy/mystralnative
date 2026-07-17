@@ -32,6 +32,8 @@
 #include <regex>
 #include <queue>
 #include <array>
+#include <deque>
+#include <iomanip>
 
 // WebP animation encoding (for video recording)
 #ifdef MYSTRAL_HAS_WEBP_MUX
@@ -243,10 +245,59 @@ static std::string extractJsonString(const std::string& json, const std::string&
     size_t quoteStart = json.find('"', colonPos);
     if (quoteStart == std::string::npos) return "";
 
-    size_t quoteEnd = json.find('"', quoteStart + 1);
-    if (quoteEnd == std::string::npos) return "";
+    std::string result;
+    bool escaped = false;
+    for (size_t i = quoteStart + 1; i < json.size(); i++) {
+        char c = json[i];
+        if (escaped) {
+            switch (c) {
+                case '"': result.push_back('"'); break;
+                case '\\': result.push_back('\\'); break;
+                case '/': result.push_back('/'); break;
+                case 'b': result.push_back('\b'); break;
+                case 'f': result.push_back('\f'); break;
+                case 'n': result.push_back('\n'); break;
+                case 'r': result.push_back('\r'); break;
+                case 't': result.push_back('\t'); break;
+                default: result.push_back(c); break;
+            }
+            escaped = false;
+        } else if (c == '\\') {
+            escaped = true;
+        } else if (c == '"') {
+            return result;
+        } else {
+            result.push_back(c);
+        }
+    }
+    return "";
+}
 
-    return json.substr(quoteStart + 1, quoteEnd - quoteStart - 1);
+static std::string escapeJson(const std::string& value) {
+    static const char hex[] = "0123456789abcdef";
+    std::string result;
+    result.reserve(value.size());
+    for (unsigned char c : value) {
+        switch (c) {
+            case '"': result += "\\\""; break;
+            case '\\': result += "\\\\"; break;
+            case '\b': result += "\\b"; break;
+            case '\f': result += "\\f"; break;
+            case '\n': result += "\\n"; break;
+            case '\r': result += "\\r"; break;
+            case '\t': result += "\\t"; break;
+            default:
+                if (c < 0x20) {
+                    result += "\\u00";
+                    result.push_back(hex[(c >> 4) & 0x0f]);
+                    result.push_back(hex[c & 0x0f]);
+                } else {
+                    result.push_back(static_cast<char>(c));
+                }
+                break;
+        }
+    }
+    return result;
 }
 
 /**
@@ -328,6 +379,10 @@ DEBUG/TESTING OPTIONS:
     --debug               Enable verbose debug logging (WebGPU, shaders, etc.)
     --debug-port <port>   Enable debug server on specified port (e.g., 9222)
                           Allows remote testing via WebSocket protocol
+    --benchmark <frames>  Profile exactly N frames, then exit
+    --warmup <frames>     Frames excluded before profiling (default: 120)
+    --benchmark-output <file>
+                          Write the benchmark report as JSON
 
 COMPILE OPTIONS:
     --include <dir>       Asset directory to bundle (repeatable)
@@ -437,6 +492,12 @@ struct CLIOptions {
     // Debug server
     int debugPort = 0;  // Port for debug server (0 = disabled)
 
+    // Fixed-frame runtime benchmark
+    bool benchmarkRequested = false;
+    int benchmarkFrames = 0;
+    int benchmarkWarmupFrames = 120;
+    std::string benchmarkOutputPath;
+
     // Verbose logging
     bool debug = false;  // Enable verbose WebGPU/shader logging
 
@@ -509,6 +570,13 @@ CLIOptions parseArgs(int argc, char* argv[]) {
             opts.useNativeCapture = false;
         } else if (arg == "--debug-port" && i + 1 < argc) {
             opts.debugPort = std::stoi(argv[++i]);
+        } else if (arg == "--benchmark" && i + 1 < argc) {
+            opts.benchmarkRequested = true;
+            opts.benchmarkFrames = std::stoi(argv[++i]);
+        } else if (arg == "--warmup" && i + 1 < argc) {
+            opts.benchmarkWarmupFrames = std::stoi(argv[++i]);
+        } else if (arg == "--benchmark-output" && i + 1 < argc) {
+            opts.benchmarkOutputPath = argv[++i];
         } else if (arg == "--debug") {
             opts.debug = true;
         } else if (arg == "--resolution" && i + 1 < argc) {
@@ -1285,7 +1353,160 @@ static int compileBundle(const CLIOptions& opts) {
     return 0;
 }
 
+static void appendProfileStatisticsJson(
+    std::ostringstream& out,
+    const mystral::RuntimeProfileStatistics& stats) {
+    out << "{\"minMs\":" << stats.minMs
+        << ",\"meanMs\":" << stats.meanMs
+        << ",\"p50Ms\":" << stats.p50Ms
+        << ",\"p95Ms\":" << stats.p95Ms
+        << ",\"p99Ms\":" << stats.p99Ms
+        << ",\"maxMs\":" << stats.maxMs << "}";
+}
+
+static void appendMemorySnapshotJson(
+    std::ostringstream& out,
+    const mystral::RuntimeMemorySnapshot& memory) {
+    out << "{\"heapUsedBytes\":" << memory.heapUsedBytes
+        << ",\"heapTotalBytes\":" << memory.heapTotalBytes
+        << ",\"heapLimitBytes\":" << memory.heapLimitBytes
+        << ",\"nativeFunctions\":" << memory.nativeFunctions
+        << ",\"frameHandles\":" << memory.frameHandles << "}";
+}
+
+static std::string makeBenchmarkJson(
+    const mystral::RuntimeProfileReport& report,
+    int requestedFrames,
+    int warmupFrames,
+    const std::string& scriptPath,
+    const std::string& workloadJson) {
+    std::ostringstream out;
+    out << std::fixed << std::setprecision(6);
+    const double throughputFps = report.wallTimeMs > 0.0
+        ? static_cast<double>(report.sampledFrames) * 1000.0 / report.wallTimeMs
+        : 0.0;
+    const int64_t heapDelta = static_cast<int64_t>(report.memoryEnd.heapUsedBytes)
+        - static_cast<int64_t>(report.memoryStart.heapUsedBytes);
+
+    out << "{\"schemaVersion\":1"
+        << ",\"runtimeVersion\":\"" << escapeJson(mystral::getVersion()) << "\""
+        << ",\"jsEngine\":\"" << escapeJson(mystral::getJSEngine()) << "\""
+        << ",\"webgpuBackend\":\"" << escapeJson(mystral::getWebGPUBackend()) << "\""
+        << ",\"script\":\"" << escapeJson(scriptPath) << "\""
+        << ",\"workload\":" << (workloadJson.empty() ? "null" : workloadJson)
+        << ",\"requestedFrames\":" << requestedFrames
+        << ",\"warmupFrames\":" << warmupFrames
+        << ",\"sampledFrames\":" << report.sampledFrames
+        << ",\"wallTimeMs\":" << report.wallTimeMs
+        << ",\"throughputFps\":" << throughputFps
+        << ",\"phases\":{";
+    out << "\"frame\":";
+    appendProfileStatisticsJson(out, report.frame);
+    out << ",\"events\":";
+    appendProfileStatisticsJson(out, report.events);
+    out << ",\"asyncWork\":";
+    appendProfileStatisticsJson(out, report.asyncWork);
+    out << ",\"callbacks\":";
+    appendProfileStatisticsJson(out, report.callbacks);
+    out << ",\"animationFrame\":";
+    appendProfileStatisticsJson(out, report.animationFrame);
+    out << ",\"cleanup\":";
+    appendProfileStatisticsJson(out, report.cleanup);
+    out << "},\"frameBudgetMisses\":{"
+        << "\"8.33ms\":" << report.framesOver8_33Ms
+        << ",\"16.67ms\":" << report.framesOver16_67Ms
+        << ",\"33.33ms\":" << report.framesOver33_33Ms
+        << "},\"workers\":{"
+        << "\"created\":" << report.workersCreated
+        << ",\"messagesProcessed\":" << report.workerMessagesProcessed
+        << ",\"timerCallbacks\":" << report.workerTimerCallbacks
+        << ",\"messagesRejected\":" << report.workerMessagesRejected
+        << ",\"busyTimeMs\":" << report.workerBusyTimeMs
+        << ",\"inputQueueEndBytes\":" << report.workerInputQueueEndBytes
+        << ",\"outputQueueEndBytes\":" << report.workerOutputQueueEndBytes
+        << ",\"inputQueuePeakBytes\":" << report.workerInputQueuePeakBytes
+        << ",\"outputQueuePeakBytes\":" << report.workerOutputQueuePeakBytes
+        << ",\"sharedMemoryStartBytes\":" << report.sharedMemoryStartBytes
+        << ",\"sharedMemoryEndBytes\":" << report.sharedMemoryEndBytes
+        << "},\"memory\":{\"start\":";
+    appendMemorySnapshotJson(out, report.memoryStart);
+    out << ",\"end\":";
+    appendMemorySnapshotJson(out, report.memoryEnd);
+    out << ",\"heapUsedDeltaBytes\":" << heapDelta << "}}";
+    return out.str();
+}
+
+static void printBenchmarkSummary(
+    const mystral::RuntimeProfileReport& report,
+    int requestedFrames,
+    int warmupFrames) {
+    const double throughputFps = report.wallTimeMs > 0.0
+        ? static_cast<double>(report.sampledFrames) * 1000.0 / report.wallTimeMs
+        : 0.0;
+    const double heapDeltaMiB = (
+        static_cast<double>(report.memoryEnd.heapUsedBytes)
+        - static_cast<double>(report.memoryStart.heapUsedBytes)) / (1024.0 * 1024.0);
+
+    std::cout << "=== Runtime benchmark ===\n"
+              << "Frames: " << report.sampledFrames << "/" << requestedFrames
+              << " measured after " << warmupFrames << " warmup\n"
+              << "Engine: " << mystral::getJSEngine()
+              << " | WebGPU: " << mystral::getWebGPUBackend() << "\n\n"
+              << std::left << std::setw(18) << "Phase"
+              << std::right << std::setw(10) << "mean"
+              << std::setw(10) << "p50"
+              << std::setw(10) << "p95"
+              << std::setw(10) << "p99"
+              << std::setw(10) << "max" << "\n";
+
+    auto printPhase = [](const char* name, const mystral::RuntimeProfileStatistics& stats) {
+        std::cout << std::left << std::setw(18) << name
+                  << std::right << std::fixed << std::setprecision(3)
+                  << std::setw(10) << stats.meanMs
+                  << std::setw(10) << stats.p50Ms
+                  << std::setw(10) << stats.p95Ms
+                  << std::setw(10) << stats.p99Ms
+                  << std::setw(10) << stats.maxMs << "\n";
+    };
+
+    printPhase("frame", report.frame);
+    printPhase("events", report.events);
+    printPhase("async", report.asyncWork);
+    printPhase("callbacks", report.callbacks);
+    printPhase("animationFrame", report.animationFrame);
+    printPhase("cleanup", report.cleanup);
+
+    std::cout << "\nBudget misses: >8.33ms=" << report.framesOver8_33Ms
+              << " >16.67ms=" << report.framesOver16_67Ms
+              << " >33.33ms=" << report.framesOver33_33Ms << "\n"
+              << "Throughput: " << std::fixed << std::setprecision(1) << throughputFps << " frames/s\n"
+              << "Workers: created=" << report.workersCreated
+              << " messages=" << report.workerMessagesProcessed
+              << " timers=" << report.workerTimerCallbacks
+              << " rejected=" << report.workerMessagesRejected
+              << " busy=" << std::setprecision(3) << report.workerBusyTimeMs << " ms"
+              << " queuePeak=" << report.workerInputQueuePeakBytes
+              << "/" << report.workerOutputQueuePeakBytes << " bytes"
+              << " shared=" << report.sharedMemoryEndBytes << " bytes\n"
+              << "Heap delta: " << std::showpos << std::setprecision(3) << heapDeltaMiB
+              << std::noshowpos << " MiB\n";
+}
+
 int runScript(const CLIOptions& opts) {
+    const bool benchmarkMode = opts.benchmarkRequested;
+    if ((benchmarkMode && opts.benchmarkFrames <= 0) || opts.benchmarkWarmupFrames < 0) {
+        std::cerr << "Error: Benchmark frames must be positive and warmup frames non-negative." << std::endl;
+        return 1;
+    }
+    if (!benchmarkMode && !opts.benchmarkOutputPath.empty()) {
+        std::cerr << "Error: --benchmark-output requires --benchmark." << std::endl;
+        return 1;
+    }
+    if (benchmarkMode && (!opts.screenshotPath.empty() || !opts.videoPath.empty())) {
+        std::cerr << "Error: Benchmark mode cannot be combined with screenshot or video capture." << std::endl;
+        return 1;
+    }
+
     // Enable headless mode via environment variable (SDL3 uses this)
     if (opts.headless) {
         #ifdef _WIN32
@@ -1321,6 +1542,11 @@ int runScript(const CLIOptions& opts) {
         if (opts.debugPort > 0) {
             std::cout << "Debug server: port " << opts.debugPort << std::endl;
         }
+        if (benchmarkMode) {
+            std::cout << "Benchmark mode: " << opts.benchmarkFrames
+                      << " measured frames after " << opts.benchmarkWarmupFrames
+                      << " warmup frames" << std::endl;
+        }
         std::cout << std::endl;
     }
 
@@ -1340,16 +1566,107 @@ int runScript(const CLIOptions& opts) {
     config.watch = opts.watch;
     config.debug = debugMode;
 
+    struct DebugLogEntry {
+        uint64_t sequence;
+        std::string type;
+        std::string message;
+    };
+    struct PendingFrameWait {
+        int clientId;
+        int requestId;
+        uint64_t targetFrame;
+        std::chrono::steady_clock::time_point deadline;
+    };
+
+    std::unique_ptr<mystral::debug::DebugServer> debugServer;
+    std::deque<DebugLogEntry> debugLogs;
+    std::vector<PendingFrameWait> pendingFrameWaits;
+    uint64_t nextLogSequence = 1;
+    int quitDelayPolls = -1;
+    constexpr size_t maxDebugLogs = 1000;
+
     auto runtime = mystral::Runtime::create(config);
     if (!runtime) {
         std::cerr << "Error: Failed to create runtime!" << std::endl;
         return 1;
     }
 
+    runtime->setConsoleCallback([&](const std::string& type, const std::string& message) {
+        DebugLogEntry entry{nextLogSequence++, type, message};
+        debugLogs.push_back(entry);
+        if (debugLogs.size() > maxDebugLogs) {
+            debugLogs.pop_front();
+        }
+        if (debugServer && debugServer->isRunning()) {
+            debugServer->broadcastEvent(
+                "console",
+                "{\"sequence\":" + std::to_string(entry.sequence) +
+                ",\"type\":\"" + escapeJson(entry.type) +
+                "\",\"message\":\"" + escapeJson(entry.message) + "\"}");
+        }
+    });
+
     // Load and execute the script
     if (!runtime->loadScript(opts.scriptPath)) {
         std::cerr << "Error: Failed to evaluate script!" << std::endl;
         return 1;
+    }
+
+    if (benchmarkMode) {
+        for (int frame = 0; frame < opts.benchmarkWarmupFrames; frame++) {
+            if (!runtime->pollEvents()) {
+                std::cerr << "Error: Runtime quit during benchmark warmup at frame "
+                          << frame << "." << std::endl;
+                return 1;
+            }
+        }
+
+        runtime->startProfiler(static_cast<uint64_t>(opts.benchmarkFrames));
+        bool quitEarly = false;
+        for (int frame = 0; frame < opts.benchmarkFrames; frame++) {
+            if (!runtime->pollEvents()) {
+                quitEarly = frame + 1 < opts.benchmarkFrames;
+                break;
+            }
+        }
+        const mystral::RuntimeProfileReport report = runtime->stopProfiler();
+        const mystral::EvaluationResult workload = runtime->evaluateExpression(
+            "globalThis.__mystralRuntimeBenchmark ?? null");
+
+        if (!opts.quiet) {
+            printBenchmarkSummary(
+                report,
+                opts.benchmarkFrames,
+                opts.benchmarkWarmupFrames);
+        }
+
+        const std::string json = makeBenchmarkJson(
+            report,
+            opts.benchmarkFrames,
+            opts.benchmarkWarmupFrames,
+            opts.scriptPath,
+            workload.success ? workload.valueJson : "");
+        if (!opts.benchmarkOutputPath.empty()) {
+            std::ofstream output(opts.benchmarkOutputPath, std::ios::trunc);
+            if (!output.is_open()) {
+                std::cerr << "Error: Cannot write benchmark report: "
+                          << opts.benchmarkOutputPath << std::endl;
+                return 1;
+            }
+            output << json << "\n";
+            if (!opts.quiet) {
+                std::cout << "Report: " << opts.benchmarkOutputPath << std::endl;
+            }
+        } else if (opts.quiet) {
+            std::cout << json << std::endl;
+        }
+
+        if (quitEarly || report.sampledFrames != static_cast<uint64_t>(opts.benchmarkFrames)) {
+            std::cerr << "Error: Benchmark ended after " << report.sampledFrames
+                      << " of " << opts.benchmarkFrames << " measured frames." << std::endl;
+            return 1;
+        }
+        return runtime->getExitCode();
     }
 
     if (screenshotMode) {
@@ -1660,8 +1977,6 @@ int runScript(const CLIOptions& opts) {
     } else {
         // Normal mode: run main loop until quit
         // If debug server is enabled, we need to use a manual loop
-        std::unique_ptr<mystral::debug::DebugServer> debugServer;
-        int frameCount = 0;
 
         if (opts.debugPort > 0) {
             debugServer = std::make_unique<mystral::debug::DebugServer>(opts.debugPort);
@@ -1670,10 +1985,49 @@ int runScript(const CLIOptions& opts) {
                 debugServer.reset();
             } else {
                 // Set up command handler
-                debugServer->setCommandHandler([&](const std::string& method, const std::string& params) -> std::string {
+                debugServer->setCommandHandler([&](int clientId, int requestId, const std::string& method, const std::string& params) -> std::string {
+                    auto fail = [&](const std::string& message) {
+                        debugServer->sendError(clientId, requestId, message);
+                        return std::string{};
+                    };
+
+                    if (method == "hello" || method == "getCapabilities") {
+                        return "{\"protocolVersion\":1,\"runtimeVersion\":\"" +
+                            std::string(mystral::getVersion()) +
+                            "\",\"agentBridgeVersion\":1,\"methods\":[\"screenshot\",\"keyboard\",\"mouse\",\"gamepad\","
+                            "\"getFrameCount\",\"evaluate\",\"getLogs\",\"waitForFrame\",\"pause\",\"resume\",\"stepFrames\",\"quit\","
+                            "\"agent.list\",\"agent.inspect\",\"agent.act\"]}";
+                    }
+
                     // Handle getFrameCount
                     if (method == "getFrameCount") {
-                        return "{\"frame\":" + std::to_string(frameCount) + "}";
+                        return "{\"frame\":" + std::to_string(runtime->getFrameCount()) +
+                            ",\"paused\":" + (runtime->isPaused() ? "true" : "false") + "}";
+                    }
+
+                    if (method == "pause") {
+                        runtime->setPaused(true);
+                        return "{\"frame\":" + std::to_string(runtime->getFrameCount()) + ",\"paused\":true}";
+                    }
+
+                    if (method == "resume") {
+                        runtime->setPaused(false);
+                        return "{\"frame\":" + std::to_string(runtime->getFrameCount()) + ",\"paused\":false}";
+                    }
+
+                    if (method == "quit") {
+                        quitDelayPolls = 2;
+                        return "{\"quitting\":true}";
+                    }
+
+                    if (method == "stepFrames") {
+                        int count = static_cast<int>(extractJsonNumber(params, "count", 1));
+                        if (count < 1) {
+                            return fail("count must be at least 1");
+                        }
+                        uint64_t targetFrame = runtime->getFrameCount() + static_cast<uint64_t>(count);
+                        runtime->stepFrames(static_cast<uint32_t>(count));
+                        return "{\"targetFrame\":" + std::to_string(targetFrame) + ",\"paused\":true}";
                     }
 
                     // Handle screenshot
@@ -1688,9 +2042,9 @@ int runScript(const CLIOptions& opts) {
                                 std::string base64 = base64Encode(pngData.data(), pngData.size());
                                 return "{\"data\":\"" + base64 + "\",\"width\":" + std::to_string(width) + ",\"height\":" + std::to_string(height) + "}";
                             }
-                            return "{\"error\":\"Failed to encode PNG\"}";
+                            return fail("Failed to encode PNG");
                         }
-                        return "{\"error\":\"Failed to capture frame\"}";
+                        return fail("Failed to capture frame");
                     }
 
                     // Handle keyboard.press, keyboard.down, keyboard.up, keyboard.type
@@ -1701,7 +2055,7 @@ int runScript(const CLIOptions& opts) {
                         if (subMethod == "press") {
                             SDL_Scancode scancode = keyNameToScancode(keyName);
                             if (scancode == SDL_SCANCODE_UNKNOWN) {
-                                return "{\"error\":\"Unknown key: " + keyName + "\"}";
+                                return fail("Unknown key: " + keyName);
                             }
                             injectKeyboardEvent(scancode, true);
                             injectKeyboardEvent(scancode, false);
@@ -1710,7 +2064,7 @@ int runScript(const CLIOptions& opts) {
                         if (subMethod == "down") {
                             SDL_Scancode scancode = keyNameToScancode(keyName);
                             if (scancode == SDL_SCANCODE_UNKNOWN) {
-                                return "{\"error\":\"Unknown key: " + keyName + "\"}";
+                                return fail("Unknown key: " + keyName);
                             }
                             injectKeyboardEvent(scancode, true);
                             return "{}";
@@ -1718,7 +2072,7 @@ int runScript(const CLIOptions& opts) {
                         if (subMethod == "up") {
                             SDL_Scancode scancode = keyNameToScancode(keyName);
                             if (scancode == SDL_SCANCODE_UNKNOWN) {
-                                return "{\"error\":\"Unknown key: " + keyName + "\"}";
+                                return fail("Unknown key: " + keyName);
                             }
                             injectKeyboardEvent(scancode, false);
                             return "{}";
@@ -1735,7 +2089,7 @@ int runScript(const CLIOptions& opts) {
                             }
                             return "{}";
                         }
-                        return "{\"error\":\"Unknown keyboard method: " + subMethod + "\"}";
+                        return fail("Unknown keyboard method: " + subMethod);
                     }
 
                     // Handle mouse.move, mouse.click, mouse.down, mouse.up
@@ -1765,7 +2119,7 @@ int runScript(const CLIOptions& opts) {
                             injectMouseButton(x, y, button, false);
                             return "{}";
                         }
-                        return "{\"error\":\"Unknown mouse method: " + subMethod + "\"}";
+                        return fail("Unknown mouse method: " + subMethod);
                     }
 
                     // Handle gamepad.press, gamepad.axis
@@ -1793,7 +2147,7 @@ int runScript(const CLIOptions& opts) {
                             else if (buttonStr == "DPadRight") button = SDL_GAMEPAD_BUTTON_DPAD_RIGHT;
 
                             if (button == SDL_GAMEPAD_BUTTON_INVALID) {
-                                return "{\"error\":\"Unknown gamepad button: " + buttonStr + "\"}";
+                                return fail("Unknown gamepad button: " + buttonStr);
                             }
 
                             // Inject button press and release
@@ -1825,7 +2179,7 @@ int runScript(const CLIOptions& opts) {
                             }
 
                             if (axisX == SDL_GAMEPAD_AXIS_INVALID) {
-                                return "{\"error\":\"Unknown gamepad axis: " + axisStr + "\"}";
+                                return fail("Unknown gamepad axis: " + axisStr);
                             }
 
                             // Inject axis events (values are -32768 to 32767)
@@ -1841,23 +2195,71 @@ int runScript(const CLIOptions& opts) {
                             SDL_PushEvent(&event);
                             return "{}";
                         }
-                        return "{\"error\":\"Unknown gamepad method: " + subMethod + "\"}";
+                        return fail("Unknown gamepad method: " + subMethod);
                     }
 
                     // Handle waitForFrame - returns empty to signal async handling
                     if (method == "waitForFrame") {
-                        // This would need to be handled asynchronously
-                        // For now, immediately return current frame
-                        return "{\"frame\":" + std::to_string(frameCount) + "}";
+                        double absoluteFrame = extractJsonNumber(params, "frame", -1);
+                        int count = static_cast<int>(extractJsonNumber(params, "count", 1));
+                        int timeoutMs = static_cast<int>(extractJsonNumber(params, "timeoutMs", 5000));
+                        uint64_t currentFrame = runtime->getFrameCount();
+                        uint64_t targetFrame = absoluteFrame >= 0
+                            ? static_cast<uint64_t>(absoluteFrame)
+                            : currentFrame + static_cast<uint64_t>(count > 0 ? count : 0);
+                        if (targetFrame <= currentFrame) {
+                            return "{\"frame\":" + std::to_string(currentFrame) + "}";
+                        }
+                        pendingFrameWaits.push_back({
+                            clientId,
+                            requestId,
+                            targetFrame,
+                            std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs > 0 ? timeoutMs : 1)
+                        });
+                        return "";
                     }
 
                     // Handle evaluate - execute JS in the runtime
                     if (method == "evaluate") {
-                        // Would need to call runtime->evaluate() if available
-                        return "{\"error\":\"evaluate not yet implemented\"}";
+                        std::string expression = extractJsonString(params, "expression");
+                        if (params.find("\"expression\"") == std::string::npos) {
+                            return fail("Missing expression");
+                        }
+                        mystral::EvaluationResult evaluation = runtime->evaluateExpression(expression);
+                        if (!evaluation.success) {
+                            return fail(evaluation.error);
+                        }
+                        return evaluation.valueJson;
                     }
 
-                    return "{\"error\":\"Unknown method: " + method + "\"}";
+                    if (method == "getLogs") {
+                        double sinceValue = extractJsonNumber(params, "since", 0);
+                        uint64_t since = static_cast<uint64_t>(sinceValue > 0 ? sinceValue : 0);
+                        std::string result = "{\"entries\":[";
+                        bool first = true;
+                        for (const auto& entry : debugLogs) {
+                            if (entry.sequence <= since) continue;
+                            if (!first) result += ",";
+                            first = false;
+                            result += "{\"sequence\":" + std::to_string(entry.sequence) +
+                                ",\"type\":\"" + escapeJson(entry.type) +
+                                "\",\"message\":\"" + escapeJson(entry.message) + "\"}";
+                        }
+                        result += "]}";
+                        return result;
+                    }
+
+                    if (method.rfind("agent.", 0) == 0) {
+                        mystral::EvaluationResult result = runtime->dispatchAgentCommand(
+                            method.substr(6),
+                            params.empty() ? "{}" : params);
+                        if (!result.success) {
+                            return fail(result.error);
+                        }
+                        return result.valueJson;
+                    }
+
+                    return fail("Unknown method: " + method);
                 });
 
                 if (!opts.quiet) {
@@ -1868,12 +2270,35 @@ int runScript(const CLIOptions& opts) {
 
         if (debugServer) {
             // Manual loop with debug server
+            uint64_t lastBroadcastFrame = runtime->getFrameCount();
             while (runtime->pollEvents()) {
-                frameCount++;
+                uint64_t currentFrame = runtime->getFrameCount();
 
                 // Broadcast frameRendered event to connected clients
-                if (debugServer->getClientCount() > 0) {
-                    debugServer->broadcastEvent("frameRendered", "{\"frame\":" + std::to_string(frameCount) + "}");
+                if (currentFrame != lastBroadcastFrame && debugServer->getClientCount() > 0) {
+                    debugServer->broadcastEvent("frameRendered", "{\"frame\":" + std::to_string(currentFrame) + "}");
+                }
+                lastBroadcastFrame = currentFrame;
+
+                auto now = std::chrono::steady_clock::now();
+                for (auto it = pendingFrameWaits.begin(); it != pendingFrameWaits.end();) {
+                    if (currentFrame >= it->targetFrame) {
+                        debugServer->sendResponse(
+                            it->clientId,
+                            it->requestId,
+                            "{\"frame\":" + std::to_string(currentFrame) + "}");
+                        it = pendingFrameWaits.erase(it);
+                    } else if (now >= it->deadline) {
+                        debugServer->sendError(it->clientId, it->requestId, "waitForFrame timed out");
+                        it = pendingFrameWaits.erase(it);
+                    } else {
+                        ++it;
+                    }
+                }
+
+                if (quitDelayPolls >= 0 && --quitDelayPolls <= 0) {
+                    runtime->quit();
+                    break;
                 }
 
                 // Small delay to prevent CPU spin

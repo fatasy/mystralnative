@@ -82,7 +82,7 @@ SUPPORTED IMPORTS:
 
 NOTE:
     The bundled output is plain JavaScript that runs in the Mystral
-    native runtime's JavaScript engine (QuickJS/JSC/V8).
+    native runtime's JavaScript engine (QuickJS/V8).
 `);
 }
 
@@ -106,7 +106,7 @@ async function main() {
     // Bundle using Bun's built-in bundler
     const result = await Bun.build({
       entrypoints: [options.entry],
-      target: "browser", // Closest to our QuickJS/JSC environment
+      target: "browser", // Closest to our QuickJS/V8 environment
       format: "esm",
       minify: options.minify,
       sourcemap: options.sourcemap ? "inline" : "none",

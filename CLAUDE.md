@@ -183,7 +183,7 @@ git tag v0.1.0
 git push origin v0.1.0
 ```
 
-This triggers `release.yml` which builds all platform/engine/backend combinations (macOS, Linux, Windows x V8, QuickJS, JSC x Dawn, wgpu) and creates a GitHub Release with download artifacts.
+This triggers `release.yml` which builds the supported platform/engine/backend combinations (macOS, Linux, Windows x V8, QuickJS x Dawn, wgpu) and creates a GitHub Release with download artifacts.
 
 Tags containing `alpha`, `beta`, or `rc` are marked as prerelease.
 

@@ -1,392 +1,570 @@
-/**
- * WorkerThread Implementation
- *
- * Runs JavaScript code in a separate thread with its own JS engine.
- * Communicates with the main thread via thread-safe message queues.
- */
-
 #include "mystral/workers/worker_thread.h"
-#include "mystral/js/engine.h"
-#include <iostream>
+
+#include "mystral/js/module_system.h"
+
+#include <algorithm>
 #include <chrono>
+#include <cmath>
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <limits>
+#include <sstream>
+#include <utility>
 
-namespace mystral {
-namespace workers {
+namespace mystral::workers {
 
-// Global pointer used by worker's native functions to access the engine
-// Thread-local to support multiple workers
-thread_local js::Engine* g_workerEngine = nullptr;
-thread_local WorkerThread* g_workerThread = nullptr;
+namespace {
 
-WorkerThread::WorkerThread(int id, const std::string& code)
-    : id_(id)
-    , code_(code)
-{
+thread_local js::Engine* currentWorkerEngine = nullptr;
+thread_local WorkerThread* currentWorker = nullptr;
+
+size_t transferBytes(const std::vector<js::TransferredArrayBuffer>& transfers) {
+    size_t total = 0;
+    for (const auto& transfer : transfers) total += transfer.size;
+    return total;
 }
+
+size_t messageBytes(const std::string& payload,
+                    const std::vector<js::TransferredArrayBuffer>& transfers) {
+    return payload.size() + transferBytes(transfers);
+}
+
+bool takeTransferList(js::Engine* engine,
+                      js::JSValueHandle value,
+                      std::vector<js::TransferredArrayBuffer>& result) {
+    if (!value.ptr || engine->isUndefined(value) || engine->isNull(value)) return true;
+    if (!engine->isArray(value)) return false;
+    const auto lengthValue = engine->getProperty(value, "length");
+    const auto length = static_cast<uint32_t>(engine->toNumber(lengthValue));
+    result.reserve(length);
+    for (uint32_t index = 0; index < length; index++) {
+        auto item = engine->getPropertyIndex(value, index);
+        js::TransferredArrayBuffer transferred;
+        if (!engine->transferArrayBuffer(item, transferred)) return false;
+        result.push_back(std::move(transferred));
+    }
+    return true;
+}
+
+std::string readTextFile(const std::string& rootDir, const std::string& requestedPath) {
+    std::string normalized = requestedPath;
+    if (normalized.rfind("file://", 0) == 0) normalized.erase(0, 7);
+    std::filesystem::path path(normalized);
+    if (!path.is_absolute()) path = std::filesystem::path(rootDir) / path;
+    path = std::filesystem::absolute(path).lexically_normal();
+
+    std::ifstream file(path, std::ios::binary);
+    if (!file.is_open()) return {};
+    std::ostringstream stream;
+    stream << file.rdbuf();
+    return stream.str();
+}
+
+}  // namespace
+
+WorkerThread::WorkerThread(int id,
+                           js::EngineType engineType,
+                           WorkerSourceKind sourceKind,
+                           std::string source,
+                           std::string rootDir,
+                           std::string name,
+                           std::shared_ptr<SharedBufferRegistry> sharedBuffers,
+                           WorkerQueueLimits queueLimits)
+    : id_(id)
+    , engineType_(engineType)
+    , sourceKind_(sourceKind)
+    , source_(std::move(source))
+    , rootDir_(std::move(rootDir))
+    , name_(std::move(name))
+    , sharedBuffers_(std::move(sharedBuffers))
+    , queueLimits_(queueLimits) {}
 
 WorkerThread::~WorkerThread() {
     terminate();
-    if (thread_ && thread_->joinable()) {
-        thread_->join();
-    }
 }
 
 void WorkerThread::start() {
-    if (running_.load()) {
-        return;
+    WorkerState expected = WorkerState::Created;
+    if (!state_.compare_exchange_strong(expected, WorkerState::Starting)) return;
+    terminated_ = false;
+    try {
+        thread_ = std::thread(&WorkerThread::threadMain, this);
+    } catch (const std::exception& error) {
+        state_ = WorkerState::Failed;
+        enqueueOutput(WorkerMessage::Type::Error, error.what());
+        enqueueOutput(WorkerMessage::Type::Exited, {});
     }
-
-    running_ = true;
-    thread_ = std::make_unique<std::thread>(&WorkerThread::threadMain, this);
 }
 
-void WorkerThread::postMessage(std::vector<uint8_t> data,
-                               std::vector<std::shared_ptr<ArrayBufferData>> transfers) {
-    if (terminated_.load()) {
-        return;
+WorkerPostStatus WorkerThread::postMessage(
+    std::string payload,
+    std::vector<js::TransferredArrayBuffer> transfers) {
+    const WorkerState currentState = state_.load();
+    if (terminated_.load() || (currentState != WorkerState::Starting && currentState != WorkerState::Running)) {
+        return WorkerPostStatus::NotRunning;
     }
-
-    WorkerMessage msg;
-    msg.type = WorkerMessage::Type::MESSAGE;
-    msg.payload = std::move(data);
-    msg.transfers = std::move(transfers);
-
+    const size_t byteSize = messageBytes(payload, transfers);
+    if (byteSize > queueLimits_.maxBytes) {
+        rejectedInputMessages_.fetch_add(1);
+        return WorkerPostStatus::MessageTooLarge;
+    }
     {
-        std::lock_guard<std::mutex> lock(inMutex_);
-        inQueue_.push(std::move(msg));
+        std::lock_guard<std::mutex> lock(inputMutex_);
+        const WorkerState lockedState = state_.load();
+        if (terminated_.load() ||
+            (lockedState != WorkerState::Starting && lockedState != WorkerState::Running)) {
+            return WorkerPostStatus::NotRunning;
+        }
+        if (inputQueue_.size() >= queueLimits_.maxMessages ||
+            byteSize > queueLimits_.maxBytes - inputQueuedBytes_) {
+            rejectedInputMessages_.fetch_add(1);
+            return WorkerPostStatus::QueueFull;
+        }
+        inputQueuedBytes_ += byteSize;
+        inputQueue_.push({std::move(payload), std::move(transfers)});
+        peakInputQueuedBytes_ = std::max(peakInputQueuedBytes_, inputQueuedBytes_);
     }
-    inCondition_.notify_one();
+    inputCondition_.notify_one();
+    return WorkerPostStatus::Posted;
 }
 
 void WorkerThread::terminate() {
-    if (terminated_.exchange(true)) {
-        return;  // Already terminated
-    }
-
-    // Send termination message
+    terminated_ = true;
+    WorkerState currentState = state_.load();
+    while (currentState != WorkerState::Stopped && currentState != WorkerState::Failed &&
+           !state_.compare_exchange_weak(currentState, WorkerState::Stopping)) {}
     {
-        std::lock_guard<std::mutex> lock(inMutex_);
-        WorkerMessage msg;
-        msg.type = WorkerMessage::Type::TERMINATE;
-        inQueue_.push(std::move(msg));
+        std::lock_guard<std::mutex> lock(engineMutex_);
+        if (engine_) engine_->requestTermination();
     }
-    inCondition_.notify_one();
-
-    // Wait for thread to finish
-    if (thread_ && thread_->joinable()) {
-        thread_->join();
+    inputCondition_.notify_all();
+    if (thread_.joinable() && thread_.get_id() != std::this_thread::get_id()) {
+        thread_.join();
     }
-
-    running_ = false;
+    if (state_.load() != WorkerState::Failed) state_ = WorkerState::Stopped;
 }
 
-bool WorkerThread::hasMessages() const {
-    std::lock_guard<std::mutex> lock(outMutex_);
-    return !outQueue_.empty();
+bool WorkerThread::isFinished() const {
+    const WorkerState currentState = state_.load();
+    return currentState == WorkerState::Stopped || currentState == WorkerState::Failed;
 }
 
-WorkerMessage WorkerThread::popMessage() {
-    std::lock_guard<std::mutex> lock(outMutex_);
-    if (outQueue_.empty()) {
-        return WorkerMessage{};
+WorkerThreadStats WorkerThread::stats() const {
+    WorkerThreadStats result;
+    result.state = state_.load();
+    result.processedMessages = processedMessages_.load();
+    result.processedTimerCallbacks = processedTimerCallbacks_.load();
+    result.busyNanoseconds = busyNanoseconds_.load();
+    result.rejectedInputMessages = rejectedInputMessages_.load();
+    result.rejectedOutputMessages = rejectedOutputMessages_.load();
+    {
+        std::lock_guard<std::mutex> lock(inputMutex_);
+        result.queuedInputMessages = inputQueue_.size();
+        result.queuedInputBytes = inputQueuedBytes_;
+        result.peakQueuedInputBytes = peakInputQueuedBytes_;
     }
-    WorkerMessage msg = std::move(outQueue_.front());
-    outQueue_.pop();
-    return msg;
+    {
+        std::lock_guard<std::mutex> lock(outputMutex_);
+        result.queuedOutputMessages = outputQueue_.size();
+        result.queuedOutputBytes = outputQueuedBytes_;
+        result.peakQueuedOutputBytes = peakOutputQueuedBytes_;
+    }
+    return result;
 }
 
-void WorkerThread::setupWorkerGlobals(void* enginePtr) {
-    auto* engine = static_cast<js::Engine*>(enginePtr);
+std::vector<WorkerMessage> WorkerThread::drainMessages() {
+    std::vector<WorkerMessage> messages;
+    std::lock_guard<std::mutex> lock(outputMutex_);
+    messages.reserve(outputQueue_.size());
+    while (!outputQueue_.empty()) {
+        outputQueuedBytes_ -= messageBytes(
+            outputQueue_.front().payload, outputQueue_.front().transfers);
+        messages.push_back(std::move(outputQueue_.front()));
+        outputQueue_.pop();
+    }
+    return messages;
+}
 
-    // __workerPostMessage(jsonString, transfers) - Send message to main thread
+WorkerPostStatus WorkerThread::enqueueOutput(
+    WorkerMessage::Type type,
+    std::string payload,
+    std::vector<js::TransferredArrayBuffer> transfers) {
+    std::lock_guard<std::mutex> lock(outputMutex_);
+    const size_t byteSize = messageBytes(payload, transfers);
+    if (type != WorkerMessage::Type::Ready && type != WorkerMessage::Type::Exited) {
+        if (byteSize > queueLimits_.maxBytes) {
+            rejectedOutputMessages_.fetch_add(1);
+            return WorkerPostStatus::MessageTooLarge;
+        }
+        if (outputQueue_.size() >= queueLimits_.maxMessages ||
+            outputQueuedBytes_ > queueLimits_.maxBytes ||
+            byteSize > queueLimits_.maxBytes - outputQueuedBytes_) {
+            rejectedOutputMessages_.fetch_add(1);
+            return WorkerPostStatus::QueueFull;
+        }
+    }
+    outputQueuedBytes_ += byteSize;
+    outputQueue_.push({type, std::move(payload), std::move(transfers)});
+    peakOutputQueuedBytes_ = std::max(peakOutputQueuedBytes_, outputQueuedBytes_);
+    return WorkerPostStatus::Posted;
+}
+
+void WorkerThread::finishThread(js::Engine* engine, WorkerState finalState) {
+    {
+        std::lock_guard<std::mutex> lock(engineMutex_);
+        if (engine_ == engine) engine_ = nullptr;
+    }
+    enqueueOutput(WorkerMessage::Type::Exited, {});
+    state_ = finalState;
+}
+
+int WorkerThread::scheduleTimer(double delayMs, bool repeat) {
+    if (!std::isfinite(delayMs) || delayMs < 0.0) delayMs = 0.0;
+    const auto interval = std::chrono::milliseconds(
+        static_cast<int64_t>(std::min(delayMs, static_cast<double>(std::numeric_limits<int32_t>::max()))));
+    const auto effectiveDelay = repeat && interval.count() == 0
+        ? std::chrono::milliseconds(1)
+        : interval;
+    const int id = nextTimerId_++;
+    timers_[id] = {std::chrono::steady_clock::now() + effectiveDelay, effectiveDelay, repeat};
+    return id;
+}
+
+void WorkerThread::cancelTimer(int id) {
+    timers_.erase(id);
+}
+
+std::vector<int> WorkerThread::collectDueTimers() {
+    const auto now = std::chrono::steady_clock::now();
+    std::vector<std::pair<std::chrono::steady_clock::time_point, int>> due;
+    for (const auto& [id, timer] : timers_) {
+        if (timer.due <= now) due.emplace_back(timer.due, id);
+    }
+    std::sort(due.begin(), due.end(), [](const auto& left, const auto& right) {
+        return left.first == right.first ? left.second < right.second : left.first < right.first;
+    });
+
+    std::vector<int> result;
+    result.reserve(due.size());
+    for (const auto& [_, id] : due) {
+        auto it = timers_.find(id);
+        if (it == timers_.end()) continue;
+        result.push_back(id);
+        if (it->second.repeat) {
+            const auto interval = std::max(it->second.interval, std::chrono::milliseconds(1));
+            do {
+                it->second.due += interval;
+            } while (it->second.due <= now);
+        } else {
+            timers_.erase(it);
+        }
+    }
+    return result;
+}
+
+bool WorkerThread::dispatchTimer(js::Engine* engine, int id) {
+    const auto startedAt = std::chrono::steady_clock::now();
+    engine->beginFrame();
+    auto dispatch = engine->getGlobalProperty("__mystralWorkerDispatchTimer");
+    auto result = engine->call(dispatch, engine->newUndefined(), {engine->newNumber(id)});
+    (void)result;
+    bool succeeded = true;
+    if (engine->hasException()) {
+        const std::string error = engine->getException();
+        if (!terminated_.load()) enqueueOutput(WorkerMessage::Type::Error, error);
+        succeeded = false;
+    }
+    busyNanoseconds_.fetch_add(static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - startedAt).count()));
+    processedTimerCallbacks_.fetch_add(1);
+    engine->clearFrameHandles();
+    return succeeded;
+}
+
+bool WorkerThread::dispatchMessage(js::Engine* engine, const WorkerPayload& message) {
+    const auto startedAt = std::chrono::steady_clock::now();
+    engine->beginFrame();
+    auto dispatch = engine->getGlobalProperty("__mystralWorkerDispatch");
+    auto payload = engine->newString(message.serialized.c_str());
+    auto transferred = engine->newArray(message.transfers.size());
+    for (uint32_t index = 0; index < message.transfers.size(); index++) {
+        engine->setPropertyIndex(
+            transferred, index, engine->newTransferredArrayBuffer(message.transfers[index]));
+    }
+    auto result = engine->call(dispatch, engine->newUndefined(), {payload, transferred});
+    (void)result;
+    bool succeeded = true;
+    if (engine->hasException()) {
+        const std::string error = engine->getException();
+        if (!terminated_.load()) enqueueOutput(WorkerMessage::Type::Error, error);
+        succeeded = false;
+    }
+    busyNanoseconds_.fetch_add(static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - startedAt).count()));
+    processedMessages_.fetch_add(1);
+    engine->clearFrameHandles();
+    return succeeded;
+}
+
+bool WorkerThread::setupWorkerGlobals(js::Engine* engine) {
+    installSharedBufferBindings(engine, sharedBuffers_);
+    if (!engine->evalScript(sharedApiSource(), "mystral-shared.js")) return false;
+
     engine->setGlobalProperty("__workerPostMessage",
         engine->newFunction("__workerPostMessage",
-            [](void* ctx, const std::vector<js::JSValueHandle>& args) {
-                if (!g_workerEngine || !g_workerThread) {
-                    return g_workerEngine->newUndefined();
+            [](void*, const std::vector<js::JSValueHandle>& args) {
+                if (!currentWorkerEngine || !currentWorker) return js::JSValueHandle{};
+                if (!args.empty()) {
+                    std::vector<js::TransferredArrayBuffer> transfers;
+                    if (args.size() > 1 &&
+                        !takeTransferList(currentWorkerEngine, args[1], transfers)) {
+                        currentWorkerEngine->throwException("Worker transfer list contains an invalid ArrayBuffer");
+                        return currentWorkerEngine->newUndefined();
+                    }
+                    const auto status = currentWorker->enqueueOutput(
+                        WorkerMessage::Type::Message,
+                        currentWorkerEngine->toString(args[0]),
+                        std::move(transfers));
+                    if (status == WorkerPostStatus::QueueFull) {
+                        currentWorkerEngine->throwException("Worker output queue is full");
+                    } else if (status == WorkerPostStatus::MessageTooLarge) {
+                        currentWorkerEngine->throwException("Worker message exceeds the output queue byte limit");
+                    }
                 }
+                return currentWorkerEngine->newUndefined();
+            }));
 
-                if (args.empty()) {
-                    return g_workerEngine->newUndefined();
-                }
-
-                // Get JSON string payload
-                std::string json = g_workerEngine->toString(args[0]);
-
-                WorkerMessage msg;
-                msg.type = WorkerMessage::Type::MESSAGE;
-                msg.payload = std::vector<uint8_t>(json.begin(), json.end());
-
-                // Handle transfers (ArrayBuffers)
-                if (args.size() > 1 && g_workerEngine->isArray(args[1])) {
-                    // TODO: Extract ArrayBuffers and mark as transferred
-                }
-
-                // Queue message for main thread
-                {
-                    std::lock_guard<std::mutex> lock(g_workerThread->outMutex_);
-                    g_workerThread->outQueue_.push(std::move(msg));
-                }
-
-                return g_workerEngine->newUndefined();
-            }
-        )
-    );
-
-    // __workerClose() - Self-terminate the worker
     engine->setGlobalProperty("__workerClose",
         engine->newFunction("__workerClose",
-            [](void* ctx, const std::vector<js::JSValueHandle>& args) {
-                if (g_workerThread) {
-                    g_workerThread->terminated_ = true;
-                }
-                return g_workerEngine->newUndefined();
-            }
-        )
-    );
+            [](void*, const std::vector<js::JSValueHandle>&) {
+                if (!currentWorkerEngine || !currentWorker) return js::JSValueHandle{};
+                currentWorker->terminated_ = true;
+                currentWorker->state_ = WorkerState::Stopping;
+                currentWorker->inputCondition_.notify_all();
+                return currentWorkerEngine->newUndefined();
+            }));
 
-    // __workerHasMessage() - Check if there's a message in the queue
-    engine->setGlobalProperty("__workerHasMessage",
-        engine->newFunction("__workerHasMessage",
-            [](void* ctx, const std::vector<js::JSValueHandle>& args) {
-                if (!g_workerThread) {
-                    return g_workerEngine->newBoolean(false);
-                }
-                std::lock_guard<std::mutex> lock(g_workerThread->inMutex_);
-                return g_workerEngine->newBoolean(!g_workerThread->inQueue_.empty());
-            }
-        )
-    );
+    engine->setGlobalProperty("__workerSetTimer",
+        engine->newFunction("__workerSetTimer",
+            [](void*, const std::vector<js::JSValueHandle>& args) {
+                if (!currentWorkerEngine || !currentWorker) return js::JSValueHandle{};
+                const double delay = args.empty() ? 0.0 : currentWorkerEngine->toNumber(args[0]);
+                const bool repeat = args.size() > 1 && currentWorkerEngine->toBoolean(args[1]);
+                return currentWorkerEngine->newNumber(currentWorker->scheduleTimer(delay, repeat));
+            }));
 
-    // __workerGetMessage() - Get the next message from the queue (blocking or non-blocking)
-    engine->setGlobalProperty("__workerGetMessage",
-        engine->newFunction("__workerGetMessage",
-            [](void* ctx, const std::vector<js::JSValueHandle>& args) {
-                if (!g_workerThread || !g_workerEngine) {
-                    return g_workerEngine->newNull();
-                }
+    engine->setGlobalProperty("__workerClearTimer",
+        engine->newFunction("__workerClearTimer",
+            [](void*, const std::vector<js::JSValueHandle>& args) {
+                if (!currentWorkerEngine || !currentWorker) return js::JSValueHandle{};
+                if (!args.empty()) currentWorker->cancelTimer(
+                    static_cast<int>(currentWorkerEngine->toNumber(args[0])));
+                return currentWorkerEngine->newUndefined();
+            }));
 
-                bool blocking = true;
-                if (!args.empty()) {
-                    blocking = g_workerEngine->toBoolean(args[0]);
-                }
+    engine->setGlobalProperty("__workerReadText",
+        engine->newFunction("__workerReadText",
+            [this, engine](void*, const std::vector<js::JSValueHandle>& args) {
+                if (args.empty()) return engine->newNull();
+                auto source = readTextFile(rootDir_, engine->toString(args[0]));
+                return source.empty() ? engine->newNull() : engine->newString(source.c_str());
+            }));
 
-                WorkerMessage msg;
-                {
-                    std::unique_lock<std::mutex> lock(g_workerThread->inMutex_);
-
-                    if (blocking) {
-                        // Wait for a message with timeout (100ms)
-                        g_workerThread->inCondition_.wait_for(lock,
-                            std::chrono::milliseconds(100),
-                            [&]() {
-                                return !g_workerThread->inQueue_.empty() ||
-                                       g_workerThread->terminated_.load();
-                            }
-                        );
-                    }
-
-                    if (g_workerThread->inQueue_.empty()) {
-                        return g_workerEngine->newNull();
-                    }
-
-                    msg = std::move(g_workerThread->inQueue_.front());
-                    g_workerThread->inQueue_.pop();
-                }
-
-                // Create result object
-                auto result = g_workerEngine->newObject();
-                g_workerEngine->setProperty(result, "type",
-                    g_workerEngine->newNumber(static_cast<int>(msg.type)));
-
-                if (!msg.payload.empty()) {
-                    std::string json(msg.payload.begin(), msg.payload.end());
-                    g_workerEngine->setProperty(result, "data",
-                        g_workerEngine->newString(json.c_str()));
-                }
-
-                // TODO: Handle transferred ArrayBuffers
-
-                return result;
-            }
-        )
-    );
-
-    // Worker global scope setup (JavaScript)
-    const char* workerGlobalCode = R"(
-// Worker global scope - make self a global reference to globalThis
+    return engine->evalScript(R"JS(
 globalThis.self = globalThis;
-
-// Private state (using closure via IIFE to hide internals)
 (function() {
-    let _onmessage = null;
-    let _onerror = null;
+    let messageHandler = null;
+    let errorHandler = null;
+    const messageListeners = [];
+    const errorListeners = [];
+    const timerCallbacks = new Map();
 
-    // onmessage property on globalThis (accessible as self.onmessage)
+    function dispatchError(error) {
+        const errorEvent = { error, message: error && error.message ? error.message : String(error), target: globalThis };
+        if (errorHandler) errorHandler.call(globalThis, errorEvent);
+        for (const listener of errorListeners.slice()) listener.call(globalThis, errorEvent);
+    }
+
     Object.defineProperty(globalThis, 'onmessage', {
-        get: () => _onmessage,
-        set: (fn) => {
-            _onmessage = fn;
-        },
-        configurable: true
+        get: () => messageHandler,
+        set: value => { messageHandler = typeof value === 'function' ? value : null; },
+        configurable: true,
     });
-
-    // onerror property
     Object.defineProperty(globalThis, 'onerror', {
-        get: () => _onerror,
-        set: (fn) => { _onerror = fn; },
-        configurable: true
+        get: () => errorHandler,
+        set: value => { errorHandler = typeof value === 'function' ? value : null; },
+        configurable: true,
     });
 
-    // postMessage function
-    globalThis.postMessage = function(data, transfer) {
-        transfer = transfer || [];
-        const json = JSON.stringify(data);
-        __workerPostMessage(json, transfer);
+    globalThis.addEventListener = function(type, handler) {
+        if (typeof handler !== 'function') return;
+        if (type === 'message') messageListeners.push(handler);
+        else if (type === 'error') errorListeners.push(handler);
     };
-
-    // close function
-    globalThis.close = function() {
-        __workerClose();
+    globalThis.removeEventListener = function(type, handler) {
+        const listeners = type === 'message' ? messageListeners : type === 'error' ? errorListeners : null;
+        if (!listeners) return;
+        const index = listeners.indexOf(handler);
+        if (index >= 0) listeners.splice(index, 1);
     };
-
-    // Internal: Process incoming messages
-    globalThis.__processMessages = function() {
-        while (true) {
-            const msg = __workerGetMessage(false);  // Non-blocking
-            if (!msg) break;
-
-            if (msg.type === 2) {  // TERMINATE
-                globalThis.close();
-                return false;
-            }
-
-            if (msg.type === 0 && _onmessage) {  // MESSAGE
-                try {
-                    const data = msg.data ? JSON.parse(msg.data) : undefined;
-                    _onmessage({ data: data, target: globalThis });
-                } catch (e) {
-                    console.error('[Worker] Error processing message:', e);
-                    if (_onerror) {
-                        _onerror({ error: e, message: e.message });
-                    }
-                }
-            }
+    globalThis.postMessage = function(data, transferList = []) {
+        const prepared = __mystralPrepareMessage(data, transferList);
+        __workerPostMessage(prepared.payload, prepared.transfers);
+    };
+    globalThis.close = function() { __workerClose(); };
+    function createTimer(callback, delay, repeat, args) {
+        if (typeof callback !== 'function') throw new TypeError('Worker timer callback must be a function');
+        const numericDelay = Number(delay);
+        const id = __workerSetTimer(Number.isFinite(numericDelay) ? Math.max(0, numericDelay) : 0, repeat);
+        timerCallbacks.set(id, { callback, args, repeat });
+        return id;
+    }
+    globalThis.setTimeout = function(callback, delay = 0, ...args) {
+        return createTimer(callback, delay, false, args);
+    };
+    globalThis.clearTimeout = function(id) {
+        timerCallbacks.delete(Number(id));
+        __workerClearTimer(Number(id));
+    };
+    globalThis.setInterval = function(callback, delay = 0, ...args) {
+        return createTimer(callback, delay, true, args);
+    };
+    globalThis.clearInterval = globalThis.clearTimeout;
+    globalThis.queueMicrotask = function(callback) {
+        if (typeof callback !== 'function') throw new TypeError('queueMicrotask callback must be a function');
+        Promise.resolve().then(callback);
+    };
+    globalThis.importScripts = function(...paths) {
+        for (const path of paths) {
+            const source = __workerReadText(String(path));
+            if (source === null) throw new Error('importScripts failed to load: ' + path);
+            (0, eval)(source);
         }
-        return true;
+    };
+    globalThis.__mystralWorkerDispatch = function(payload, transfers) {
+        const event = { data: __mystralParseMessage(payload, transfers), target: globalThis };
+        try {
+            if (messageHandler) messageHandler.call(globalThis, event);
+            for (const listener of messageListeners.slice()) listener.call(globalThis, event);
+        } catch (error) {
+            dispatchError(error);
+            throw error;
+        }
+    };
+    globalThis.__mystralWorkerDispatchTimer = function(id) {
+        const timer = timerCallbacks.get(id);
+        if (!timer) return;
+        if (!timer.repeat) timerCallbacks.delete(id);
+        try {
+            timer.callback(...timer.args);
+        } catch (error) {
+            dispatchError(error);
+            throw error;
+        }
     };
 })();
-)";
-
-    engine->eval(workerGlobalCode, "worker-global.js");
+)JS", "worker-global.js");
 }
 
 void WorkerThread::threadMain() {
-    std::cout << "[Worker " << id_ << "] Thread started" << std::endl;
-
-    // Create a new JS engine for this worker
-    auto engine = js::createEngine();
-    if (!engine) {
-        std::cerr << "[Worker " << id_ << "] Failed to create JS engine" << std::endl;
-        running_ = false;
-
-        // Send error to main thread
-        WorkerMessage errMsg;
-        errMsg.type = WorkerMessage::Type::ERROR;
-        std::string error = "Failed to create JS engine";
-        errMsg.payload = std::vector<uint8_t>(error.begin(), error.end());
-        {
-            std::lock_guard<std::mutex> lock(outMutex_);
-            outQueue_.push(std::move(errMsg));
-        }
+    if (terminated_.load()) {
+        finishThread(nullptr, WorkerState::Stopped);
         return;
     }
 
-    // Set thread-local globals
-    g_workerEngine = engine.get();
-    g_workerThread = this;
+    auto engine = js::createEngine(engineType_);
+    if (!engine) {
+        enqueueOutput(WorkerMessage::Type::Error, "Failed to create JavaScript engine for Worker");
+        finishThread(nullptr, WorkerState::Failed);
+        return;
+    }
 
-    // Add worker log function FIRST (before anything uses console)
-    engine->setGlobalProperty("__workerLog",
-        engine->newFunction("__workerLog",
-            [](void* ctx, const std::vector<js::JSValueHandle>& args) {
-                if (args.size() < 2) return g_workerEngine->newUndefined();
+    {
+        std::lock_guard<std::mutex> lock(engineMutex_);
+        engine_ = engine.get();
+        if (terminated_.load()) engine_->requestTermination();
+    }
 
-                std::string level = g_workerEngine->toString(args[0]);
-                std::string msg = g_workerEngine->toString(args[1]);
+    currentWorkerEngine = engine.get();
+    currentWorker = this;
+    js::ModuleSystem moduleSystem(engine.get(), rootDir_);
+    js::setModuleSystem(&moduleSystem);
 
-                int workerId = g_workerThread ? g_workerThread->getId() : -1;
-                std::cout << "[Worker " << workerId << "] [" << level << "] " << msg << std::endl;
+    if (!setupWorkerGlobals(engine.get())) {
+        const std::string error = engine->getException();
+        if (!terminated_.load()) enqueueOutput(WorkerMessage::Type::Error, error);
+        js::setModuleSystem(nullptr);
+        currentWorkerEngine = nullptr;
+        currentWorker = nullptr;
+        finishThread(engine.get(), terminated_.load() ? WorkerState::Stopped : WorkerState::Failed);
+        return;
+    }
 
-                return g_workerEngine->newUndefined();
-            }
-        )
-    );
-
-    // Force console override for workers (always replace, even if exists)
-    const char* consoleCode = R"(
-globalThis.console = {
-    log: (...args) => __workerLog('log', args.join(' ')),
-    warn: (...args) => __workerLog('warn', args.join(' ')),
-    error: (...args) => __workerLog('error', args.join(' ')),
-    info: (...args) => __workerLog('info', args.join(' ')),
-};
-)";
-
-    engine->eval(consoleCode, "worker-console.js");
-
-    // Setup worker globals (after console is available)
-    setupWorkerGlobals(engine.get());
-
-    // Execute the worker code
-    std::cout << "[Worker " << id_ << "] Executing user code..." << std::endl;
-    if (!engine->eval(code_.c_str(), "worker.js")) {
+    bool loaded = sourceKind_ == WorkerSourceKind::Module
+        ? moduleSystem.loadEntry(source_)
+        : engine->evalScript(source_.c_str(), name_.empty() ? "worker.js" : name_.c_str());
+    if (!loaded) {
         std::string error = engine->getException();
-        std::cerr << "[Worker " << id_ << "] Error executing code: " << error << std::endl;
-
-        WorkerMessage errMsg;
-        errMsg.type = WorkerMessage::Type::ERROR;
-        errMsg.payload = std::vector<uint8_t>(error.begin(), error.end());
-        {
-            std::lock_guard<std::mutex> lock(outMutex_);
-            outQueue_.push(std::move(errMsg));
+        if (!terminated_.load()) {
+            enqueueOutput(WorkerMessage::Type::Error,
+                error.empty() ? "Failed to load Worker script" : std::move(error));
+            state_ = WorkerState::Failed;
         }
     } else {
-        std::cout << "[Worker " << id_ << "] User code executed successfully" << std::endl;
-    }
-
-    // Check for any pending exception
-    if (engine->hasException()) {
-        std::string error = engine->getException();
-        std::cerr << "[Worker " << id_ << "] Exception after code execution: " << error << std::endl;
-    }
-
-    std::cout << "[Worker " << id_ << "] Entering main loop..." << std::endl;
-
-    // Main worker loop
-    while (!terminated_.load()) {
-        // Process messages via JS
-        auto processResult = engine->evalWithResult("__processMessages()", "worker-loop.js");
-        if (engine->hasException()) {
-            std::string error = engine->getException();
-            std::cerr << "[Worker " << id_ << "] Exception in message loop: " << error << std::endl;
+        if (terminated_.load()) {
+            state_ = WorkerState::Stopping;
+        } else {
+            state_ = WorkerState::Running;
+            enqueueOutput(WorkerMessage::Type::Ready, {});
         }
-        if (!engine->toBoolean(processResult)) {
-            std::cout << "[Worker " << id_ << "] __processMessages returned false, exiting" << std::endl;
-            break;  // Worker requested close
+    }
+
+    while (loaded && !terminated_.load()) {
+        const auto dueTimers = collectDueTimers();
+        if (!dueTimers.empty()) {
+            for (int timerId : dueTimers) {
+                if (terminated_.load()) break;
+                dispatchTimer(engine.get(), timerId);
+            }
         }
 
-        // Small sleep to prevent busy-waiting
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        WorkerPayload pending;
+        {
+            std::unique_lock<std::mutex> lock(inputMutex_);
+            if (inputQueue_.empty()) {
+                if (timers_.empty()) {
+                    inputCondition_.wait(lock, [this]() {
+                        return terminated_.load() || !inputQueue_.empty();
+                    });
+                } else {
+                    auto nextDue = timers_.begin()->second.due;
+                    for (const auto& [_, timer] : timers_) nextDue = std::min(nextDue, timer.due);
+                    inputCondition_.wait_until(lock, nextDue, [this]() {
+                        return terminated_.load() || !inputQueue_.empty();
+                    });
+                }
+            }
+            if (terminated_.load()) break;
+            if (inputQueue_.empty()) continue;
+            pending = std::move(inputQueue_.front());
+            inputQueuedBytes_ -= messageBytes(pending.serialized, pending.transfers);
+            inputQueue_.pop();
+        }
+        dispatchMessage(engine.get(), pending);
     }
 
-    // Cleanup
-    g_workerEngine = nullptr;
-    g_workerThread = nullptr;
-    running_ = false;
-
-    std::cout << "[Worker " << id_ << "] Thread finished" << std::endl;
+    timers_.clear();
+    moduleSystem.clearCaches();
+    js::setModuleSystem(nullptr);
+    currentWorkerEngine = nullptr;
+    currentWorker = nullptr;
+    const WorkerState finalState = state_.load() == WorkerState::Failed
+        ? WorkerState::Failed
+        : WorkerState::Stopped;
+    finishThread(engine.get(), finalState);
 }
 
-}  // namespace workers
-}  // namespace mystral
+}  // namespace mystral::workers

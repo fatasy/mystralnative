@@ -13,6 +13,8 @@
 #include "mystral/audio/audio_bindings.h"
 #include "mystral/vfs/embedded_bundle.h"
 #include "mystral/async/event_loop.h"
+#include "mystral/workers/shared_buffer.h"
+#include "mystral/workers/worker_registry.h"
 #include "storage/local_storage.h"
 
 // Ray tracing bindings (conditional)
@@ -47,6 +49,9 @@
 #include <queue>
 #include <mutex>
 #include <csignal>
+#include <algorithm>
+#include <cmath>
+#include <numeric>
 
 // libuv for precise timers (conditional)
 #if defined(MYSTRAL_HAS_LIBUV) && !defined(__ANDROID__) && !defined(IOS)
@@ -146,12 +151,43 @@ static void installCrashHandlers() {
     signal(SIGILL, crashSignalHandler);
 }
 
+static std::string quoteJavaScriptString(const std::string& value) {
+    static const char hex[] = "0123456789abcdef";
+    std::string result;
+    result.reserve(value.size() + 2);
+    result.push_back('"');
+    for (unsigned char c : value) {
+        switch (c) {
+            case '"': result += "\\\""; break;
+            case '\\': result += "\\\\"; break;
+            case '\b': result += "\\b"; break;
+            case '\f': result += "\\f"; break;
+            case '\n': result += "\\n"; break;
+            case '\r': result += "\\r"; break;
+            case '\t': result += "\\t"; break;
+            default:
+                if (c < 0x20) {
+                    result += "\\u00";
+                    result.push_back(hex[(c >> 4) & 0x0f]);
+                    result.push_back(hex[c & 0x0f]);
+                } else {
+                    result.push_back(static_cast<char>(c));
+                }
+                break;
+        }
+    }
+    result.push_back('"');
+    return result;
+}
+
 // Forward declaration for WebGPU bindings
 namespace webgpu {
-    bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuDevice, void* wgpuQueue, void* wgpuSurface, uint32_t surfaceFormat, uint32_t width, uint32_t height, bool debug = false);
+    bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, void* wgpuDevice, void* wgpuQueue, void* wgpuSurface, uint32_t surfaceFormat, uint32_t width, uint32_t height, bool debug = false);
     void setOffscreenTexture(void* texture, void* textureView);
     void beginDawnFrame();
     void endDawnFrame();
+    void releaseReloadResources();
+    void resetSessionBindings();
 }
 
 /**
@@ -380,7 +416,7 @@ public:
     }
 
     // Helper method to initialize JS engine and bindings (shared by SDL and no-SDL paths)
-    bool initializeJSAndBindings() {
+    bool initializeJSAndBindings(bool initializeServices = true) {
         // Initialize JavaScript engine
         LOGI("Creating JavaScript engine...");
         jsEngine_ = js::createEngine();
@@ -391,6 +427,12 @@ public:
         }
         LOGI("JS engine created: %s", jsEngine_->getName());
         std::cout << "[Mystral] Using JS engine: " << jsEngine_->getName() << std::endl;
+
+        sharedBuffers_ = std::make_shared<workers::SharedBufferRegistry>();
+        workerRegistry_ = std::make_unique<workers::WorkerRegistry>(
+            jsEngine_->getType(),
+            std::filesystem::current_path().string(),
+            sharedBuffers_);
 
         // Set up requestAnimationFrame
         setupAnimationFrame();
@@ -410,7 +452,7 @@ public:
         // Set up WebTransport API (QUIC/HTTP3 via quiche; stubbed if not built)
         webtransport::initBindings(jsEngine_.get());
 
-        // Set up URL parsing and Worker polyfill (needed for Draco decoder, etc.)
+        // Set up URL parsing, shared memory, and native Workers.
         setupURL();
 
         // Set up module system (ESM/CJS resolution)
@@ -418,6 +460,9 @@ public:
 
         // Set up DOM event system (document, window, addEventListener, etc.)
         setupDOMEvents();
+
+        // Set up the opt-in semantic inspection/action bridge for agents.
+        setupAgentBridge();
 
         // Set up localStorage/sessionStorage (file-backed persistence)
         setupStorage();
@@ -437,7 +482,7 @@ public:
         // Set up WebGPU bindings in JS
         // For no-SDL mode, pass nullptr for surface (offscreen rendering uses texture directly)
         WGPUSurface surface = config_.noSdl ? nullptr : webgpu_->getSurface();
-        if (!webgpu::initBindings(jsEngine_.get(), webgpu_->getInstance(), webgpu_->getDevice(), webgpu_->getQueue(), surface, webgpu_->getPreferredFormat(), width_, height_, config_.debug)) {
+        if (!webgpu::initBindings(jsEngine_.get(), webgpu_->getInstance(), webgpu_->getAdapter(), webgpu_->getDevice(), webgpu_->getQueue(), surface, webgpu_->getPreferredFormat(), width_, height_, config_.debug)) {
             std::cerr << "[Mystral] Failed to initialize WebGPU bindings" << std::endl;
             return false;
         }
@@ -457,20 +502,22 @@ public:
         // (Metal/WebGPU use signals during setup that we shouldn't intercept)
         installCrashHandlers();
 
-        // Initialize libuv event loop for async I/O (HTTP, file, timers)
-        async::EventLoop::instance().init();
+        if (initializeServices) {
+            // Initialize libuv event loop for async I/O (HTTP, file, timers)
+            async::EventLoop::instance().init();
 
-        // Initialize async HTTP client (uses libuv for non-blocking requests)
-        http::getAsyncHttpClient().init();
+            // Initialize async HTTP client (uses libuv for non-blocking I/O)
+            http::getAsyncHttpClient().init();
 
-        // Initialize async file reader (uses libuv thread pool for non-blocking file I/O)
-        fs::getAsyncFileReader().init();
+            // Initialize async file reader (uses libuv thread pool)
+            fs::getAsyncFileReader().init();
 
-        // Initialize file watcher (uses libuv fs_event for hot reload)
-        fs::getFileWatcher().init();
+            // Initialize file watcher (uses libuv fs_event for hot reload)
+            fs::getFileWatcher().init();
 
-        // Initialize WebTransport subsystem (QUIC sockets are created lazily)
-        webtransport::init();
+            // Initialize WebTransport subsystem (sockets are created lazily)
+            webtransport::init();
+        }
 
         std::cout << "[Mystral] Runtime initialized" << std::endl;
         return true;
@@ -479,6 +526,11 @@ public:
     void shutdown() {
         std::cout << "[Mystral] Shutting down runtime..." << std::endl;
         running_ = false;
+
+        if (workerRegistry_) {
+            workerRegistry_->shutdown();
+            workerRegistry_.reset();
+        }
 
         // Clean up audio resources FIRST before touching JS objects
         // (Audio callback thread may be accessing JS handles)
@@ -501,19 +553,25 @@ public:
 #ifdef MYSTRAL_USE_LIBUV_TIMERS
         // Clean up libuv timers before shutting down the event loop
         for (auto& [id, ctx] : uvTimers_) {
-            if (ctx && !ctx->cancelled) {
+            if (ctx) {
+                ctx->cancelled = true;
                 uv_timer_stop(&ctx->handle);
-                if (jsEngine_) {
+                if (jsEngine_ && ctx->callbackProtected) {
                     jsEngine_->unprotect(ctx->callback);
+                    ctx->callbackProtected = false;
                 }
-                uv_close(reinterpret_cast<uv_handle_t*>(&ctx->handle), nullptr);
+                if (!uv_is_closing(reinterpret_cast<uv_handle_t*>(&ctx->handle))) {
+                    uv_close(reinterpret_cast<uv_handle_t*>(&ctx->handle), onTimerClose);
+                }
             }
         }
-        uvTimers_.clear();
 #endif
 
         // Shutdown libuv event loop (waits for pending handles to close)
         async::EventLoop::instance().shutdown();
+#ifdef MYSTRAL_USE_LIBUV_TIMERS
+        uvTimers_.clear();
+#endif
 
         // Unprotect all RAF callbacks before clearing
         if (jsEngine_) {
@@ -522,6 +580,7 @@ public:
             }
         }
         rafCallbacks_.clear();
+        clearDOMEventListeners();
 
         // Unprotect all timer callbacks before clearing
 #ifndef MYSTRAL_USE_LIBUV_TIMERS
@@ -550,6 +609,10 @@ public:
         }
 
         jsEngine_.reset();    // Release JS engine
+        if (sharedBuffers_) {
+            sharedBuffers_->clear();
+            sharedBuffers_.reset();
+        }
         webgpu_.reset();      // Release WebGPU resources
         if (!config_.noSdl) {
             platform::destroyWindow();
@@ -571,19 +634,29 @@ public:
         // Store script path for reloading
         scriptPath_ = path;
 
-        // Set up file watching if watch mode is enabled
+        // Watch the containing directory so atomic bundle replacement does
+        // not detach the watch from the old inode/file handle.
         if (config_.watch && fs::getFileWatcher().isReady()) {
             if (watchId_ >= 0) {
                 fs::getFileWatcher().unwatch(watchId_);
             }
-            watchId_ = fs::getFileWatcher().watch(path, [this](const std::string& changedPath, fs::FileChangeType type) {
+            std::error_code pathError;
+            auto absoluteScript = std::filesystem::absolute(path, pathError).lexically_normal();
+            if (pathError) absoluteScript = std::filesystem::path(path).lexically_normal();
+            watchedScriptName_ = absoluteScript.filename().string();
+            auto watchDirectory = absoluteScript.parent_path();
+            if (watchDirectory.empty()) watchDirectory = ".";
+            watchId_ = fs::getFileWatcher().watch(watchDirectory.string(), [this](const std::string& changedPath, fs::FileChangeType type) {
+                if (std::filesystem::path(changedPath).filename().string() != watchedScriptName_) return;
                 if (type == fs::FileChangeType::Modified || type == fs::FileChangeType::Renamed) {
                     std::cout << "[HotReload] File changed: " << changedPath << std::endl;
                     reloadRequested_ = true;
+                    reloadDeadline_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(300);
+                    reloadCandidateObserved_ = false;
                 }
             });
             if (watchId_ >= 0) {
-                std::cout << "[HotReload] Watching for changes: " << path << std::endl;
+                std::cout << "[HotReload] Watching for changes: " << absoluteScript.string() << std::endl;
             }
         }
 
@@ -602,6 +675,109 @@ public:
         return jsEngine_->evalScript(code.c_str(), filename.c_str());
     }
 
+    EvaluationResult evaluateExpression(const std::string& expression) override {
+        if (!jsEngine_) {
+            return {false, "", "JavaScript engine is not available"};
+        }
+
+        if (jsEngine_->hasException()) {
+            jsEngine_->getException();
+        }
+
+        const std::string source =
+            "(() => { try {"
+            "const value = (0, eval)(" + quoteJavaScriptString(expression) + ");"
+            "const seen = new WeakSet();"
+            "return JSON.stringify({ok:true,type:typeof value,value:value,description:String(value)},"
+            "(_key,item) => {"
+            "if (typeof item === 'bigint' || typeof item === 'symbol') return String(item);"
+            "if (typeof item === 'function') return '[Function ' + (item.name || 'anonymous') + ']';"
+            "if (typeof item === 'number' && !Number.isFinite(item)) return String(item);"
+            "if (item && typeof item === 'object') { if (seen.has(item)) return '[Circular]'; seen.add(item); }"
+            "return item;"
+            "});"
+            "} catch (error) {"
+            "return JSON.stringify({ok:false,error:{message:String(error && error.message || error),"
+            "stack:String(error && error.stack || '')}});"
+            "} })()";
+
+        js::JSValueHandle value = jsEngine_->evalScriptWithResult(source.c_str(), "<debug-evaluate>");
+        if (!value.ptr || jsEngine_->hasException()) {
+            std::string error = jsEngine_->hasException()
+                ? jsEngine_->getException()
+                : "Expression evaluation failed";
+            return {false, "", error};
+        }
+
+        std::string valueJson = jsEngine_->toString(value);
+        jsEngine_->releaseValue(value);
+        if (valueJson.empty()) {
+            return {false, "", "Expression result could not be serialized"};
+        }
+        return {true, std::move(valueJson), ""};
+    }
+
+    EvaluationResult dispatchAgentCommand(
+        const std::string& method,
+        const std::string& paramsJson) override {
+        if (!jsEngine_) {
+            return {false, "", "JavaScript engine is not available"};
+        }
+
+        if (jsEngine_->hasException()) {
+            jsEngine_->getException();
+        }
+
+        const std::string source =
+            "(() => { try {"
+            "const params = JSON.parse(" + quoteJavaScriptString(paramsJson.empty() ? "{}" : paramsJson) + ");"
+            "const value = globalThis.mystralAgent.__dispatch("
+                + quoteJavaScriptString(method) + ", params);"
+            "const seen = new WeakSet();"
+            "const json = JSON.stringify(value, (_key,item) => {"
+            "if (typeof item === 'bigint' || typeof item === 'symbol') return String(item);"
+            "if (typeof item === 'function') return '[Function ' + (item.name || 'anonymous') + ']';"
+            "if (typeof item === 'number' && !Number.isFinite(item)) return String(item);"
+            "if (item && typeof item === 'object') { if (seen.has(item)) return '[Circular]'; seen.add(item); }"
+            "return item;"
+            "});"
+            "return {ok:true,json};"
+            "} catch (error) {"
+            "return {ok:false,error:String(error && error.message || error)};"
+            "} })()";
+
+        js::JSValueHandle result = jsEngine_->evalScriptWithResult(source.c_str(), "<agent-dispatch>");
+        if (!result.ptr || jsEngine_->hasException()) {
+            std::string error = jsEngine_->hasException()
+                ? jsEngine_->getException()
+                : "Agent command failed";
+            return {false, "", error};
+        }
+
+        js::JSValueHandle okValue = jsEngine_->getProperty(result, "ok");
+        bool ok = jsEngine_->toBoolean(okValue);
+        jsEngine_->releaseValue(okValue);
+
+        js::JSValueHandle detailValue = jsEngine_->getProperty(result, ok ? "json" : "error");
+        std::string detail = jsEngine_->toString(detailValue);
+        jsEngine_->releaseValue(detailValue);
+        jsEngine_->releaseValue(result);
+
+        if (!ok) {
+            return {false, "", detail.empty() ? "Agent command failed" : std::move(detail)};
+        }
+        if (detail.empty()) {
+            return {false, "", "Agent command result could not be serialized"};
+        }
+        return {true, std::move(detail), ""};
+    }
+
+    void setConsoleCallback(ConsoleCallback callback) override {
+        if (jsEngine_) {
+            jsEngine_->setConsoleCallback(std::move(callback));
+        }
+    }
+
     bool reloadScript() override {
         if (scriptPath_.empty()) {
             std::cerr << "[HotReload] No script loaded to reload" << std::endl;
@@ -609,6 +785,18 @@ public:
         }
 
         std::cout << "[HotReload] Reloading script: " << scriptPath_ << std::endl;
+        logHotReloadStats("before dispose");
+
+        // Give the application one synchronous chance to release its scene,
+        // renderer and JS-owned GPU wrappers before native callbacks vanish.
+        auto disposeHook = jsEngine_->getGlobalProperty("__laasHotDispose");
+        if (jsEngine_->isFunction(disposeHook)) {
+            auto result = jsEngine_->call(disposeHook, jsEngine_->newUndefined(), {});
+            if (!result.ptr) {
+                std::cerr << "[HotReload] Application dispose hook failed" << std::endl;
+            }
+        }
+        jsEngine_->setGlobalProperty("__laasHotDispose", jsEngine_->newUndefined());
 
         // Clear all pending timers
         clearAllTimers();
@@ -619,9 +807,26 @@ public:
         }
         rafCallbacks_.clear();
 
+        clearDOMEventListeners();
+
         // Clear module caches so script is re-read from disk
         if (moduleSystem_) {
             moduleSystem_->clearCaches();
+        }
+
+        webgpu::releaseReloadResources();
+
+        // Native binding calls made by the dispose hook leave temporary V8
+        // handles in the current frame set. Drop those roots before forcing
+        // GC, otherwise the old Three texture/material graph survives until
+        // after the new bundle has already allocated its replacement.
+        jsEngine_->clearFrameHandles();
+        jsEngine_->gc();
+        jsEngine_->gc();
+        logHotReloadStats("after GC");
+
+        if (!recreateJavaScriptEngine()) {
+            return false;
         }
 
         // Reload the script
@@ -637,15 +842,67 @@ public:
     }
 
 private:
+    void logHotReloadStats(const char* phase) {
+        const auto memory = jsEngine_->getMemoryStats();
+        std::cout << "[HotReload] " << phase
+                  << ": heap=" << (memory.heapUsedBytes / (1024 * 1024)) << " MB"
+                  << ", nativeFunctions=" << memory.nativeFunctions;
+        auto statsFunction = jsEngine_->getGlobalProperty("__mystralWebGpuStats");
+        if (jsEngine_->isFunction(statsFunction)) {
+            auto stats = jsEngine_->call(statsFunction, jsEngine_->newUndefined(), {});
+            if (stats.ptr) {
+                const auto number = [this, stats](const char* name) -> uint64_t {
+                    return static_cast<uint64_t>(jsEngine_->toNumber(jsEngine_->getProperty(stats, name)));
+                };
+                std::cout << ", buffers=" << number("activeBuffers")
+                          << ", textures=" << number("activeTextures")
+                          << ", renderPipelines=" << number("activeRenderPipelines")
+                          << ", computePipelines=" << number("activeComputePipelines")
+                          << ", offscreenCanvases=" << number("activeOffscreenCanvases")
+                          << ", canvas2DContexts=" << number("activeCanvas2DContexts")
+                          << ", encoders=" << number("activeCommandEncoders")
+                          << ", passes=" << (number("activeRenderPasses") + number("activeComputePasses"));
+            }
+        }
+        std::cout << std::endl;
+    }
+
+    bool reloadFileIsStable(std::chrono::steady_clock::time_point now) {
+        std::error_code error;
+        const auto size = std::filesystem::file_size(scriptPath_, error);
+        if (error || size == 0) {
+            reloadCandidateObserved_ = false;
+            return false;
+        }
+        const auto writeTime = std::filesystem::last_write_time(scriptPath_, error);
+        if (error) {
+            reloadCandidateObserved_ = false;
+            return false;
+        }
+        if (!reloadCandidateObserved_ || size != reloadCandidateSize_ || writeTime != reloadCandidateWriteTime_) {
+            reloadCandidateObserved_ = true;
+            reloadCandidateSize_ = size;
+            reloadCandidateWriteTime_ = writeTime;
+            reloadCandidateSince_ = now;
+            return false;
+        }
+        return now - reloadCandidateSince_ >= std::chrono::milliseconds(300);
+    }
+
     void clearAllTimers() {
 #ifdef MYSTRAL_USE_LIBUV_TIMERS
         // Stop and clean up all libuv timers
         for (auto& [id, ctx] : uvTimers_) {
-            if (ctx && !ctx->cancelled) {
+            if (ctx) {
                 ctx->cancelled = true;
                 uv_timer_stop(&ctx->handle);
-                jsEngine_->unprotect(ctx->callback);
-                uv_close(reinterpret_cast<uv_handle_t*>(&ctx->handle), onTimerClose);
+                if (ctx->callbackProtected) {
+                    jsEngine_->unprotect(ctx->callback);
+                    ctx->callbackProtected = false;
+                }
+                if (!uv_is_closing(reinterpret_cast<uv_handle_t*>(&ctx->handle))) {
+                    uv_close(reinterpret_cast<uv_handle_t*>(&ctx->handle), onTimerClose);
+                }
             }
         }
         // Note: Don't clear uvTimers_ here - onTimerClose will do that
@@ -666,7 +923,53 @@ private:
         timerCallbacks_.clear();
         cancelledTimerIds_.clear();
 #endif
-        nextTimerId_ = 1;
+        // IDs remain monotonic: libuv close callbacks erase old timers on a
+        // later loop turn, so reusing IDs here could erase a new timer.
+    }
+
+    bool recreateJavaScriptEngine() {
+        // Bindings with native-side JS handles must detach before the engine
+        // destroys its context. The Dawn context/device and SDL window remain.
+        audio::cleanupAudioBindings();
+#ifdef MYSTRAL_HAS_RAYTRACING
+        rt::cleanupRTBindings();
+#endif
+        webtransport::resetBindings();
+
+        if (workerRegistry_) {
+            workerRegistry_->shutdown();
+            workerRegistry_.reset();
+        }
+
+        if (moduleSystem_) {
+            moduleSystem_->clearCaches();
+            js::setModuleSystem(nullptr);
+            moduleSystem_.reset();
+        }
+
+        while (!pendingFileCallbacks_.empty()) pendingFileCallbacks_.pop();
+#ifdef MYSTRAL_HAS_DRACO
+        {
+            std::lock_guard<std::mutex> lock(dracoMutex_);
+            while (!pendingDracoCallbacks_.empty()) pendingDracoCallbacks_.pop();
+        }
+#endif
+
+        canvasElement_ = {};
+        webgpu::resetSessionBindings();
+        ++jsGeneration_;
+        jsEngine_.reset();
+        if (sharedBuffers_) {
+            sharedBuffers_->clear();
+            sharedBuffers_.reset();
+        }
+
+        if (!initializeJSAndBindings(false)) {
+            std::cerr << "[HotReload] Failed to recreate JavaScript engine" << std::endl;
+            return false;
+        }
+        logHotReloadStats("new engine");
+        return true;
     }
 
 public:
@@ -704,6 +1007,7 @@ public:
             // In no-SDL (headless) mode, exit when there's no more work to do
             if (config_.noSdl) {
                 bool hasWork = !rafCallbacks_.empty() || hasActiveTimers() ||
+                               (workerRegistry_ && workerRegistry_->size() > 0) ||
                                webtransport::hasActiveSessions();
                 if (!hasWork) {
                     idleFrames++;
@@ -748,6 +1052,15 @@ public:
     }
 
     bool pollEvents() override {
+        using ProfileClock = std::chrono::steady_clock;
+        ProfileClock::time_point profileFrameStart;
+        ProfileClock::time_point profilePhaseStart;
+        FrameProfileSample profileSample;
+        if (profilerActive_) {
+            profileFrameStart = ProfileClock::now();
+            profilePhaseStart = profileFrameStart;
+        }
+
         // Poll SDL events through our platform layer (skip in no-SDL mode)
         if (!config_.noSdl) {
             if (!platform::pollEvents()) {
@@ -759,6 +1072,16 @@ public:
         // Poll libuv event loop - process any ready I/O callbacks (non-blocking)
         // This handles async HTTP requests, file I/O, and libuv-based timers
         async::EventLoop::instance().runOnce();
+
+        if (profilerActive_) {
+            auto now = ProfileClock::now();
+            profileSample.eventsMs = millisecondsBetween(profilePhaseStart, now);
+            profilePhaseStart = now;
+        }
+
+        if (paused_ && stepFramesRemaining_ == 0) {
+            return running_;
+        }
 
         // Process completed async HTTP requests (invoke their JS callbacks)
         // This must be called after runOnce() to invoke callbacks safely on the main thread
@@ -776,9 +1099,17 @@ public:
         fs::getFileWatcher().processPendingEvents();
 
         // Check if hot reload was requested
-        if (reloadRequested_) {
+        const auto reloadNow = std::chrono::steady_clock::now();
+        if (reloadRequested_ && reloadNow >= reloadDeadline_ && reloadFileIsStable(reloadNow)) {
             reloadRequested_ = false;
+            reloadCandidateObserved_ = false;
             reloadScript();
+        }
+
+        if (profilerActive_) {
+            auto now = ProfileClock::now();
+            profileSample.asyncWorkMs = millisecondsBetween(profilePhaseStart, now);
+            profilePhaseStart = now;
         }
 
         // Execute timer callbacks (setTimeout, setInterval)
@@ -791,24 +1122,156 @@ public:
         // Process completed async Draco decode results
         processPendingDracoCallbacks();
 
+        processWorkerMessages();
+
         // Process microtask queue for promises
         processMicrotasks();
 
-        // Begin frame — enables per-frame allocation tracking
+        if (profilerActive_) {
+            auto now = ProfileClock::now();
+            profileSample.callbacksMs = millisecondsBetween(profilePhaseStart, now);
+            profilePhaseStart = now;
+        }
+
+        // Begin frame — enables per-frame temporary-handle tracking. Native
+        // function callbacks have GC ownership and may safely outlive it.
         jsEngine_->beginFrame();
         webgpu::beginDawnFrame();
 
         // Execute requestAnimationFrame callbacks (renders a frame)
         executeAnimationFrameCallbacks();
 
-        // Free non-protected handles, per-frame native allocations, and Dawn resources
+        if (profilerActive_) {
+            auto now = ProfileClock::now();
+            profileSample.animationFrameMs = millisecondsBetween(profilePhaseStart, now);
+            profilePhaseStart = now;
+        }
+
+        // Free non-protected temporary handles and per-frame Dawn resources.
         jsEngine_->clearFrameHandles();
         webgpu::endDawnFrame();
+
+        if (profilerActive_) {
+            auto now = ProfileClock::now();
+            profileSample.cleanupMs = millisecondsBetween(profilePhaseStart, now);
+            profileSample.frameMs = millisecondsBetween(profileFrameStart, now);
+            profilerSamples_.push_back(profileSample);
+        }
+
+        frameCount_++;
+        if (paused_ && stepFramesRemaining_ > 0) {
+            stepFramesRemaining_--;
+        }
 
         // TODO: Translate to Web events via InputShim
         // TODO: Dispatch to JS
 
         return running_;
+    }
+
+    void setPaused(bool paused) override {
+        paused_ = paused;
+        if (!paused_) {
+            stepFramesRemaining_ = 0;
+        }
+    }
+
+    bool isPaused() const override {
+        return paused_;
+    }
+
+    void stepFrames(uint32_t count) override {
+        paused_ = true;
+        stepFramesRemaining_ = count;
+    }
+
+    uint64_t getFrameCount() const override {
+        return frameCount_;
+    }
+
+    void startProfiler(uint64_t expectedFrames) override {
+        profilerSamples_.clear();
+        profilerSamples_.reserve(expectedFrames > 0
+            ? static_cast<size_t>(expectedFrames)
+            : 1024);
+        profilerMemoryStart_ = getMemorySnapshot();
+        profilerWorkerStart_ = workerRegistry_
+            ? workerRegistry_->stats()
+            : workers::WorkerRegistryStats{};
+        profilerSharedMemoryStartBytes_ = sharedBuffers_ ? sharedBuffers_->allocatedBytes() : 0;
+        profilerStartedAt_ = std::chrono::steady_clock::now();
+        profilerActive_ = true;
+    }
+
+    RuntimeProfileReport stopProfiler() override {
+        RuntimeProfileReport report;
+        if (!profilerActive_) {
+            return report;
+        }
+
+        const auto stoppedAt = std::chrono::steady_clock::now();
+        profilerActive_ = false;
+
+        report.sampledFrames = profilerSamples_.size();
+        report.wallTimeMs = millisecondsBetween(profilerStartedAt_, stoppedAt);
+        report.memoryStart = profilerMemoryStart_;
+        report.memoryEnd = getMemorySnapshot();
+        const auto workerEnd = workerRegistry_
+            ? workerRegistry_->stats()
+            : workers::WorkerRegistryStats{};
+        report.workersCreated = workerEnd.createdWorkers >= profilerWorkerStart_.createdWorkers
+            ? workerEnd.createdWorkers - profilerWorkerStart_.createdWorkers
+            : 0;
+        report.workerMessagesProcessed = workerEnd.processedMessages >= profilerWorkerStart_.processedMessages
+            ? workerEnd.processedMessages - profilerWorkerStart_.processedMessages
+            : 0;
+        report.workerTimerCallbacks =
+            workerEnd.processedTimerCallbacks >= profilerWorkerStart_.processedTimerCallbacks
+                ? workerEnd.processedTimerCallbacks - profilerWorkerStart_.processedTimerCallbacks
+                : 0;
+        const uint64_t rejectedAtStart = profilerWorkerStart_.rejectedInputMessages +
+            profilerWorkerStart_.rejectedOutputMessages;
+        const uint64_t rejectedAtEnd = workerEnd.rejectedInputMessages +
+            workerEnd.rejectedOutputMessages;
+        report.workerMessagesRejected = rejectedAtEnd >= rejectedAtStart
+            ? rejectedAtEnd - rejectedAtStart
+            : 0;
+        const uint64_t workerBusyNanoseconds =
+            workerEnd.busyNanoseconds >= profilerWorkerStart_.busyNanoseconds
+                ? workerEnd.busyNanoseconds - profilerWorkerStart_.busyNanoseconds
+                : 0;
+        report.workerBusyTimeMs = static_cast<double>(workerBusyNanoseconds) / 1'000'000.0;
+        report.workerInputQueueEndBytes = workerEnd.queuedInputBytes;
+        report.workerOutputQueueEndBytes = workerEnd.queuedOutputBytes;
+        report.workerInputQueuePeakBytes = workerEnd.peakQueuedInputBytes;
+        report.workerOutputQueuePeakBytes = workerEnd.peakQueuedOutputBytes;
+        report.sharedMemoryStartBytes = profilerSharedMemoryStartBytes_;
+        report.sharedMemoryEndBytes = sharedBuffers_ ? sharedBuffers_->allocatedBytes() : 0;
+
+        std::vector<double> values;
+        values.reserve(profilerSamples_.size());
+        auto summarize = [&values, this](auto member) {
+            values.clear();
+            for (const auto& sample : profilerSamples_) {
+                values.push_back(sample.*member);
+            }
+            return summarizeProfileValues(values);
+        };
+
+        report.frame = summarize(&FrameProfileSample::frameMs);
+        report.events = summarize(&FrameProfileSample::eventsMs);
+        report.asyncWork = summarize(&FrameProfileSample::asyncWorkMs);
+        report.callbacks = summarize(&FrameProfileSample::callbacksMs);
+        report.animationFrame = summarize(&FrameProfileSample::animationFrameMs);
+        report.cleanup = summarize(&FrameProfileSample::cleanupMs);
+
+        for (const auto& sample : profilerSamples_) {
+            if (sample.frameMs > 8.333333) report.framesOver8_33Ms++;
+            if (sample.frameMs > 16.666667) report.framesOver16_67Ms++;
+            if (sample.frameMs > 33.333333) report.framesOver33_33Ms++;
+        }
+
+        return report;
     }
 
     void quit() override {
@@ -898,6 +1361,59 @@ public:
     }
 
 private:
+    struct FrameProfileSample {
+        double frameMs = 0.0;
+        double eventsMs = 0.0;
+        double asyncWorkMs = 0.0;
+        double callbacksMs = 0.0;
+        double animationFrameMs = 0.0;
+        double cleanupMs = 0.0;
+    };
+
+    template <typename Clock, typename DurationA, typename DurationB>
+    static double millisecondsBetween(
+        const std::chrono::time_point<Clock, DurationA>& start,
+        const std::chrono::time_point<Clock, DurationB>& end) {
+        return std::chrono::duration<double, std::milli>(end - start).count();
+    }
+
+    static RuntimeProfileStatistics summarizeProfileValues(std::vector<double>& values) {
+        RuntimeProfileStatistics stats;
+        if (values.empty()) {
+            return stats;
+        }
+
+        std::sort(values.begin(), values.end());
+        const double total = std::accumulate(values.begin(), values.end(), 0.0);
+        auto percentile = [&values](double fraction) {
+            const size_t rank = static_cast<size_t>(std::ceil(fraction * values.size()));
+            return values[std::max<size_t>(1, rank) - 1];
+        };
+
+        stats.minMs = values.front();
+        stats.meanMs = total / static_cast<double>(values.size());
+        stats.p50Ms = percentile(0.50);
+        stats.p95Ms = percentile(0.95);
+        stats.p99Ms = percentile(0.99);
+        stats.maxMs = values.back();
+        return stats;
+    }
+
+    RuntimeMemorySnapshot getMemorySnapshot() const {
+        RuntimeMemorySnapshot snapshot;
+        if (!jsEngine_) {
+            return snapshot;
+        }
+
+        const auto memory = jsEngine_->getMemoryStats();
+        snapshot.heapUsedBytes = memory.heapUsedBytes;
+        snapshot.heapTotalBytes = memory.heapTotalBytes;
+        snapshot.heapLimitBytes = memory.heapLimitBytes;
+        snapshot.nativeFunctions = memory.nativeFunctions;
+        snapshot.frameHandles = memory.frameHandles;
+        return snapshot;
+    }
+
     void setupAnimationFrame() {
         if (!jsEngine_) return;
 
@@ -1017,6 +1533,7 @@ private:
         ctx->callback = callback;
         ctx->intervalMs = intervalMs;
         ctx->cancelled = false;
+        ctx->callbackProtected = true;
         ctx->runtime = this;
         ctx->handle.data = ctx.get();
 
@@ -1051,7 +1568,10 @@ private:
             ctx->cancelled = true;
             cancelledTimerIds_.insert(id);
             uv_timer_stop(&ctx->handle);
-            jsEngine_->unprotect(ctx->callback);
+            if (ctx->callbackProtected) {
+                jsEngine_->unprotect(ctx->callback);
+                ctx->callbackProtected = false;
+            }
             uv_close(reinterpret_cast<uv_handle_t*>(&ctx->handle), onTimerClose);
         }
     }
@@ -1217,6 +1737,141 @@ private:
     }
 #endif // !MYSTRAL_USE_LIBUV_TIMERS
 
+    void setupAgentBridge() {
+        if (!jsEngine_) return;
+
+        const char* source = R"JS(
+(() => {
+    const inspectors = new Map();
+    const actions = new Map();
+
+    function requireId(id, type) {
+        if (typeof id !== 'string' || id.length === 0) {
+            throw new TypeError(type + ' id must be a non-empty string');
+        }
+        return id;
+    }
+
+    function optionsOrEmpty(options) {
+        return options && typeof options === 'object' ? options : {};
+    }
+
+    function compareById(a, b) {
+        return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+    }
+
+    const api = {
+        version: 1,
+
+        exposeInspector(id, inspect, options = {}) {
+            id = requireId(id, 'Inspector');
+            if (typeof inspect !== 'function') {
+                throw new TypeError('Inspector ' + id + ' must be a function');
+            }
+            options = optionsOrEmpty(options);
+            const record = {
+                id,
+                inspect,
+                label: options.label === undefined ? id : String(options.label),
+                kind: options.kind === undefined ? 'entity' : String(options.kind),
+                description: options.description === undefined ? '' : String(options.description)
+            };
+            inspectors.set(id, record);
+            return () => inspectors.get(id) === record && inspectors.delete(id);
+        },
+
+        exposeAction(id, run, options = {}) {
+            id = requireId(id, 'Action');
+            if (typeof run !== 'function') {
+                throw new TypeError('Action ' + id + ' must be a function');
+            }
+            options = optionsOrEmpty(options);
+            const record = {
+                id,
+                run,
+                description: options.description === undefined ? '' : String(options.description),
+                entityId: options.entityId === undefined ? null : String(options.entityId),
+                inputSchema: options.inputSchema === undefined ? null : options.inputSchema
+            };
+            actions.set(id, record);
+            return () => actions.get(id) === record && actions.delete(id);
+        },
+
+        removeInspector(id) {
+            return inspectors.delete(String(id));
+        },
+
+        removeAction(id) {
+            return actions.delete(String(id));
+        },
+
+        clear() {
+            inspectors.clear();
+            actions.clear();
+        }
+    };
+
+    function dispatch(method, params) {
+        params = optionsOrEmpty(params);
+
+        if (method === 'list') {
+            return {
+                entities: Array.from(inspectors.values(), (record) => ({
+                    id: record.id,
+                    label: record.label,
+                    kind: record.kind,
+                    description: record.description
+                })).sort(compareById),
+                actions: Array.from(actions.values(), (record) => ({
+                    id: record.id,
+                    description: record.description,
+                    entityId: record.entityId,
+                    inputSchema: record.inputSchema
+                })).sort(compareById)
+            };
+        }
+
+        if (method === 'inspect') {
+            const id = requireId(params.id, 'Inspector');
+            const record = inspectors.get(id);
+            if (!record) throw new Error('Unknown inspector: ' + id);
+            const snapshot = record.inspect(params.input);
+            if (snapshot && typeof snapshot.then === 'function') {
+                throw new Error('Inspector ' + id + ' returned a Promise; inspectors must be synchronous');
+            }
+            return { id, snapshot: snapshot === undefined ? null : snapshot };
+        }
+
+        if (method === 'act') {
+            const id = requireId(params.id, 'Action');
+            const record = actions.get(id);
+            if (!record) throw new Error('Unknown action: ' + id);
+            const result = record.run(params.input);
+            if (result && typeof result.then === 'function') {
+                throw new Error('Action ' + id + ' returned a Promise; agent actions must be synchronous');
+            }
+            return { id, result: result === undefined ? null : result };
+        }
+
+        throw new Error('Unknown agent method: ' + method);
+    }
+
+    Object.defineProperty(api, '__dispatch', { value: dispatch });
+    Object.freeze(api);
+    Object.defineProperty(globalThis, 'mystralAgent', {
+        value: api,
+        writable: false,
+        configurable: false,
+        enumerable: false
+    });
+})();
+)JS";
+
+        if (!jsEngine_->evalScript(source, "<agent-bridge>")) {
+            std::cerr << "[Mystral] Failed to initialize agent bridge" << std::endl;
+        }
+    }
+
     void setupPerformance() {
         if (!jsEngine_) return;
 
@@ -1275,6 +1930,21 @@ private:
         // process.env - environment variables (empty object for now, could populate later)
         auto env = jsEngine_->newObject();
         jsEngine_->setProperty(process, "env", env);
+
+        // process.memoryUsage() - native harness diagnostics. Field names are
+        // explicit rather than pretending every engine exposes Node's full set.
+        jsEngine_->setProperty(process, "memoryUsage",
+            jsEngine_->newFunction("memoryUsage", [this](void* ctx, const std::vector<js::JSValueHandle>& args) {
+                const auto stats = jsEngine_->getMemoryStats();
+                auto result = jsEngine_->newObject();
+                jsEngine_->setProperty(result, "heapUsedBytes", jsEngine_->newNumber((double)stats.heapUsedBytes));
+                jsEngine_->setProperty(result, "heapTotalBytes", jsEngine_->newNumber((double)stats.heapTotalBytes));
+                jsEngine_->setProperty(result, "heapLimitBytes", jsEngine_->newNumber((double)stats.heapLimitBytes));
+                jsEngine_->setProperty(result, "nativeFunctions", jsEngine_->newNumber((double)stats.nativeFunctions));
+                jsEngine_->setProperty(result, "frameHandles", jsEngine_->newNumber((double)stats.frameHandles));
+                return result;
+            })
+        );
 
         jsEngine_->setGlobalProperty("process", process);
     }
@@ -1551,8 +2221,7 @@ private:
                 auto callback = args[1];
                 jsEngine_->protect(callback);
 
-                // Capture jsEngine pointer for the callback
-                auto* engine = jsEngine_.get();
+                const uint64_t generation = jsGeneration_;
 
                 // Check embedded bundle first (synchronously - it's fast)
                 std::vector<uint8_t> embeddedData;
@@ -1570,7 +2239,8 @@ private:
 
                 // Use the async file reader with libuv thread pool
                 // The callback will be queued and invoked during processCompletedReads()
-                fs::getAsyncFileReader().readFile(path, [this, callback](std::vector<uint8_t> data, std::string error) {
+                fs::getAsyncFileReader().readFile(path, [this, callback, generation](std::vector<uint8_t> data, std::string error) {
+                    if (generation != jsGeneration_) return;
                     // This callback runs on the main thread during processCompletedReads()
                     // Queue the callback with data for processing in the main loop
                     pendingFileCallbacks_.push({
@@ -1699,12 +2369,14 @@ private:
                 auto callback = args[2];
                 jsEngine_->protect(callback);
 
-                // Capture jsEngine pointer for the callback
-                auto* engine = jsEngine_.get();
+                const uint64_t generation = jsGeneration_;
 
                 // Start async request
                 http::getAsyncHttpClient().request(method, url, body,
-                    [engine, callback](http::HttpResponse response) {
+                    [this, callback, generation](http::HttpResponse response) {
+                        if (generation != jsGeneration_) return;
+                        auto* engine = jsEngine_.get();
+                        if (!engine) return;
                         // This runs on the main thread when the response arrives
                         // Create result object
                         auto result = engine->newObject();
@@ -2435,8 +3107,74 @@ globalThis.Response = Response;
     void setupURL() {
         if (!jsEngine_) return;
 
-        // URL, URLSearchParams, and Worker polyfills for native runtime
-        // Worker is a main-thread polyfill that simulates async message passing
+        workers::installSharedBufferBindings(jsEngine_.get(), sharedBuffers_);
+        if (!jsEngine_->evalScript(workers::sharedApiSource(), "mystral-shared.js")) {
+            std::cerr << "[Mystral] Failed to initialize shared memory API" << std::endl;
+        }
+
+        jsEngine_->setGlobalProperty("__mystralWorkerCreate",
+            jsEngine_->newFunction("__mystralWorkerCreate",
+                [this](void*, const std::vector<js::JSValueHandle>& args) {
+                    if (!workerRegistry_ || args.size() < 2) {
+                        jsEngine_->throwException("Worker requires a script source");
+                        return jsEngine_->newNumber(-1);
+                    }
+                    auto kind = jsEngine_->toNumber(args[0]) == 0
+                        ? workers::WorkerSourceKind::Script
+                        : workers::WorkerSourceKind::Module;
+                    std::string source = jsEngine_->toString(args[1]);
+                    std::string name;
+                    if (args.size() > 2 && !jsEngine_->isUndefined(args[2])) {
+                        name = jsEngine_->toString(args[2]);
+                    }
+                    if (source.empty()) {
+                        jsEngine_->throwException("Worker script source is empty");
+                        return jsEngine_->newNumber(-1);
+                    }
+                    return jsEngine_->newNumber(workerRegistry_->createWorker(kind, source, name));
+                }));
+
+        jsEngine_->setGlobalProperty("__mystralWorkerPostMessage",
+            jsEngine_->newFunction("__mystralWorkerPostMessage",
+                [this](void*, const std::vector<js::JSValueHandle>& args) {
+                    if (!workerRegistry_ || args.size() < 2) {
+                        return jsEngine_->newNumber(static_cast<int>(workers::WorkerPostStatus::NotFound));
+                    }
+                    int id = static_cast<int>(jsEngine_->toNumber(args[0]));
+                    std::vector<js::TransferredArrayBuffer> transfers;
+                    if (args.size() > 2 && !jsEngine_->isUndefined(args[2]) && !jsEngine_->isNull(args[2])) {
+                        if (!jsEngine_->isArray(args[2])) {
+                            return jsEngine_->newNumber(
+                                static_cast<int>(workers::WorkerPostStatus::InvalidTransfer));
+                        }
+                        const auto lengthValue = jsEngine_->getProperty(args[2], "length");
+                        const auto length = static_cast<uint32_t>(jsEngine_->toNumber(lengthValue));
+                        transfers.reserve(length);
+                        for (uint32_t index = 0; index < length; index++) {
+                            js::TransferredArrayBuffer transferred;
+                            if (!jsEngine_->transferArrayBuffer(
+                                    jsEngine_->getPropertyIndex(args[2], index), transferred)) {
+                                return jsEngine_->newNumber(
+                                    static_cast<int>(workers::WorkerPostStatus::InvalidTransfer));
+                            }
+                            transfers.push_back(std::move(transferred));
+                        }
+                    }
+                    return jsEngine_->newNumber(static_cast<int>(
+                        workerRegistry_->postToWorker(
+                            id, jsEngine_->toString(args[1]), std::move(transfers))));
+                }));
+
+        jsEngine_->setGlobalProperty("__mystralWorkerTerminate",
+            jsEngine_->newFunction("__mystralWorkerTerminate",
+                [this](void*, const std::vector<js::JSValueHandle>& args) {
+                    if (workerRegistry_ && !args.empty()) {
+                        workerRegistry_->terminateWorker(static_cast<int>(jsEngine_->toNumber(args[0])));
+                    }
+                    return jsEngine_->newUndefined();
+                }));
+
+        // URL and URLSearchParams polyfills plus the native Worker facade.
         const char* urlPolyfill = R"JS(
 // URLSearchParams polyfill
 if (typeof URLSearchParams === 'undefined') {
@@ -2559,7 +3297,7 @@ if (typeof URL === 'undefined') {
             _blobStore.delete(url);
         }
 
-        // Internal: retrieve blob data for Worker polyfill
+        // Internal: retrieve blob data for Blob-backed Workers.
         static _getBlobData(url) {
             return _blobStore.get(url);
         }
@@ -2568,136 +3306,101 @@ if (typeof URL === 'undefined') {
     globalThis.URL = URL;
 }
 
-// Worker polyfill — runs worker code on the main thread with async message passing.
-// This enables WebWorker-based libraries (like Draco decoder) to function in native runtime.
+// Native Worker facade. Each instance owns an OS thread and a JS engine.
 if (typeof Worker === 'undefined') {
-    class Worker {
-        constructor(url) {
+    const nativeWorkers = new Map();
+
+    globalThis.__mystralDispatchWorkerMessage = function(id, type, payload, transfers) {
+        const worker = nativeWorkers.get(id);
+        if (!worker || worker._terminated) return;
+        if (type === 'ready') {
+            worker._ready = true;
+            return;
+        }
+        if (type === 'exit') {
+            worker._terminated = true;
+            nativeWorkers.delete(id);
+            return;
+        }
+        if (type === 'error') {
+            const event = { type: 'error', message: payload, error: new Error(payload), target: worker };
+            if (worker.onerror) worker.onerror.call(worker, event);
+            for (const listener of worker._errorListeners.slice()) listener.call(worker, event);
+            return;
+        }
+        const event = { type: 'message', data: __mystralParseMessage(payload, transfers), target: worker };
+        if (worker.onmessage) worker.onmessage.call(worker, event);
+        for (const listener of worker._messageListeners.slice()) listener.call(worker, event);
+    };
+
+    class NativeWorker {
+        constructor(url, options = {}) {
             this.onmessage = null;
             this.onerror = null;
             this._terminated = false;
-            this._workerSelf = null;
+            this._ready = false;
+            this._messageListeners = [];
+            this._errorListeners = [];
 
-            // Extract code from blob URL
+            let kind = 1;
             let code = '';
-            if (typeof url === 'string' && url.startsWith('blob:')) {
+            if (url && url._data) {
+                code = new TextDecoder().decode(new Uint8Array(url._data));
+                kind = 0;
+            } else if (typeof url === 'string' && url.startsWith('blob:')) {
                 const blob = URL._getBlobData(url);
                 if (blob && blob._data) {
-                    const decoder = new TextDecoder();
-                    code = decoder.decode(new Uint8Array(blob._data));
+                    code = new TextDecoder().decode(new Uint8Array(blob._data));
+                    kind = 0;
                 }
+            } else {
+                code = String(url);
             }
 
-            if (!code) {
-                const worker = this;
-                setTimeout(() => {
-                    if (worker.onerror) worker.onerror(new ErrorEvent('error', { message: 'Failed to load worker script' }));
-                }, 0);
-                return;
-            }
-
-            // Build a worker-like scope with self, postMessage, etc.
-            const worker = this;
-            const workerSelf = {
-                onmessage: null,
-                postMessage: function(data) {
-                    if (worker._terminated) return;
-                    // Async delivery to main thread's onmessage handler
-                    setTimeout(() => {
-                        if (worker.onmessage && !worker._terminated) {
-                            try { worker.onmessage({ data }); }
-                            catch (e) { console.error('[Worker] onmessage error:', e); }
-                        }
-                    }, 0);
-                }
-            };
-            workerSelf.self = workerSelf;
-
-            // importScripts polyfill — uses __readFileSync (synchronous bundle/FS read)
-            // combined with TextDecoder to load and execute scripts synchronously,
-            // matching the browser WebWorker importScripts() behavior.
-            workerSelf.importScripts = function() {
-                for (let i = 0; i < arguments.length; i++) {
-                    const url = arguments[i];
-                    const data = __readFileSync(url);
-                    if (!data) {
-                        throw new Error('importScripts: Failed to load script: ' + url);
-                    }
-                    const code = new TextDecoder().decode(new Uint8Array(data));
-                    (0, eval)(code);
-                }
-            };
-
-            // Execute the worker code as a function with self and postMessage in scope.
-            // The worker code can set self.onmessage and call postMessage() / self.postMessage().
-            // We also provide a patched eval that handles Emscripten's `(var X = ...)` pattern,
-            // which is invalid as an expression but common in WASM module loaders.
-            try {
-                const wrapped = '(function(self, postMessage, __nativeEval, importScripts) {\n' +
-                    'var eval = function(code) {\n' +
-                    '  try { return __nativeEval(code); }\n' +
-                    '  catch(e) {\n' +
-                    '    if (e instanceof SyntaxError) {\n' +
-                    '      var t = code.trim();\n' +
-                    '      if (t[0]==="(" && t[t.length-1]===")") {\n' +
-                    '        var inner = t.slice(1, -1).trim();\n' +
-                    '        if (/^(?:var|let|const)\\s/.test(inner)) {\n' +
-                    '          __nativeEval(inner);\n' +
-                    '          var m = inner.match(/^(?:var|let|const)\\s+(\\w+)/);\n' +
-                    '          if (m) return __nativeEval(m[1]);\n' +
-                    '        }\n' +
-                    '      }\n' +
-                    '    }\n' +
-                    '    throw e;\n' +
-                    '  }\n' +
-                    '};\n' +
-                    code + '\n})';
-                const fn = (0, eval)(wrapped);
-                fn(workerSelf, workerSelf.postMessage, (0, eval), workerSelf.importScripts);
-            } catch (e) {
-                console.error('[Worker] Initialization error:', e);
-                const w = this;
-                setTimeout(() => { if (w.onerror) w.onerror(e); }, 0);
-                return;
-            }
-
-            this._workerSelf = workerSelf;
+            if (!code) throw new TypeError('Worker requires a script URL or Blob');
+            this._id = __mystralWorkerCreate(kind, code, options && options.name ? String(options.name) : '');
+            if (this._id < 0) throw new Error('Failed to create Worker');
+            nativeWorkers.set(this._id, this);
         }
 
-        postMessage(data) {
+        postMessage(data, transferList = []) {
             if (this._terminated) return;
-            const ws = this._workerSelf;
-            if (!ws || !ws.onmessage) return;
-            // Async delivery to worker's onmessage handler
-            const terminated = () => this._terminated;
-            const handler = ws.onmessage;
-            setTimeout(() => {
-                if (!terminated() && handler) {
-                    try { handler({ data }); }
-                    catch (e) { console.error('[Worker] message handler error:', e); }
-                }
-            }, 0);
+            const prepared = __mystralPrepareMessage(data, transferList);
+            const status = __mystralWorkerPostMessage(this._id, prepared.payload, prepared.transfers);
+            if (status === 0) return;
+            if (status === 2) throw new RangeError('Worker input queue is full');
+            if (status === 3) throw new RangeError('Worker message exceeds the input queue byte limit');
+            if (status === 5) throw new TypeError('Worker transfer list contains an invalid ArrayBuffer');
+            throw new Error('Worker is no longer running');
         }
 
         terminate() {
+            if (this._terminated) return;
             this._terminated = true;
-            this._workerSelf = null;
+            nativeWorkers.delete(this._id);
+            __mystralWorkerTerminate(this._id);
         }
 
         addEventListener(type, handler) {
-            if (type === 'message') this.onmessage = handler;
-            else if (type === 'error') this.onerror = handler;
+            if (typeof handler !== 'function') return;
+            if (type === 'message') this._messageListeners.push(handler);
+            else if (type === 'error') this._errorListeners.push(handler);
         }
 
-        removeEventListener() {}
+        removeEventListener(type, handler) {
+            const listeners = type === 'message' ? this._messageListeners : type === 'error' ? this._errorListeners : null;
+            if (!listeners) return;
+            const index = listeners.indexOf(handler);
+            if (index >= 0) listeners.splice(index, 1);
+        }
     }
 
-    globalThis.Worker = Worker;
+    globalThis.Worker = NativeWorker;
 }
 )JS";
 
         jsEngine_->eval(urlPolyfill, "url-worker-polyfill.js");
-        std::cout << "[Mystral] URL and Worker polyfills initialized" << std::endl;
+        std::cout << "[Mystral] URL and native Worker APIs initialized" << std::endl;
     }
 
     void setupModules() {
@@ -3045,6 +3748,7 @@ globalThis.loadGLTF = loadGLTF;
                 decCtx->uvAttrId = uvAttrId;
                 decCtx->callback = callback;
                 decCtx->runtime = this;
+                decCtx->generation = jsGeneration_;
 
                 // Queue decoding on libuv thread pool
                 uv_queue_work(
@@ -3128,6 +3832,10 @@ globalThis.loadGLTF = loadGLTF;
                     // After-work callback — runs on main thread (libuv loop iteration)
                     [](uv_work_t* req, int status) {
                         auto* dc = static_cast<DracoDecodeContext*>(req->data);
+                        if (dc->generation != dc->runtime->jsGeneration_) {
+                            delete dc;
+                            return;
+                        }
                         // Queue the result for processing on the JS main thread
                         std::lock_guard<std::mutex> lock(dc->runtime->dracoMutex_);
                         dc->runtime->pendingDracoCallbacks_.push(std::unique_ptr<DracoDecodeContext>(dc));
@@ -3179,6 +3887,7 @@ globalThis.__mystralNativeDecodeDracoAsync = function(buffer, attrs) {
         while (!toProcess.empty()) {
             auto dc = std::move(toProcess.front());
             toProcess.pop();
+            if (dc->generation != jsGeneration_) continue;
 
             if (!dc->error.empty()) {
                 // Error — call callback(null, errorString)
@@ -3255,7 +3964,10 @@ globalThis.__mystralNativeDecodeDracoAsync = function(buffer, attrs) {
             if (pending.intervalMs == 0) {
                 auto it = uvTimers_.find(pending.id);
                 if (it != uvTimers_.end()) {
-                    jsEngine_->unprotect(it->second->callback);
+                    if (it->second->callbackProtected) {
+                        jsEngine_->unprotect(it->second->callback);
+                        it->second->callbackProtected = false;
+                    }
                     // uv_close is async - onTimerClose will erase from map when done
                     uv_close(reinterpret_cast<uv_handle_t*>(&it->second->handle), onTimerClose);
                 }
@@ -3349,12 +4061,46 @@ globalThis.__mystralNativeDecodeDracoAsync = function(buffer, attrs) {
         }
     }
 
+    void processWorkerMessages() {
+        if (!workerRegistry_ || !jsEngine_) return;
+
+        auto dispatch = jsEngine_->getGlobalProperty("__mystralDispatchWorkerMessage");
+        if (!jsEngine_->isFunction(dispatch)) return;
+
+        workerRegistry_->drainMessages(
+            [this, dispatch](int id, const workers::WorkerMessage& message) {
+                const char* type = "message";
+                if (message.type == workers::WorkerMessage::Type::Error) type = "error";
+                else if (message.type == workers::WorkerMessage::Type::Ready) type = "ready";
+                else if (message.type == workers::WorkerMessage::Type::Exited) type = "exit";
+
+                auto transfers = jsEngine_->newArray(message.transfers.size());
+                for (uint32_t index = 0; index < message.transfers.size(); index++) {
+                    jsEngine_->setPropertyIndex(
+                        transfers,
+                        index,
+                        jsEngine_->newTransferredArrayBuffer(message.transfers[index]));
+                }
+
+                auto result = jsEngine_->call(dispatch, jsEngine_->newUndefined(), {
+                    jsEngine_->newNumber(id),
+                    jsEngine_->newString(type),
+                    jsEngine_->newString(message.payload.c_str()),
+                    transfers,
+                });
+                (void)result;
+                if (jsEngine_->hasException()) {
+                    std::cerr << "[Worker] Main-thread message handler failed: "
+                              << jsEngine_->getException() << std::endl;
+                }
+            });
+    }
+
     void processMicrotasks() {
         // Process the microtask queue (for Promises)
         // This is engine-specific:
         // - QuickJS: Call js_std_loop or execute pending jobs
         // - V8: Microtasks are usually auto-processed
-        // - JSC: Promises resolve through runloop integration
 
         // For now, QuickJS needs explicit job execution
         if (jsEngine_ && jsEngine_->getType() == js::EngineType::QuickJS) {
@@ -3364,19 +4110,30 @@ globalThis.__mystralNativeDecodeDracoAsync = function(buffer, attrs) {
             // but that requires access to the raw context
         }
 
-        // V8 and JSC handle microtasks automatically in their runloops
+        // V8 handles microtasks automatically; QuickJS drains pending jobs in engine calls.
         // So we don't need to do anything special for them
     }
 
     RuntimeConfig config_;
     bool running_;
     int exitCode_ = 0;  // Exit code set by process.exit()
+    bool paused_ = false;
+    uint32_t stepFramesRemaining_ = 0;
+    uint64_t frameCount_ = 0;
+    bool profilerActive_ = false;
+    std::chrono::steady_clock::time_point profilerStartedAt_;
+    RuntimeMemorySnapshot profilerMemoryStart_;
+    workers::WorkerRegistryStats profilerWorkerStart_;
+    uint64_t profilerSharedMemoryStartBytes_ = 0;
+    std::vector<FrameProfileSample> profilerSamples_;
     int width_;
     int height_;
 
     std::unique_ptr<webgpu::Context> webgpu_;
     std::unique_ptr<js::Engine> jsEngine_;
     std::unique_ptr<js::ModuleSystem> moduleSystem_;
+    std::shared_ptr<workers::SharedBufferRegistry> sharedBuffers_;
+    std::unique_ptr<workers::WorkerRegistry> workerRegistry_;
     storage::LocalStorage localStorage_;
 
     // requestAnimationFrame state
@@ -3388,6 +4145,8 @@ globalThis.__mystralNativeDecodeDracoAsync = function(buffer, attrs) {
     int nextRafId_ = 1;
 
     // setTimeout/setInterval state
+    uint64_t jsGeneration_ = 1;
+
 #ifdef MYSTRAL_USE_LIBUV_TIMERS
     // libuv-based timer context
     struct UvTimerContext {
@@ -3396,6 +4155,7 @@ globalThis.__mystralNativeDecodeDracoAsync = function(buffer, attrs) {
         js::JSValueHandle callback;
         int intervalMs;  // 0 for setTimeout, >0 for setInterval
         bool cancelled;
+        bool callbackProtected;
         RuntimeImpl* runtime;  // Back-reference for callback
     };
     std::map<int, std::unique_ptr<UvTimerContext>> uvTimers_;
@@ -3450,6 +4210,7 @@ globalThis.__mystralNativeDecodeDracoAsync = function(buffer, attrs) {
         // JS callback + back-reference
         js::JSValueHandle callback;
         RuntimeImpl* runtime = nullptr;
+        uint64_t generation = 0;
     };
     std::queue<std::unique_ptr<DracoDecodeContext>> pendingDracoCallbacks_;
     std::mutex dracoMutex_;
@@ -3469,8 +4230,36 @@ globalThis.__mystralNativeDecodeDracoAsync = function(buffer, attrs) {
 
     // Hot reload state
     std::string scriptPath_;  // Path to the currently loaded script
+    std::string watchedScriptName_;
     int watchId_ = -1;        // File watcher ID (-1 if not watching)
     bool reloadRequested_ = false;  // Set when a file change is detected
+    std::chrono::steady_clock::time_point reloadDeadline_{};
+    bool reloadCandidateObserved_ = false;
+    uintmax_t reloadCandidateSize_ = 0;
+    std::filesystem::file_time_type reloadCandidateWriteTime_{};
+    std::chrono::steady_clock::time_point reloadCandidateSince_{};
+
+    void clearDOMEventListeners() {
+        if (!jsEngine_) {
+            eventListeners_.clear();
+            return;
+        }
+        size_t count = 0;
+        for (auto& [target, byType] : eventListeners_) {
+            for (auto& [type, listeners] : byType) {
+                for (auto& listener : listeners) {
+                    if (listener.callback.ptr) {
+                        jsEngine_->unprotect(listener.callback);
+                        count++;
+                    }
+                }
+            }
+        }
+        eventListeners_.clear();
+        if (count > 0) {
+            std::cout << "[HotReload] Released " << count << " DOM listeners" << std::endl;
+        }
+    }
 
     void setupDOMEvents() {
         if (!jsEngine_) return;
@@ -3753,6 +4542,31 @@ globalThis.__mystralNativeDecodeDracoAsync = function(buffer, attrs) {
                 }
                 return { tagName: (tagName || '').toUpperCase(), style: {} };
             };
+            // Namespaced variant — libraries (e.g. three.js loaders) create
+            // elements via createElementNS('http://www.w3.org/1999/xhtml', tag)
+            document.createElementNS = function(namespaceURI, tagName) {
+                return document.createElement(tagName);
+            };
+            // DOM event class globals — browser code type-checks events with
+            // `instanceof PointerEvent` etc.; without these constructors that
+            // check is a ReferenceError. Dispatched events are still plain
+            // objects (instanceof yields false) — code should duck-type until
+            // dispatch constructs real instances.
+            if (typeof globalThis.Event === 'undefined') {
+                globalThis.Event = class Event {
+                    constructor(type, init) {
+                        this.type = String(type || '');
+                        Object.assign(this, init || {});
+                    }
+                    preventDefault() {}
+                    stopPropagation() {}
+                };
+            }
+            globalThis.UIEvent ??= class UIEvent extends globalThis.Event {};
+            globalThis.MouseEvent ??= class MouseEvent extends globalThis.UIEvent {};
+            globalThis.PointerEvent ??= class PointerEvent extends globalThis.MouseEvent {};
+            globalThis.WheelEvent ??= class WheelEvent extends globalThis.MouseEvent {};
+            globalThis.KeyboardEvent ??= class KeyboardEvent extends globalThis.UIEvent {};
         )";
         jsEngine_->eval(createElementSetup, "createElement-setup");
 

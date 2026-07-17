@@ -37,6 +37,9 @@ mystral run <script.js> [options]
 | `--quiet`, `-q` | flag | - | Suppress all output except errors |
 | `--debug` | flag | - | Enable verbose WebGPU/shader debug logging |
 | `--debug-port` | number | - | Enable debug server on specified port (for testing) |
+| `--benchmark` | number | - | Profile exactly this many frames, then exit |
+| `--warmup` | number | 120 | Frames to execute before profiling begins |
+| `--benchmark-output` | string | - | Write the benchmark report as JSON |
 
 ### Video Recording Options
 
@@ -76,6 +79,112 @@ mystral run game.js --headless --video demo.mp4 --end-frame 600
 # Enable verbose debug logging
 mystral run game.js --debug
 ```
+
+### Fixed Runtime Benchmark
+
+Use the repository's stable CPU workload to compare runtime builds. Warmup frames
+allow the selected JavaScript engine to optimize the workload before measurements
+begin:
+
+```bash
+mystral run benchmarks/runtime-core.js \
+  --no-sdl \
+  --benchmark 600 \
+  --warmup 120 \
+  --benchmark-output runtime-benchmark.json
+```
+
+The profiler reports mean, p50, p95, p99, and maximum time for the complete frame
+and for these runtime phases: events, asynchronous work, callbacks, animation frame,
+and cleanup. It also records frame-budget misses and JavaScript heap snapshots before
+and after the measured window.
+
+Native Worker activity is reported separately as Workers created, messages and
+timer callbacks processed, messages rejected, cumulative Worker busy time, input/output queue bytes at the
+end of the sample, lifetime input/output queue high-water bytes, and shared-memory
+bytes. Rejected messages indicate backpressure rather than silent dropping.
+Worker busy time is not added to main-thread frame time because Workers execute
+concurrently.
+
+The benchmark workload is versioned and intentionally avoids GPU rendering and
+per-frame allocations. Keep its contents unchanged when comparing commits. Use a
+separate script with the same CLI options to profile a real game scene.
+
+### Agent and Test Automation
+
+Start a live game with the local WebSocket debug protocol enabled:
+
+```bash
+mystral run game.js --headless --debug-port 9222
+```
+
+The repository includes a Bun client so an agent or test can control the running
+process without a browser:
+
+```bash
+bun tools/mystral-debug-client.ts hello --port 9222
+bun tools/mystral-debug-client.ts evaluate "globalThis.score" --port 9222
+bun tools/mystral-debug-client.ts pause --port 9222
+bun tools/mystral-debug-client.ts step 3 --port 9222
+bun tools/mystral-debug-client.ts screenshot output.png --port 9222
+bun tools/mystral-debug-client.ts logs --port 9222
+bun tools/mystral-debug-client.ts agent-list --port 9222
+bun tools/mystral-debug-client.ts agent-inspect player --port 9222
+bun tools/mystral-debug-client.ts agent-act player.move '{"x":4,"y":2}' --port 9222
+bun tools/mystral-debug-client.ts quit --port 9222
+```
+
+Games can expose stable semantic IDs, live snapshots, and safe actions without
+coupling the runtime to a particular scene library:
+
+```js
+mystralAgent.exposeInspector("player", () => ({
+  health: player.health,
+  position: { x: player.x, y: player.y }
+}), {
+  label: "Player",
+  kind: "actor",
+  description: "Current player state"
+});
+
+mystralAgent.exposeAction("player.move", ({ x, y }) => {
+  player.moveTo(x, y);
+  return { accepted: true };
+}, {
+  entityId: "player",
+  description: "Move the player in world coordinates",
+  inputSchema: {
+    type: "object",
+    required: ["x", "y"],
+    properties: { x: { type: "number" }, y: { type: "number" } }
+  }
+});
+```
+
+`exposeInspector()` and `exposeAction()` return cleanup functions. Registering
+the same ID again replaces its previous registration, which keeps IDs stable
+when game systems are rebuilt. Inspectors and actions are synchronous in this
+protocol version; an action can still start asynchronous game work and return
+an immediate acknowledgement.
+
+| Protocol method | Purpose |
+|-----------------|---------|
+| `hello` / `getCapabilities` | Negotiate the protocol version and supported methods |
+| `screenshot` | Capture the current WebGPU frame as PNG data |
+| `evaluate` | Evaluate JavaScript and return a JSON-safe result, error, and stack |
+| `getLogs` | Read buffered startup and runtime console entries |
+| `agent.list` | Discover exposed entities, actions, descriptions, and input schemas |
+| `agent.inspect` | Read a live JSON-safe snapshot by stable entity ID |
+| `agent.act` | Run an explicitly exposed game action with JSON input |
+| `pause` / `resume` | Pause or resume game-frame execution while debug I/O remains available |
+| `stepFrames` | Execute a bounded number of frames and remain paused |
+| `waitForFrame` | Wait asynchronously for an absolute or relative frame with a timeout |
+| `keyboard.*`, `mouse.*`, `gamepad.*` | Inject native input through SDL |
+| `quit` | Stop the controlled runtime cleanly |
+
+The server only listens on `127.0.0.1`. Protocol messages are JSON objects sent
+over WebSocket and use numeric request IDs, allowing multiple clients to reuse
+the same request IDs safely.
 
 ## mystral compile
 

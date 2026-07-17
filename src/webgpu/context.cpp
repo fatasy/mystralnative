@@ -11,6 +11,10 @@
 #include <vector>
 #include <thread>
 #include <chrono>
+#include <filesystem>
+#include <fstream>
+#include <mutex>
+#include <cstdlib>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -24,12 +28,10 @@ extern "C" int stbi_write_png(const char* filename, int w, int h, int comp, cons
 #include "mystral/webgpu_compat.h"
 #endif
 
-// Dawn-specific includes for proc table setup
-// Windows uses Skia's dawn_combined.lib which requires proc table initialization
-// Linux/macOS use official Dawn releases which have direct implementations
+// Dawn-specific native API used for adapter/device discovery.
 #if defined(MYSTRAL_WEBGPU_DAWN)
 #include "dawn/native/DawnNative.h"
-#if defined(_WIN32)
+#if defined(MYSTRAL_DAWN_USE_PROC_TABLE)
 #include "dawn/dawn_proc.h"
 #endif
 #endif
@@ -95,6 +97,106 @@ WGPUBool wgpuDevicePoll(WGPUDevice device, WGPUBool wait, WGPUWrappedSubmissionI
 
 namespace mystral {
 namespace webgpu {
+
+#if defined(MYSTRAL_WEBGPU_DAWN)
+namespace {
+
+struct DawnDiskCache {
+    std::filesystem::path directory;
+    std::mutex mutex;
+};
+
+static DawnDiskCache& dawnDiskCache() {
+    static DawnDiskCache cache;
+    static std::once_flag initialized;
+    std::call_once(initialized, [] {
+#ifdef _WIN32
+        const char* base = std::getenv("LOCALAPPDATA");
+        cache.directory = base && *base
+            ? std::filesystem::path(base) / "Mystral" / "cache" / "dawn"
+            : std::filesystem::temp_directory_path() / "Mystral" / "cache" / "dawn";
+#else
+        const char* xdg = std::getenv("XDG_CACHE_HOME");
+        const char* home = std::getenv("HOME");
+        if (xdg && *xdg) cache.directory = std::filesystem::path(xdg) / "mystral" / "dawn";
+        else if (home && *home) cache.directory = std::filesystem::path(home) / ".cache" / "mystral" / "dawn";
+        else cache.directory = std::filesystem::temp_directory_path() / "mystral" / "dawn";
+#endif
+        std::error_code error;
+        std::filesystem::create_directories(cache.directory, error);
+        std::cout << "[WebGPU] Dawn pipeline cache: " << cache.directory.string() << std::endl;
+    });
+    return cache;
+}
+
+static std::string cacheKeyHex(const void* key, size_t keySize) {
+    static constexpr char hex[] = "0123456789abcdef";
+    const auto* bytes = static_cast<const uint8_t*>(key);
+    std::string value;
+    value.resize(keySize * 2);
+    for (size_t i = 0; i < keySize; ++i) {
+        value[i * 2] = hex[bytes[i] >> 4];
+        value[i * 2 + 1] = hex[bytes[i] & 0x0f];
+    }
+    return value;
+}
+
+static std::filesystem::path cachePath(DawnDiskCache& cache, const void* key, size_t keySize) {
+    return cache.directory / (cacheKeyHex(key, keySize) + ".bin");
+}
+
+static size_t loadDawnCacheData(
+    const void* key, size_t keySize, void* value, size_t valueSize, void* userdata) {
+    auto& cache = *static_cast<DawnDiskCache*>(userdata);
+    std::lock_guard<std::mutex> lock(cache.mutex);
+    const auto path = cachePath(cache, key, keySize);
+    std::error_code error;
+    const auto size = std::filesystem::file_size(path, error);
+    if (error) return 0;
+    if (!value || valueSize < size) return static_cast<size_t>(size);
+    std::ifstream input(path, std::ios::binary);
+    if (!input.read(static_cast<char*>(value), static_cast<std::streamsize>(size))) return 0;
+    return static_cast<size_t>(size);
+}
+
+static void storeDawnCacheData(
+    const void* key, size_t keySize, const void* value, size_t valueSize, void* userdata) {
+    auto& cache = *static_cast<DawnDiskCache*>(userdata);
+    std::lock_guard<std::mutex> lock(cache.mutex);
+    std::error_code error;
+    std::filesystem::create_directories(cache.directory, error);
+    const auto path = cachePath(cache, key, keySize);
+    if (!value || valueSize == 0) {
+        std::filesystem::remove(path, error);
+        return;
+    }
+    auto temporary = path;
+    temporary += ".tmp";
+    {
+        std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
+        if (!output.write(static_cast<const char*>(value), static_cast<std::streamsize>(valueSize))) {
+            std::filesystem::remove(temporary, error);
+            return;
+        }
+    }
+    std::filesystem::remove(path, error);
+    error.clear();
+    std::filesystem::rename(temporary, path, error);
+    if (error) std::filesystem::remove(temporary, error);
+}
+
+static void attachDawnCache(WGPUDeviceDescriptor& deviceDesc,
+                            WGPUDawnCacheDeviceDescriptor& cacheDesc) {
+    cacheDesc = WGPU_DAWN_CACHE_DEVICE_DESCRIPTOR_INIT;
+    cacheDesc.isolationKey = WGPU_STRING_VIEW("mystralnative-dawn-v1");
+    cacheDesc.loadDataFunction = loadDawnCacheData;
+    cacheDesc.storeDataFunction = storeDawnCacheData;
+    cacheDesc.functionUserdata = &dawnDiskCache();
+    deviceDesc.nextInChain = &cacheDesc.chain;
+}
+
+} // namespace
+#endif
 
 // Callback data for async operations
 struct AdapterRequestData {
@@ -184,6 +286,34 @@ static void onDeviceError(WGPUErrorType type, char const* message, void* userdat
 }
 #endif
 
+#if defined(MYSTRAL_WEBGPU_WGPU) || defined(MYSTRAL_WEBGPU_DAWN)
+/**
+ * Enumerate every feature the adapter exposes so the device can be created
+ * with all of them — matching what a browser page can opt into (three.js,
+ * for example, requests every available adapter feature when creating its
+ * device). Previously only IndirectFirstInstance was requested, so standard
+ * capabilities such as float32-filterable or the texture-format tiers were
+ * silently missing from the device even when the hardware supports them.
+ */
+static std::vector<WGPUFeatureName> enumerateAdapterFeatures(WGPUAdapter adapter) {
+    std::vector<WGPUFeatureName> features;
+#if defined(MYSTRAL_WEBGPU_DAWN)
+    WGPUSupportedFeatures supported = {};
+    wgpuAdapterGetFeatures(adapter, &supported);
+    features.assign(supported.features, supported.features + supported.featureCount);
+    wgpuSupportedFeaturesFreeMembers(supported);
+#else
+    size_t count = wgpuAdapterEnumerateFeatures(adapter, nullptr);
+    features.resize(count);
+    if (count > 0) {
+        wgpuAdapterEnumerateFeatures(adapter, features.data());
+    }
+#endif
+    std::cout << "[WebGPU] Requesting " << features.size() << " adapter features" << std::endl;
+    return features;
+}
+#endif
+
 #if defined(MYSTRAL_WEBGPU_WGPU)
 static void onWgpuLog(WGPULogLevel level, char const* message, void* userdata) {
     const char* levelStr = "???";
@@ -233,10 +363,7 @@ Context::~Context() {
 bool Context::initialize() {
     std::cout << "[WebGPU] Initializing..." << std::endl;
 
-#if defined(MYSTRAL_WEBGPU_DAWN) && defined(_WIN32)
-    // Windows Dawn (from Skia build) requires setting up the proc table before any WebGPU calls
-    // This connects the wgpu* function calls to Dawn's actual implementation
-    // Linux/macOS Dawn releases have direct implementations and don't need this
+#if defined(MYSTRAL_DAWN_USE_PROC_TABLE)
     dawnProcSetProcs(&dawn::native::GetProcs());
     std::cout << "[WebGPU] Dawn proc table initialized" << std::endl;
 #endif
@@ -342,39 +469,30 @@ bool Context::initializeHeadless() {
     // Request device
     WGPUDeviceDescriptor deviceDesc = {};
     WGPU_SET_LABEL(deviceDesc, "Mystral Headless Device");
+#if defined(MYSTRAL_WEBGPU_DAWN)
+    WGPUDawnCacheDeviceDescriptor cacheDesc;
+    attachDawnCache(deviceDesc, cacheDesc);
+#endif
 
 #if defined(MYSTRAL_WEBGPU_DAWN)
     WGPULimits adapterLimits = {};
     wgpuAdapterGetLimits(adapter_, &adapterLimits);
     WGPULimits requiredLimits = adapterLimits;
     deviceDesc.requiredLimits = &requiredLimits;
-
-    static WGPUFeatureName requiredFeaturesDawn[1];
-    size_t featureCount = 0;
-    if (wgpuAdapterHasFeature(adapter_, WGPUFeatureName_IndirectFirstInstance)) {
-        requiredFeaturesDawn[0] = WGPUFeatureName_IndirectFirstInstance;
-        featureCount = 1;
-        hasIndirectFirstInstance_ = true;
-    }
-    deviceDesc.requiredFeatureCount = featureCount;
-    deviceDesc.requiredFeatures = featureCount > 0 ? requiredFeaturesDawn : nullptr;
 #elif defined(MYSTRAL_WEBGPU_WGPU)
     WGPUSupportedLimits adapterLimits = {};
     wgpuAdapterGetLimits(adapter_, &adapterLimits);
     WGPURequiredLimits requiredLimits = {};
     requiredLimits.limits = adapterLimits.limits;
     deviceDesc.requiredLimits = &requiredLimits;
-
-    static WGPUFeatureName requiredFeaturesWGPU[1];
-    size_t featureCount = 0;
-    if (wgpuAdapterHasFeature(adapter_, WGPUFeatureName_IndirectFirstInstance)) {
-        requiredFeaturesWGPU[0] = WGPUFeatureName_IndirectFirstInstance;
-        featureCount = 1;
-        hasIndirectFirstInstance_ = true;
-    }
-    deviceDesc.requiredFeatureCount = featureCount;
-    deviceDesc.requiredFeatures = featureCount > 0 ? requiredFeaturesWGPU : nullptr;
 #endif
+
+    // Request every adapter feature (see enumerateAdapterFeatures)
+    std::vector<WGPUFeatureName> requiredFeatures = enumerateAdapterFeatures(adapter_);
+    hasIndirectFirstInstance_ =
+        wgpuAdapterHasFeature(adapter_, WGPUFeatureName_IndirectFirstInstance);
+    deviceDesc.requiredFeatureCount = requiredFeatures.size();
+    deviceDesc.requiredFeatures = requiredFeatures.empty() ? nullptr : requiredFeatures.data();
 
     WGPUUncapturedErrorCallbackInfo errorCallbackInfo = {};
     errorCallbackInfo.callback = onDeviceError;
@@ -602,6 +720,10 @@ bool Context::createSurface(void* nativeHandle, int platformType) {
     // Request device with required limits
     WGPUDeviceDescriptor deviceDesc = {};
     WGPU_SET_LABEL(deviceDesc, "Mystral Device");
+#if defined(MYSTRAL_WEBGPU_DAWN)
+    WGPUDawnCacheDeviceDescriptor cacheDesc;
+    attachDawnCache(deviceDesc, cacheDesc);
+#endif
 
     // Set up required limits - copy adapter limits and override what we need
     // WebGPU default is 32 bytes per sample, but deferred rendering needs ~40
@@ -622,22 +744,6 @@ bool Context::createSurface(void* nativeHandle, int platformType) {
     }
 
     deviceDesc.requiredLimits = &requiredLimits;
-
-    // Check if IndirectFirstInstance is supported before requesting it
-    // This feature allows instance_index in shaders to include firstInstance offset
-    static WGPUFeatureName requiredFeaturesDawn[1];
-    size_t featureCount = 0;
-    if (wgpuAdapterHasFeature(adapter_, WGPUFeatureName_IndirectFirstInstance)) {
-        requiredFeaturesDawn[0] = WGPUFeatureName_IndirectFirstInstance;
-        featureCount = 1;
-        hasIndirectFirstInstance_ = true;
-        std::cout << "[WebGPU] Requesting IndirectFirstInstance feature (supported)" << std::endl;
-    } else {
-        hasIndirectFirstInstance_ = false;
-        std::cout << "[WebGPU] IndirectFirstInstance feature NOT supported (continuing without)" << std::endl;
-    }
-    deviceDesc.requiredFeatureCount = featureCount;
-    deviceDesc.requiredFeatures = featureCount > 0 ? requiredFeaturesDawn : nullptr;
 #elif defined(MYSTRAL_WEBGPU_WGPU)
     // wgpu-native uses WGPURequiredLimits wrapper
     WGPUSupportedLimits adapterLimits = {};
@@ -654,23 +760,16 @@ bool Context::createSurface(void* nativeHandle, int platformType) {
     }
 
     deviceDesc.requiredLimits = &requiredLimits;
-
-    // Check if IndirectFirstInstance is supported before requesting it
-    // This feature allows instance_index in shaders to include firstInstance offset
-    static WGPUFeatureName requiredFeaturesWGPU[1];
-    size_t featureCount = 0;
-    if (wgpuAdapterHasFeature(adapter_, WGPUFeatureName_IndirectFirstInstance)) {
-        requiredFeaturesWGPU[0] = WGPUFeatureName_IndirectFirstInstance;
-        featureCount = 1;
-        hasIndirectFirstInstance_ = true;
-        std::cout << "[WebGPU] Requesting IndirectFirstInstance feature (supported)" << std::endl;
-    } else {
-        hasIndirectFirstInstance_ = false;
-        std::cout << "[WebGPU] IndirectFirstInstance feature NOT supported (continuing without)" << std::endl;
-    }
-    deviceDesc.requiredFeatureCount = featureCount;
-    deviceDesc.requiredFeatures = featureCount > 0 ? requiredFeaturesWGPU : nullptr;
 #endif
+
+    // Request every adapter feature (see enumerateAdapterFeatures)
+    std::vector<WGPUFeatureName> requiredFeatures = enumerateAdapterFeatures(adapter_);
+    hasIndirectFirstInstance_ =
+        wgpuAdapterHasFeature(adapter_, WGPUFeatureName_IndirectFirstInstance);
+    std::cout << "[WebGPU] IndirectFirstInstance "
+              << (hasIndirectFirstInstance_ ? "supported" : "NOT supported") << std::endl;
+    deviceDesc.requiredFeatureCount = requiredFeatures.size();
+    deviceDesc.requiredFeatures = requiredFeatures.empty() ? nullptr : requiredFeatures.data();
 
     // Set up error callback
     WGPUUncapturedErrorCallbackInfo errorCallbackInfo = {};
@@ -810,6 +909,10 @@ bool Context::createSurfaceWithDisplay(void* display, void* window, int platform
     // Request device with required limits - same as createSurface
     WGPUDeviceDescriptor deviceDesc = {};
     WGPU_SET_LABEL(deviceDesc, "Mystral Device");
+#if defined(MYSTRAL_WEBGPU_DAWN)
+    WGPUDawnCacheDeviceDescriptor cacheDesc;
+    attachDawnCache(deviceDesc, cacheDesc);
+#endif
 
 #if defined(MYSTRAL_WEBGPU_DAWN)
     WGPULimits adapterLimits = {};
@@ -820,16 +923,6 @@ bool Context::createSurfaceWithDisplay(void* display, void* window, int platform
         requiredLimits.maxColorAttachmentBytesPerSample = neededBytesPerSample;
     }
     deviceDesc.requiredLimits = &requiredLimits;
-
-    static WGPUFeatureName requiredFeaturesDawn[1];
-    size_t featureCount = 0;
-    if (wgpuAdapterHasFeature(adapter_, WGPUFeatureName_IndirectFirstInstance)) {
-        requiredFeaturesDawn[0] = WGPUFeatureName_IndirectFirstInstance;
-        featureCount = 1;
-        hasIndirectFirstInstance_ = true;
-    }
-    deviceDesc.requiredFeatureCount = featureCount;
-    deviceDesc.requiredFeatures = featureCount > 0 ? requiredFeaturesDawn : nullptr;
 #elif defined(MYSTRAL_WEBGPU_WGPU)
     WGPUSupportedLimits adapterLimits = {};
     wgpuAdapterGetLimits(adapter_, &adapterLimits);
@@ -840,17 +933,14 @@ bool Context::createSurfaceWithDisplay(void* display, void* window, int platform
         requiredLimits.limits.maxColorAttachmentBytesPerSample = neededBytesPerSample;
     }
     deviceDesc.requiredLimits = &requiredLimits;
-
-    static WGPUFeatureName requiredFeaturesWGPU[1];
-    size_t featureCount = 0;
-    if (wgpuAdapterHasFeature(adapter_, WGPUFeatureName_IndirectFirstInstance)) {
-        requiredFeaturesWGPU[0] = WGPUFeatureName_IndirectFirstInstance;
-        featureCount = 1;
-        hasIndirectFirstInstance_ = true;
-    }
-    deviceDesc.requiredFeatureCount = featureCount;
-    deviceDesc.requiredFeatures = featureCount > 0 ? requiredFeaturesWGPU : nullptr;
 #endif
+
+    // Request every adapter feature (see enumerateAdapterFeatures)
+    std::vector<WGPUFeatureName> requiredFeatures = enumerateAdapterFeatures(adapter_);
+    hasIndirectFirstInstance_ =
+        wgpuAdapterHasFeature(adapter_, WGPUFeatureName_IndirectFirstInstance);
+    deviceDesc.requiredFeatureCount = requiredFeatures.size();
+    deviceDesc.requiredFeatures = requiredFeatures.empty() ? nullptr : requiredFeatures.data();
 
     WGPUUncapturedErrorCallbackInfo errorCallbackInfo = {};
     errorCallbackInfo.callback = onDeviceError;

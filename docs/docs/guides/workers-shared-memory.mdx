@@ -1,0 +1,336 @@
+# Workers and Shared Memory: LLM Handoff
+
+This document is the implementation guide and architectural contract for MystralNative's parallel JavaScript Workers and shared-memory APIs. It is written so that another LLM or contributor can continue the work without assuming browser behavior that the runtime does not implement.
+
+## Scope and mental model
+
+MystralNative runs the game entry point in one JavaScript engine instance (the **main isolate**). Every `Worker` runs on a real OS thread with its own JavaScript engine instance and its own heap. JavaScript objects, closures, module state, and garbage-collected heaps are never shared between those instances.
+
+Cross-thread communication has two paths:
+
+1. `postMessage` copies JSON-compatible control data through native queues.
+2. A `postMessage` transfer list moves plain `ArrayBuffer` ownership and detaches the sender.
+3. `SharedBuffer`, `SharedTable`, and `SharedQueue` expose explicitly shared, typed memory without copying the backing bytes.
+
+```text
+main JS isolate
+  | Worker constructor / postMessage
+  v
+runtime-owned WorkerRegistry
+  | owns WorkerThread objects and native message queues
+  +--------------------+--------------------+
+  v                    v                    v
+OS thread 1          OS thread 2          OS thread N
+JS isolate 1         JS isolate 2         JS isolate N
+  \_____________________|____________________/
+                 SharedBufferStorage
+          (native bytes with shared lifetime)
+```
+
+This is intentionally not a shared JavaScript heap. The runtime shares storage; each isolate creates its own `SharedArrayBuffer` and typed-array wrapper over the same native bytes.
+
+## Source-of-truth map
+
+| Responsibility | Files |
+| --- | --- |
+| Worker lifecycle, thread entry point, Worker-side globals | `include/mystral/workers/worker_thread.h`, `src/workers/worker_thread.cpp` |
+| Runtime-owned Worker collection and message routing | `include/mystral/workers/worker_registry.h`, `src/workers/worker_registry.cpp` |
+| Shared storage registry, native hooks, JS schemas | `include/mystral/workers/shared_buffer.h`, `src/workers/shared_buffer.cpp` |
+| Main-thread Worker facade and event-loop draining | `src/runtime.cpp` |
+| JavaScript engine shared/transfer backing-store contract | `include/mystral/js/engine.h` |
+| V8 external shared and transferable backing stores | `src/js/v8_engine.cpp` |
+| QuickJS shared/transfer backing stores and Atomics fallback | `src/js/quickjs_engine.cpp` |
+| Virtual `mystral/shared` and `mystral/worker-pool` modules | `src/js/module_resolver.cpp` |
+| Fixed benchmark | `benchmarks/worker-shared.mjs`, `benchmarks/worker-shared-worker.mjs`, `benchmarks/worker-shared-schema.mjs` |
+| Native cross-isolate smoke test | `tests/native/worker-shared-smoke.cpp`, `tests/native/fixtures/worker-shared-module.mjs`, `tests/native/fixtures/worker-pool-module.mjs` |
+
+When changing behavior, update the native contract and the JavaScript facade together. Do not patch only the browser-like wrapper in `runtime.cpp`.
+
+## Worker lifecycle
+
+The current lifecycle is:
+
+1. Runtime startup creates one `WorkerRegistry` and one `SharedBufferRegistry`. They belong to that runtime instance; neither is a process-global singleton.
+2. `setupURL()` installs the public `Worker` class and the private native hooks `__mystralWorkerCreate`, `__mystralWorkerPostMessage`, and `__mystralWorkerTerminate` in the main isolate.
+3. `new Worker(source, options)` asks `WorkerRegistry` to create a `WorkerThread`.
+4. `WorkerThread` starts a `std::thread`, creates a new engine of the configured kind, installs shared-memory APIs and Worker globals, then evaluates either a classic script or an ES module.
+5. Incoming messages and monotonic timer deadlines wait on a `condition_variable`. There is no polling loop.
+6. The Worker parses a message, reconstructs transferred buffers, calls its `message` listeners and `onmessage`, then queues outbound messages produced by `postMessage`.
+7. The main runtime calls `processWorkerMessages()` during its event loop. It drains native outbound queues and invokes `__mystralDispatchWorkerMessage` in the main isolate.
+8. `terminate()`, runtime shutdown, and hot reload request stop, interrupt currently executing JavaScript on V8/QuickJS, and join Worker threads before destroying the main JavaScript engine.
+
+Internally the lifecycle is explicit: `Created`, `Starting`, `Running`, `Stopping`, `Stopped`, or `Failed`. A Worker also emits an internal exit message so the main-side facade removes Workers that call `close()` or fail during startup.
+
+In `--no-sdl` mode, a live Worker counts as pending event-loop work. The runtime stays alive until the Worker calls `close()`, exits after a failure, or is terminated. Call `worker.terminate()` or `pool.terminate()` when a long-lived Worker is no longer needed.
+
+Each Worker has these globals:
+
+- `self`
+- `onmessage` and `onerror`
+- `addEventListener` and `removeEventListener`
+- `postMessage`
+- `close`
+- `importScripts`
+- `setTimeout`, `clearTimeout`, `setInterval`, and `clearInterval`
+- `queueMicrotask`
+
+An internal ready event only marks the main-side `Worker` as ready. It is not emitted to the user's `onmessage` handler.
+
+### Script and module sources
+
+A Blob or Blob URL is treated as a classic script. A path/URL is treated as a module and is loaded by MystralNative's module resolver. Module imports resolve relative to their referrer. Source paths begin at the runtime root/current working directory.
+
+Do not assume full browser URL or Worker semantics. In particular, `postMessage` is currently JSON-compatible plus explicit `ArrayBuffer` transfers, not the browser structured-clone algorithm.
+
+## Message contract
+
+Ordinary messages use `JSON.stringify` in the sender and `JSON.parse` in the receiver. They are copied through native queues and therefore must be JSON-compatible.
+
+Each direction is bounded by default to 1,024 queued user messages and 16 MiB per Worker. Input `postMessage()` returns a deterministic native status that the public facade maps to `RangeError` for a full queue or oversized message. Worker-side output uses the same limits and throws inside the Worker when saturated. Messages are never silently added beyond the configured bounds; internal ready/exit lifecycle signals are reserved so saturation cannot hide shutdown.
+
+Supported examples include numbers, strings, booleans, `null`, arrays, plain objects, shared handles, and plain `ArrayBuffer` values listed in the second `postMessage` argument. Functions, cyclic graphs, symbols, prototypes, `undefined` as a complete payload, typed-array views as transfer-list entries, and arbitrary class instances are not supported.
+
+```js
+const bytes = new ArrayBuffer(1024);
+worker.postMessage({ bytes }, [bytes]);
+// bytes.byteLength === 0
+```
+
+The serialized payload contains an indexed transfer marker and the native queue owns the backing bytes until the receiver constructs its local `ArrayBuffer`. Queue byte accounting includes both JSON and transferred bytes. V8 detaches and moves its backing store without copying. QuickJS performs one extraction copy because its engine API cannot safely move an arbitrary heap-owned buffer, then attaches the retained native bytes at the receiver without another copy. Duplicate entries, non-`ArrayBuffer` entries, and buffers already transferred through the public API fail explicitly.
+
+Shared-memory handles are JSON objects whose underlying buffer marker is:
+
+```js
+{ $mystralSharedBuffer: numericId }
+```
+
+The JSON reviver recognizes that marker and attaches a local `SharedArrayBuffer` wrapper to the same native storage. Only the small descriptor crosses the queue; the backing bytes are not copied.
+
+## Shared-memory ownership and lifetime
+
+`SharedBufferRegistry` allocates zero-initialized `SharedBufferStorage` and assigns a numeric ID. The registry keeps strong ownership so another isolate can attach after receiving a handle. Engine-specific backing-store callbacks also retain shared ownership while a JavaScript buffer wrapper exists.
+
+`SharedBuffer.release()` removes the registry's ownership for that ID. Existing attached wrappers can keep the storage alive, but no new isolate should be expected to attach after release. Application code must therefore release only after every required attachment has completed and the shared region is being retired.
+
+Engine status:
+
+| Engine | Worker isolation | Forced termination | Shared memory |
+| --- | --- | --- | --- |
+| V8 | Supported | `TerminateExecution()` | Supported with an external `v8::SharedArrayBuffer` backing store |
+| QuickJS | Supported | Runtime interrupt handler | Supported with a shared external `ArrayBuffer` and native sequentially consistent Atomics fallback |
+
+QuickJS's fallback Atomics currently supports `Int32Array` operations: `load`, `store`, `add`, `sub`, `exchange`, `compareExchange`, `and`, `or`, `xor`, `isLockFree(4)`, and a no-op `notify`. It does not implement `Atomics.wait`.
+
+## Public shared API
+
+Import the virtual module from every module that defines or attaches a schema:
+
+```js
+import { SharedBuffer, SharedTable, SharedQueue } from 'mystral/shared';
+```
+
+The module is virtual. There is no package file for an application to copy, and a Worker knows a schema only because its own module imports the schema definition. A schema name alone does not generate a JavaScript binding.
+
+### SharedBuffer
+
+```js
+const bytes = SharedBuffer.allocate(4096);
+const view = new Uint32Array(bytes.buffer);
+
+worker.postMessage({ buffer: bytes });
+
+// Equivalent explicit descriptor:
+const handle = bytes.handle();
+const attached = SharedBuffer.attach(handle);
+```
+
+Public members are `id`, `byteLength`, `buffer`, `handle()`, `toJSON()`, and `release()`.
+
+### SharedTable
+
+`SharedTable` is a fixed-capacity structure-of-arrays store. Define the same schema in an ordinary shared application module and import that definition from both main and Worker modules:
+
+```js
+// character-rows.mjs
+import { SharedTable } from 'mystral/shared';
+
+export const CharacterRows = SharedTable.define('game.characters.v1', {
+  templateIndex: 'u16',
+  settlementId: 'u32',
+  householdRef: 'u32',
+  birthDay: 'i32',
+  energy: 'f32',
+});
+```
+
+```js
+// main.mjs
+import { CharacterRows } from './character-rows.mjs';
+
+const characters = CharacterRows.create({ capacity: 200_000 });
+characters.length = 100_000;
+characters.templateIndex[0] = 12;
+
+worker.postMessage({ characters: characters.handle() });
+```
+
+```js
+// character-worker.mjs
+import { CharacterRows } from './character-rows.mjs';
+
+self.onmessage = ({ data }) => {
+  const characters = CharacterRows.attach(data.characters);
+  for (let i = data.begin; i < data.end; i++) {
+    characters.energy[i] += 1;
+  }
+  postMessage({ type: 'done' });
+};
+```
+
+This answers the important ownership question: `CharacterRows` is application code, defined once in `character-rows.mjs` and imported independently into each isolate. The native runtime provides `SharedTable`; it does not know the game's character schema.
+
+Supported field types are `u8`, `i8`, `u16`, `i16`, `u32`, `i32`, `f32`, and `f64`. Fields appear directly as typed arrays on the attached instance.
+
+The first 64 bytes are a control header. Its relevant `Int32` slots are:
+
+| Index | Meaning |
+| --- | --- |
+| 0 | 32-bit schema hash |
+| 1 | capacity |
+| 2 | current length |
+
+The schema ID, ordered field names/types, capacity, backing-buffer size, and header are validated during attachment. Changing a schema requires a new versioned `schemaId`, for example `game.characters.v2`.
+
+`SharedTable` does not resize transparently. `CharacterRows.resize(characters, { capacity })` allocates a new table, copies `min(oldLength, capacity)` rows field by field, and returns the migrated instance. The old table remains valid. Use a game-controlled safe point: stop writers, call `resize`, distribute the new handle, wait for acknowledgements, then call `oldTable.release()`. Shrinking truncates `length` to the new capacity.
+
+### SharedQueue
+
+`SharedQueue` is a bounded **single-producer/single-consumer** (SPSC) ring for typed records:
+
+```js
+const Commands = SharedQueue.define('game.commands.v1', {
+  kind: 'u16',
+  entity: 'u32',
+  value: 'f32',
+});
+
+const commands = Commands.create({ capacity: 4096 });
+commands.push({ kind: 1, entity: 42, value: 3.5 }); // false when full
+
+const command = commands.pop(); // null when empty
+```
+
+It uses `capacity + 1` physical slots so full and empty states are distinguishable. Header slots are schema hash, logical capacity, producer head, and consumer tail. The producer writes a record before publishing the new head atomically; the consumer reads only published records and then advances the tail.
+
+Do not use one queue with multiple producers or multiple consumers. Create separate SPSC queues or implement a separately specified MPSC/MPMC primitive with the required algorithm and tests. Do not silently broaden this class's contract.
+
+## Deterministic WorkerPool
+
+The virtual `mystral/worker-pool` module exports `WorkerPool`, `exposeWorkerTask`, `transferResult`, and `deterministicPartitions`.
+
+- `new WorkerPool(url, { size, name })` creates a fixed set of module Workers.
+- `pool.run(data, { start, end })` or `pool.run(data, { length })` assigns stable contiguous ranges. Lower Worker indexes receive remainder rows.
+- Only one round can be active. The returned Promise resolves at a barrier after one result from every Worker and preserves Worker-index order.
+- Duplicate/stale Worker results do not advance the barrier.
+- A task error rejects the round and terminates the pool.
+- `pool.resizeTable(definition, table, options)` delegates to explicit table migration and rejects while the pool is busy. It cannot guard unrelated Workers, so the global safe-point rule still applies.
+
+Worker modules install one task handler:
+
+```js
+import { exposeWorkerTask, transferResult } from 'mystral/worker-pool';
+
+exposeWorkerTask(({ data, begin, end, round, workerIndex, workerCount }) => {
+  // Mutate only the assigned shared-memory partition.
+  return { begin, end };
+  // For binary output: return transferResult({ bytes }, [bytes]);
+});
+```
+
+## Integrating an existing CharacterStore
+
+Keep the store as the domain API and invariant owner. Replace its private typed-array storage with views supplied by an attached `SharedTable`; do not replace all store methods with raw array access throughout the game.
+
+For a store with fields such as `templateIndices: Uint16Array`, `settlementIds: Uint32Array`, `householdRefs: Uint32Array`, and `birthDays: Int32Array`, the direct schema mapping is `u16`, `u32`, `u32`, and `i32`. Other hot simulation fields can be added when they have a clear owner.
+
+Recommended division of responsibility:
+
+- Main thread owns entity creation, deletion, packed-reference allocation, render state, and WebGPU resources.
+- Workers read stable identity/liveness metadata and update explicitly assigned row ranges or components.
+- Each mutable region has one writer during a simulation phase.
+- Workers report completion or compact commands through `SharedQueue`/`postMessage`; the main thread applies structural changes at a safe point.
+
+If entity references encode index, generation, or namespace bits, continue validating them through the allocator/store contract. Sharing the underlying arrays must not bypass stale-reference checks.
+
+## Concurrency invariants
+
+These rules are part of the implementation contract:
+
+1. Never access a JavaScript object created by one isolate from another isolate.
+2. Give each mutable field or row partition one writer per phase.
+3. Use Atomics for synchronization words, counters, ownership flags, and publication. Do not make every numeric component atomic by default.
+4. Never resize, release, or replace a region while Workers may still attach to or use it.
+5. Keep rendering and WebGPU ownership on the main thread until a separate, verified graphics-thread contract exists.
+6. Treat `SharedQueue` as SPSC.
+7. Treat messages as JSON-compatible plus explicit plain-`ArrayBuffer` transfers, not structured clone.
+8. Version schemas when their binary layout changes.
+9. Terminate/join Workers before destroying their engine or shared registries.
+
+Shared memory removes serialization and copying cost for bulk state, but introduces data races, false sharing, cache-coherency traffic, fixed-capacity planning, and more difficult debugging. Parallel execution is only faster when each task contains enough work to amortize scheduling and synchronization.
+
+## Profiling and fixed benchmark
+
+The runtime profiler records Worker count, processed messages, processed timer callbacks, rejected messages, cumulative Worker busy time, input/output queue bytes at sample end, lifetime queue high-water bytes, and shared-memory bytes at start/end. Use those measurements together with frame/tick time; Worker utilization by itself does not prove a faster game loop. Any rejected message means a producer reached backpressure and must reduce traffic, batch work, or use a shared queue.
+
+The fixed benchmark uses 200,000 rows, four Workers, ten warmup samples, and fifty measured samples. It initializes baseline and parallel tables identically, assigns exclusive row partitions, and validates checksum equality before reporting median, p95, and p99.
+
+```bash
+mystral run benchmarks/worker-shared.mjs
+```
+
+Do not change its fixed inputs when comparing runtime changes. Create an additional benchmark if a different workload is needed.
+
+## Validation commands
+
+Recommended V8 + Dawn build:
+
+```bash
+cmake -B build \
+  -DMYSTRAL_USE_V8=ON \
+  -DMYSTRAL_USE_DAWN=ON \
+  -DMYSTRAL_USE_QUICKJS=OFF \
+  -DMYSTRAL_USE_WGPU=OFF \
+  -DMYSTRAL_BUILD_NATIVE_TESTS=ON
+cmake --build build --parallel
+ctest --test-dir build -R mystral-worker-shared-smoke --output-on-failure
+```
+
+Then run the fixed benchmark with the built `mystral` executable. The native smoke test verifies both virtual modules, schema mismatch rejection, explicit table grow/shrink migration, shared-queue full/wrap behavior, cross-isolate attachment and mutation, transferable-buffer detach/round-trip behavior, real timers and cancellation, deterministic WorkerPool partitions/barriers, input/output backpressure, oversized-message rejection, forced interruption of an infinite loop, `close()`, startup failure, rapid registry shutdown, and clean teardown on V8 and QuickJS.
+
+## Safe extension guide
+
+When extending this subsystem:
+
+- New table field type: add it to `TYPE_INFO`, define alignment and typed-array behavior, then cover create/attach and schema mismatch.
+- New message value category: decide whether it is copied, transferred, or shared; specify lifetime and failure behavior before changing serialization.
+- Queue with additional producers/consumers: create a new primitive with an explicit memory-ordering algorithm instead of modifying SPSC semantics in place.
+- New resize policy: preserve the explicit safe-point migration protocol; do not mutate a live backing-store size or replace attached views.
+- Worker graphics access: keep it out of this subsystem unless device/thread affinity and shutdown ordering have a separate design and validation plan.
+
+## Change checklist
+
+Before considering a Worker/shared-memory change complete, verify:
+
+- Main and Worker isolates still own independent JS heaps.
+- Worker shutdown interrupts executing JavaScript on V8/QuickJS and joins all native threads.
+- Input/output queues remain bounded and rejection metrics are observable.
+- Shared backing storage cannot be freed while an engine wrapper uses it.
+- Schema/layout mismatch fails explicitly.
+- Every shared mutable region has a documented writer.
+- Queue producer/consumer cardinality matches its contract.
+- Correctness is checked with deterministic output/checksum, not timing alone.
+- V8 and QuickJS paths are tested when changed.
+- Timer callbacks sleep until their deadline and remain interruptible during shutdown.
+- WorkerPool partitions and barrier result order remain deterministic.
+- Profiler metrics and the fixed benchmark still work.
+- Public docs and this handoff are updated when the contract changes.

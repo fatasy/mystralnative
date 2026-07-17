@@ -12,7 +12,7 @@ namespace js {
 
 namespace {
 
-ModuleSystem* g_moduleSystem = nullptr;
+thread_local ModuleSystem* g_moduleSystem = nullptr;
 
 bool startsWith(const std::string& value, const std::string& prefix) {
     return value.rfind(prefix, 0) == 0;
@@ -125,10 +125,9 @@ bool ModuleSystem::loadEntry(const std::string& entryPath) {
     }
 
     if (resolved.format == ModuleFormat::ESM) {
-        // JSC and QuickJS don't have native ESM support in eval(), so transpile to CJS.
+        // QuickJS uses the CJS transpilation path for entry ESM.
         // V8 has native ESM support via its module API (handled by loadEsmEntry).
-        if (engine_->getType() == EngineType::JavaScriptCore ||
-            engine_->getType() == EngineType::QuickJS) {
+        if (engine_->getType() == EngineType::QuickJS) {
             std::string cjs = transpileEsmToCjs(source);
             ResolvedModule cjsModule = resolved;
             cjsModule.format = ModuleFormat::CJS;
@@ -164,9 +163,8 @@ JSValueHandle ModuleSystem::require(const std::string& specifier, const std::str
     }
 
     if (resolved.format == ModuleFormat::ESM) {
-        // JSC and QuickJS don't have native ESM support in eval(), so transpile to CJS.
-        if (engine_->getType() == EngineType::JavaScriptCore ||
-            engine_->getType() == EngineType::QuickJS) {
+        // QuickJS uses the CJS transpilation path for required ESM.
+        if (engine_->getType() == EngineType::QuickJS) {
             std::string source;
             if (!resolver_.readFile(resolved.resolved, source, error)) {
                 std::cerr << "[Modules] Failed to read module: " << error << std::endl;
@@ -400,6 +398,7 @@ std::string ModuleSystem::escapeJsString(const std::string& input) const {
 std::string ModuleSystem::transpileEsmToCjs(const std::string& source) const {
     std::istringstream input(source);
     std::ostringstream output;
+    std::vector<std::string> deferredExports;
     bool usesExports = false;
 
     std::string line;
@@ -469,14 +468,14 @@ std::string ModuleSystem::transpileEsmToCjs(const std::string& source) const {
             usesExports = true;
             line = std::regex_replace(line, std::regex("^\\s*export\\s+default\\s+"), "");
             output << line << "\n";
-            output << "exports.default = " << match[1] << ";\n";
+            deferredExports.push_back("exports.default = " + match[1].str() + ";");
             continue;
         }
         if (std::regex_search(trimmed, match, exportDefaultClass)) {
             usesExports = true;
             line = std::regex_replace(line, std::regex("^\\s*export\\s+default\\s+"), "");
             output << line << "\n";
-            output << "exports.default = " << match[1] << ";\n";
+            deferredExports.push_back("exports.default = " + match[1].str() + ";");
             continue;
         }
         if (std::regex_match(trimmed, match, exportNamedFrom)) {
@@ -527,7 +526,7 @@ std::string ModuleSystem::transpileEsmToCjs(const std::string& source) const {
             usesExports = true;
             line = std::regex_replace(line, std::regex("^\\s*export\\s+"), "");
             output << line << "\n";
-            output << "exports." << match[2] << " = " << match[2] << ";\n";
+            deferredExports.push_back("exports." + match[2].str() + " = " + match[2].str() + ";");
             continue;
         }
         if (std::regex_match(trimmed, match, exportDefault)) {
@@ -537,6 +536,10 @@ std::string ModuleSystem::transpileEsmToCjs(const std::string& source) const {
         }
 
         output << line << "\n";
+    }
+
+    for (const auto& assignment : deferredExports) {
+        output << assignment << "\n";
     }
 
     if (usesExports) {

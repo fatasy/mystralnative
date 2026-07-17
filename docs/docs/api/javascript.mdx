@@ -14,7 +14,9 @@ Mystral Native.js implements standard Web APIs for graphics, audio, networking, 
 | WebSockets | In progress | Planned — see [Roadmap](#roadmap-realtime-networking) |
 | WebRTC | In progress | Planned — see [Roadmap](#roadmap-realtime-networking) |
 | URL / URLSearchParams | Full | URL parsing and query string handling |
-| Worker | Partial | Main-thread polyfill with async message passing |
+| Worker | Full | Native OS thread with an independent JS engine |
+| WorkerPool / transferable ArrayBuffer | Full | Deterministic barriers and binary ownership transfer |
+| SharedBuffer / SharedTable / SharedQueue | Full on V8 and QuickJS | Zero-copy shared game state via `mystral/shared` |
 | Blob | Full | Binary data containers |
 | TextEncoder / TextDecoder | Full | UTF-8 encoding/decoding |
 | Gamepad | Full | Controller support |
@@ -327,33 +329,165 @@ URL.revokeObjectURL(blobUrl);
 
 ## Worker
 
-Main-thread Worker polyfill that enables WebWorker-based libraries (like Draco mesh decoders) to function in the native runtime. Workers run on the main thread with async message passing via `setTimeout`.
+Each Worker runs on its own OS thread with an independent JavaScript engine and
+heap. Module workers can load JavaScript or TypeScript through the runtime module
+resolver. JSON-compatible control data uses `postMessage`; shared game state is
+passed by handle without copying its backing memory.
 
 ```javascript
-// Create a worker from a blob URL
-const code = `self.onmessage = (e) => { postMessage(e.data * 2); };`;
-const blob = new Blob([code]);
-const url = URL.createObjectURL(blob);
-const worker = new Worker(url);
+const worker = new Worker('./workers/simulation.ts', {
+    type: 'module',
+    name: 'simulation',
+});
 
 worker.onmessage = (e) => console.log("Result:", e.data);
 worker.postMessage(21); // Result: 42
 worker.terminate();
 ```
 
-### `importScripts` Support
+Blob workers and classic `importScripts()` remain supported. The worker loop is
+event-driven and sleeps until a message or timer is due. Worker globals include
+real `setTimeout`, `clearTimeout`, `setInterval`, `clearInterval`, and
+`queueMicrotask`. Timers use a monotonic native clock and do not busy-poll.
 
-The Worker polyfill supports `importScripts()`, matching the standard WebWorker behavior. Scripts are loaded synchronously from the embedded bundle or filesystem using `__readFileSync`, then executed via `eval`.
+Plain `ArrayBuffer` values can be transferred with ownership semantics. The
+sender is detached when `postMessage` accepts the transfer list:
 
 ```javascript
-// Inside worker code:
-importScripts('draco_decoder.js');
-importScripts('lib1.js', 'lib2.js'); // Multiple scripts supported
+const vertices = new ArrayBuffer(4 * 1024 * 1024);
+worker.postMessage({ vertices }, [vertices]);
+console.log(vertices.byteLength); // 0
 ```
 
-This enables libraries like the Draco mesh decoder to load their WASM glue code via `importScripts` without falling back to `fetch + eval`.
+The receiving isolate gets a normal `ArrayBuffer` at the same property. V8 moves
+the backing store without copying. QuickJS copies once while extracting the
+sender bytes, then attaches those bytes at the receiver without a second copy.
+Duplicate entries, non-`ArrayBuffer` entries, and detached buffers are rejected.
 
-> **Note:** Workers run on the main thread, not in a separate thread. This is sufficient for libraries that use Workers for code isolation (like Draco) but won't provide parallel execution.
+Input and output user-message queues are bounded to 1,024 messages and 16 MiB per Worker.
+`postMessage()` throws `RangeError` when the input queue is full or a serialized
+message plus transferred bytes exceed the byte limit. Worker-side `postMessage()` throws when its
+output queue reaches the same limit. Use `SharedQueue` for sustained high-rate
+game traffic instead of relying on an unbounded message backlog.
+
+`terminate()` interrupts currently executing JavaScript on V8 and QuickJS, so a
+Worker stuck in a pure JavaScript loop cannot block normal runtime shutdown or
+hot reload.
+
+### Deterministic WorkerPool
+
+`mystral/worker-pool` keeps a fixed set of Workers alive, divides a numeric range
+into stable contiguous partitions, and resolves each round only after every
+Worker reaches the barrier. Results are always returned in Worker-index order.
+
+```javascript
+// simulation-pool.worker.mjs
+import { exposeWorkerTask } from 'mystral/worker-pool';
+import { CharacterRows } from './CharacterRows.mjs';
+
+exposeWorkerTask(({ data, begin, end }) => {
+    const characters = CharacterRows.attach(data.characters);
+    for (let row = begin; row < end; row++) {
+        characters.birthDay[row] -= 1;
+    }
+    return { updated: end - begin };
+});
+```
+
+```javascript
+// main.mjs
+import { WorkerPool } from 'mystral/worker-pool';
+
+const pool = new WorkerPool('./simulation-pool.worker.mjs', {
+    size: 4,
+    name: 'simulation',
+});
+
+const results = await pool.run(
+    { characters: characters.handle() },
+    { length: characters.length },
+);
+pool.terminate();
+```
+
+Only one round can be active per pool. If the range is not divisible by the pool
+size, lower Worker indexes receive one extra row. A task error rejects the round
+and terminates the pool so partially completed state cannot be silently reused.
+
+### Shared game state
+
+Schemas are ordinary modules imported by the main isolate and every Worker that
+uses them:
+
+```javascript
+// CharacterRows.mjs
+import { SharedTable } from 'mystral/shared';
+
+export const CharacterRows = SharedTable.define('game.characters/v1', {
+    templateIndex: 'u16',
+    settlementId: 'u32',
+    householdRef: 'u32',
+    birthDay: 'i32',
+});
+```
+
+```javascript
+// main.mjs
+import { CharacterRows } from './CharacterRows.mjs';
+
+const characters = CharacterRows.create({ capacity: 200_000 });
+const worker = new Worker('./simulation.worker.mjs', { type: 'module' });
+worker.postMessage({ characters: characters.handle() });
+```
+
+```javascript
+// simulation.worker.mjs
+import { CharacterRows } from './CharacterRows.mjs';
+
+self.onmessage = ({ data }) => {
+    const characters = CharacterRows.attach(data.characters);
+    characters.birthDay[0] = -10_000;
+};
+```
+
+`SharedTable` uses fixed-capacity struct-of-arrays storage. `attach()` validates
+the schema id, layout hash, capacity, and shared header. `definition.resize()`
+performs an explicit migration into a new backing store; the old table stays
+valid until it is released:
+
+```javascript
+// Stop writers and wait for the current round first.
+const larger = CharacterRows.resize(characters, { capacity: 400_000 });
+// Distribute larger.handle() and wait for Worker acknowledgements.
+characters.release();
+characters = larger;
+```
+
+`pool.resizeTable(CharacterRows, characters, { capacity })` applies the same
+migration and rejects it while that pool has an active round. It does not manage
+Workers outside the pool, so the application must still establish a global safe
+point before retiring the old table. Attached TypedArray views are never replaced
+transparently.
+
+`SharedQueue.define()` creates a bounded single-producer/single-consumer ring
+buffer. Payload fields can be `u8`, `i8`, `u16`, `i16`, `u32`, `i32`, `f32`, or
+`f64`. Queue publication uses `Atomics`, while rows assigned exclusively to one
+Worker can use normal TypedArray writes.
+
+### Tradeoffs
+
+- JavaScript objects and closures are private to their isolate.
+- `postMessage` does not yet implement the browser structured-clone algorithm;
+  payloads must be JSON-compatible, except for Mystral shared handles and
+  explicitly transferred `ArrayBuffer` values.
+- Rendering and WebGPU remain on the main thread.
+- External shared backing stores and forced execution interruption are available
+  on both supported engines: V8 and QuickJS.
+- QuickJS uses Mystral's native sequentially-consistent fallback for 32-bit
+  integer Atomics. Blocking `Atomics.wait()` is not exposed; use Worker messages
+  or `SharedQueue` publication instead.
+
+Run the fixed benchmark with `mystral run benchmarks/worker-shared.mjs`.
 
 ## Next Steps
 

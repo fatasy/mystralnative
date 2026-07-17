@@ -23,6 +23,9 @@ namespace debug {
  *   { "id": 3, "method": "waitForFrame", "params": { "count": 60 } }
  *   { "id": 4, "method": "evaluate", "params": { "expression": "window.score" } }
  *   { "id": 5, "method": "getFrameCount" }
+ *   { "id": 6, "method": "pause" }
+ *   { "id": 7, "method": "stepFrames", "params": { "count": 1 } }
+ *   { "id": 8, "method": "getLogs", "params": { "since": 0 } }
  *
  * Responses (server -> client):
  *   { "id": 1, "result": { "data": "base64..." } }
@@ -41,11 +44,15 @@ class DebugServerImpl;
 
 /**
  * Command handler callback
+ * @param clientId The connected client identifier
+ * @param requestId The client-provided request identifier
  * @param method The command method name
  * @param params JSON string of parameters
  * @return JSON string of result, or empty string for async handling
  */
-using CommandHandler = std::function<std::string(const std::string& method, const std::string& params)>;
+using CommandHandler = std::function<std::string(int clientId, int requestId,
+                                                 const std::string& method,
+                                                 const std::string& params)>;
 
 /**
  * Debug Server
@@ -99,14 +106,14 @@ public:
      * @param requestId The request ID
      * @param result JSON string of result
      */
-    void sendResponse(int requestId, const std::string& result);
+    void sendResponse(int clientId, int requestId, const std::string& result);
 
     /**
      * Send an error response to a specific request
      * @param requestId The request ID
      * @param errorMessage Error message
      */
-    void sendError(int requestId, const std::string& errorMessage);
+    void sendError(int clientId, int requestId, const std::string& errorMessage);
 
     /**
      * Get the number of connected clients

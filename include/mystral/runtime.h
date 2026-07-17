@@ -23,11 +23,63 @@ struct RuntimeConfig {
     bool debug = false;  // Enable verbose debug logging
 };
 
+struct EvaluationResult {
+    bool success = false;
+    std::string valueJson;
+    std::string error;
+};
+
+struct RuntimeProfileStatistics {
+    double minMs = 0.0;
+    double meanMs = 0.0;
+    double p50Ms = 0.0;
+    double p95Ms = 0.0;
+    double p99Ms = 0.0;
+    double maxMs = 0.0;
+};
+
+struct RuntimeMemorySnapshot {
+    uint64_t heapUsedBytes = 0;
+    uint64_t heapTotalBytes = 0;
+    uint64_t heapLimitBytes = 0;
+    uint64_t nativeFunctions = 0;
+    uint64_t frameHandles = 0;
+};
+
+struct RuntimeProfileReport {
+    uint64_t sampledFrames = 0;
+    double wallTimeMs = 0.0;
+    RuntimeProfileStatistics frame;
+    RuntimeProfileStatistics events;
+    RuntimeProfileStatistics asyncWork;
+    RuntimeProfileStatistics callbacks;
+    RuntimeProfileStatistics animationFrame;
+    RuntimeProfileStatistics cleanup;
+    uint64_t framesOver8_33Ms = 0;
+    uint64_t framesOver16_67Ms = 0;
+    uint64_t framesOver33_33Ms = 0;
+    RuntimeMemorySnapshot memoryStart;
+    RuntimeMemorySnapshot memoryEnd;
+    uint64_t workersCreated = 0;
+    uint64_t workerMessagesProcessed = 0;
+    uint64_t workerTimerCallbacks = 0;
+    uint64_t workerMessagesRejected = 0;
+    double workerBusyTimeMs = 0.0;
+    uint64_t workerInputQueueEndBytes = 0;
+    uint64_t workerOutputQueueEndBytes = 0;
+    uint64_t workerInputQueuePeakBytes = 0;
+    uint64_t workerOutputQueuePeakBytes = 0;
+    uint64_t sharedMemoryStartBytes = 0;
+    uint64_t sharedMemoryEndBytes = 0;
+};
+
+using ConsoleCallback = std::function<void(const std::string& type, const std::string& message)>;
+
 /**
  * Mystral Native Runtime
  *
  * A lightweight runtime for JavaScript/TypeScript games using WebGPU.
- * Combines SDL3 for windowing/input, wgpu/Dawn for WebGPU, and V8/JSC/QuickJS for JS.
+ * Combines SDL3 for windowing/input, wgpu/Dawn for WebGPU, and V8/QuickJS for JS.
  *
  * Example usage:
  *   auto runtime = mystral::Runtime::create({.width = 1280, .height = 720});
@@ -65,6 +117,23 @@ public:
     virtual bool evalScript(const std::string& code, const std::string& filename = "<eval>") = 0;
 
     /**
+     * Evaluate an expression and return a JSON-safe description of its value.
+     */
+    virtual EvaluationResult evaluateExpression(const std::string& expression) = 0;
+
+    /**
+     * Dispatch a semantic agent command and return its JSON result.
+     */
+    virtual EvaluationResult dispatchAgentCommand(
+        const std::string& method,
+        const std::string& paramsJson) = 0;
+
+    /**
+     * Observe JavaScript console output.
+     */
+    virtual void setConsoleCallback(ConsoleCallback callback) = 0;
+
+    /**
      * Reload the currently loaded script (for hot reload)
      * Clears timers and requestAnimationFrame callbacks, then re-evaluates the script.
      * @return true on success
@@ -86,6 +155,22 @@ public:
      * @return false if the runtime should quit
      */
     virtual bool pollEvents() = 0;
+
+    /** Pause game callbacks while keeping the native/debug event loop alive. */
+    virtual void setPaused(bool paused) = 0;
+
+    virtual bool isPaused() const = 0;
+
+    /** Execute a bounded number of game frames, then remain paused. */
+    virtual void stepFrames(uint32_t count) = 0;
+
+    virtual uint64_t getFrameCount() const = 0;
+
+    /** Start collecting per-phase frame timings and a starting memory snapshot. */
+    virtual void startProfiler(uint64_t expectedFrames = 0) = 0;
+
+    /** Stop profiling and aggregate all collected samples. */
+    virtual RuntimeProfileReport stopProfiler() = 0;
 
     /**
      * Request the runtime to quit
@@ -130,7 +215,6 @@ public:
      * Get the underlying JS context (type depends on engine)
      * - QuickJS: JSContext*
      * - V8: v8::Isolate*
-     * - JSC: JSGlobalContextRef
      */
     virtual void* getJSContext() = 0;
 
