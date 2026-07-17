@@ -14,6 +14,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <chrono>
+#include <mutex>
 #include <sstream>
 
 #if defined(MYSTRAL_JS_V8)
@@ -26,31 +27,30 @@ namespace js {
 
 // V8 platform (shared across all isolates)
 static std::unique_ptr<v8::Platform> g_platform;
+static std::once_flag g_initializeOnce;
 static bool g_initialized = false;
 
 /**
  * Initialize V8 (call once at startup)
  */
 static bool initializeV8() {
-    if (g_initialized) {
-        return true;
-    }
+    std::call_once(g_initializeOnce, []() {
+        std::cout << "[V8] Initializing V8 JavaScript engine..." << std::endl;
 
-    std::cout << "[V8] Initializing V8 JavaScript engine..." << std::endl;
+        v8::V8::InitializeICUDefaultLocation("");
+        v8::V8::InitializeExternalStartupData("");
 
-    // Initialize V8
-    v8::V8::InitializeICUDefaultLocation("");
-    v8::V8::InitializeExternalStartupData("");
+        g_platform = v8::platform::NewDefaultPlatform();
+        v8::V8::InitializePlatform(g_platform.get());
+        g_initialized = v8::V8::Initialize();
 
-    g_platform = v8::platform::NewDefaultPlatform();
-    v8::V8::InitializePlatform(g_platform.get());
-    v8::V8::Initialize();
+        if (g_initialized) {
+            std::cout << "[V8] V8 initialized successfully" << std::endl;
+            std::cout << "[V8] Version: " << v8::V8::GetVersion() << std::endl;
+        }
+    });
 
-    g_initialized = true;
-    std::cout << "[V8] V8 initialized successfully" << std::endl;
-    std::cout << "[V8] Version: " << v8::V8::GetVersion() << std::endl;
-
-    return true;
+    return g_initialized;
 }
 
 class V8Engine : public Engine {
@@ -58,8 +58,9 @@ public:
     V8Engine() {
         std::cout << "[V8] Creating engine..." << std::endl;
 
-        if (!g_initialized) {
-            initializeV8();
+        if (!initializeV8()) {
+            std::cerr << "[V8] Failed to initialize V8" << std::endl;
+            return;
         }
 
         // Create isolate
@@ -458,6 +459,77 @@ public:
         frameHandles_.insert(persistent);
         return {persistent, isolate_};
     }
+
+    bool transferArrayBuffer(JSValueHandle value, TransferredArrayBuffer& result) override {
+        v8::Isolate::Scope isolateScope(isolate_);
+        v8::HandleScope handleScope(isolate_);
+        auto* persistent = static_cast<v8::Persistent<v8::Value>*>(value.ptr);
+        if (!persistent) return false;
+        v8::Local<v8::Value> local = persistent->Get(isolate_);
+        if (!local->IsArrayBuffer()) return false;
+        auto arrayBuffer = local.As<v8::ArrayBuffer>();
+        if (!arrayBuffer->IsDetachable() || arrayBuffer->WasDetached()) return false;
+        auto backingStore = arrayBuffer->GetBackingStore();
+        result.data = backingStore->Data();
+        result.size = backingStore->ByteLength();
+        result.owner = std::make_shared<std::shared_ptr<v8::BackingStore>>(std::move(backingStore));
+        arrayBuffer->Detach();
+        return true;
+    }
+
+    JSValueHandle newTransferredArrayBuffer(const TransferredArrayBuffer& buffer) override {
+        v8::Isolate::Scope isolateScope(isolate_);
+        v8::HandleScope handleScope(isolate_);
+        v8::Local<v8::Context> context = context_.Get(isolate_);
+        v8::Context::Scope contextScope(context);
+        auto* retainedOwner = new std::shared_ptr<void>(buffer.owner);
+        auto backingStore = v8::ArrayBuffer::NewBackingStore(
+            buffer.data,
+            buffer.size,
+            [](void*, size_t, void* deleterData) {
+                delete static_cast<std::shared_ptr<void>*>(deleterData);
+            },
+            retainedOwner);
+        if (!backingStore) {
+            delete retainedOwner;
+            return {};
+        }
+        auto arrayBuffer = v8::ArrayBuffer::New(isolate_, std::move(backingStore));
+        auto* persistent = new v8::Persistent<v8::Value>(isolate_, arrayBuffer);
+        frameHandles_.insert(persistent);
+        return {persistent, isolate_};
+    }
+
+    JSValueHandle newSharedArrayBuffer(void* data,
+                                       size_t length,
+                                       std::shared_ptr<void> owner) override {
+        v8::Isolate::Scope isolate_scope(isolate_);
+        v8::HandleScope handle_scope(isolate_);
+        v8::Local<v8::Context> context = context_.Get(isolate_);
+        v8::Context::Scope context_scope(context);
+
+        auto* retainedOwner = new std::shared_ptr<void>(std::move(owner));
+        std::unique_ptr<v8::BackingStore> backingStore =
+            v8::SharedArrayBuffer::NewBackingStore(
+                data,
+                length,
+                [](void*, size_t, void* deleterData) {
+                    delete static_cast<std::shared_ptr<void>*>(deleterData);
+                },
+                retainedOwner);
+        if (!backingStore) {
+            delete retainedOwner;
+            return {};
+        }
+
+        v8::Local<v8::SharedArrayBuffer> arrayBuffer =
+            v8::SharedArrayBuffer::New(isolate_, std::move(backingStore));
+        auto* persistent = new v8::Persistent<v8::Value>(isolate_, arrayBuffer);
+        frameHandles_.insert(persistent);
+        return {persistent, isolate_};
+    }
+
+    bool supportsSharedArrayBuffer() const override { return true; }
 
     void* getArrayBufferData(JSValueHandle value, size_t* size) override {
         v8::Isolate::Scope isolate_scope(isolate_);
@@ -884,6 +956,12 @@ public:
         isolate_->SetIdle(true);
     }
 
+    bool requestTermination() override {
+        if (!isolate_) return false;
+        isolate_->TerminateExecution();
+        return true;
+    }
+
     void registerRelease(JSValueHandle obj, std::function<void()> callback) override {
         v8::Isolate::Scope isolate_scope(isolate_);
         v8::HandleScope handle_scope(isolate_);
@@ -1139,6 +1217,10 @@ private:
 
     void reportException(v8::TryCatch& try_catch) {
         v8::HandleScope handle_scope(isolate_);
+        if (try_catch.HasTerminated()) {
+            lastException_ = "Execution terminated";
+            return;
+        }
         v8::String::Utf8Value exception(isolate_, try_catch.Exception());
         const char* exception_string = *exception ? *exception : "<string conversion failed>";
 

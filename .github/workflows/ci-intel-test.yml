@@ -78,9 +78,8 @@ jobs:
       - name: Configure CMake
         run: |
           cmake -B build -DCMAKE_BUILD_TYPE=Release \
-            -DMYSTRAL_USE_QUICKJS=OFF \
+            -DMYSTRAL_USE_QUICKJS=ON \
             -DMYSTRAL_USE_V8=OFF \
-            -DMYSTRAL_USE_JSC=ON \
             -DMYSTRAL_USE_WGPU=OFF \
             -DMYSTRAL_USE_DAWN=ON
 
@@ -135,10 +134,10 @@ jobs:
           fi
           # Include examples for testing
           cp -r examples artifacts/
-          cd artifacts && zip -r ../mystral-macOS-x64-jsc-dawn-test.zip .
+          cd artifacts && zip -r ../mystral-macOS-x64-quickjs-dawn-test.zip .
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: mystral-macOS-x64-jsc-dawn-test
-          path: mystral-macOS-x64-jsc-dawn-test.zip
+          name: mystral-macOS-x64-quickjs-dawn-test
+          path: mystral-macOS-x64-quickjs-dawn-test.zip

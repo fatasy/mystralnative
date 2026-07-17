@@ -33,6 +33,7 @@
 #include <queue>
 #include <array>
 #include <deque>
+#include <iomanip>
 
 // WebP animation encoding (for video recording)
 #ifdef MYSTRAL_HAS_WEBP_MUX
@@ -378,6 +379,10 @@ DEBUG/TESTING OPTIONS:
     --debug               Enable verbose debug logging (WebGPU, shaders, etc.)
     --debug-port <port>   Enable debug server on specified port (e.g., 9222)
                           Allows remote testing via WebSocket protocol
+    --benchmark <frames>  Profile exactly N frames, then exit
+    --warmup <frames>     Frames excluded before profiling (default: 120)
+    --benchmark-output <file>
+                          Write the benchmark report as JSON
 
 COMPILE OPTIONS:
     --include <dir>       Asset directory to bundle (repeatable)
@@ -487,6 +492,12 @@ struct CLIOptions {
     // Debug server
     int debugPort = 0;  // Port for debug server (0 = disabled)
 
+    // Fixed-frame runtime benchmark
+    bool benchmarkRequested = false;
+    int benchmarkFrames = 0;
+    int benchmarkWarmupFrames = 120;
+    std::string benchmarkOutputPath;
+
     // Verbose logging
     bool debug = false;  // Enable verbose WebGPU/shader logging
 
@@ -559,6 +570,13 @@ CLIOptions parseArgs(int argc, char* argv[]) {
             opts.useNativeCapture = false;
         } else if (arg == "--debug-port" && i + 1 < argc) {
             opts.debugPort = std::stoi(argv[++i]);
+        } else if (arg == "--benchmark" && i + 1 < argc) {
+            opts.benchmarkRequested = true;
+            opts.benchmarkFrames = std::stoi(argv[++i]);
+        } else if (arg == "--warmup" && i + 1 < argc) {
+            opts.benchmarkWarmupFrames = std::stoi(argv[++i]);
+        } else if (arg == "--benchmark-output" && i + 1 < argc) {
+            opts.benchmarkOutputPath = argv[++i];
         } else if (arg == "--debug") {
             opts.debug = true;
         } else if (arg == "--resolution" && i + 1 < argc) {
@@ -1335,7 +1353,160 @@ static int compileBundle(const CLIOptions& opts) {
     return 0;
 }
 
+static void appendProfileStatisticsJson(
+    std::ostringstream& out,
+    const mystral::RuntimeProfileStatistics& stats) {
+    out << "{\"minMs\":" << stats.minMs
+        << ",\"meanMs\":" << stats.meanMs
+        << ",\"p50Ms\":" << stats.p50Ms
+        << ",\"p95Ms\":" << stats.p95Ms
+        << ",\"p99Ms\":" << stats.p99Ms
+        << ",\"maxMs\":" << stats.maxMs << "}";
+}
+
+static void appendMemorySnapshotJson(
+    std::ostringstream& out,
+    const mystral::RuntimeMemorySnapshot& memory) {
+    out << "{\"heapUsedBytes\":" << memory.heapUsedBytes
+        << ",\"heapTotalBytes\":" << memory.heapTotalBytes
+        << ",\"heapLimitBytes\":" << memory.heapLimitBytes
+        << ",\"nativeFunctions\":" << memory.nativeFunctions
+        << ",\"frameHandles\":" << memory.frameHandles << "}";
+}
+
+static std::string makeBenchmarkJson(
+    const mystral::RuntimeProfileReport& report,
+    int requestedFrames,
+    int warmupFrames,
+    const std::string& scriptPath,
+    const std::string& workloadJson) {
+    std::ostringstream out;
+    out << std::fixed << std::setprecision(6);
+    const double throughputFps = report.wallTimeMs > 0.0
+        ? static_cast<double>(report.sampledFrames) * 1000.0 / report.wallTimeMs
+        : 0.0;
+    const int64_t heapDelta = static_cast<int64_t>(report.memoryEnd.heapUsedBytes)
+        - static_cast<int64_t>(report.memoryStart.heapUsedBytes);
+
+    out << "{\"schemaVersion\":1"
+        << ",\"runtimeVersion\":\"" << escapeJson(mystral::getVersion()) << "\""
+        << ",\"jsEngine\":\"" << escapeJson(mystral::getJSEngine()) << "\""
+        << ",\"webgpuBackend\":\"" << escapeJson(mystral::getWebGPUBackend()) << "\""
+        << ",\"script\":\"" << escapeJson(scriptPath) << "\""
+        << ",\"workload\":" << (workloadJson.empty() ? "null" : workloadJson)
+        << ",\"requestedFrames\":" << requestedFrames
+        << ",\"warmupFrames\":" << warmupFrames
+        << ",\"sampledFrames\":" << report.sampledFrames
+        << ",\"wallTimeMs\":" << report.wallTimeMs
+        << ",\"throughputFps\":" << throughputFps
+        << ",\"phases\":{";
+    out << "\"frame\":";
+    appendProfileStatisticsJson(out, report.frame);
+    out << ",\"events\":";
+    appendProfileStatisticsJson(out, report.events);
+    out << ",\"asyncWork\":";
+    appendProfileStatisticsJson(out, report.asyncWork);
+    out << ",\"callbacks\":";
+    appendProfileStatisticsJson(out, report.callbacks);
+    out << ",\"animationFrame\":";
+    appendProfileStatisticsJson(out, report.animationFrame);
+    out << ",\"cleanup\":";
+    appendProfileStatisticsJson(out, report.cleanup);
+    out << "},\"frameBudgetMisses\":{"
+        << "\"8.33ms\":" << report.framesOver8_33Ms
+        << ",\"16.67ms\":" << report.framesOver16_67Ms
+        << ",\"33.33ms\":" << report.framesOver33_33Ms
+        << "},\"workers\":{"
+        << "\"created\":" << report.workersCreated
+        << ",\"messagesProcessed\":" << report.workerMessagesProcessed
+        << ",\"timerCallbacks\":" << report.workerTimerCallbacks
+        << ",\"messagesRejected\":" << report.workerMessagesRejected
+        << ",\"busyTimeMs\":" << report.workerBusyTimeMs
+        << ",\"inputQueueEndBytes\":" << report.workerInputQueueEndBytes
+        << ",\"outputQueueEndBytes\":" << report.workerOutputQueueEndBytes
+        << ",\"inputQueuePeakBytes\":" << report.workerInputQueuePeakBytes
+        << ",\"outputQueuePeakBytes\":" << report.workerOutputQueuePeakBytes
+        << ",\"sharedMemoryStartBytes\":" << report.sharedMemoryStartBytes
+        << ",\"sharedMemoryEndBytes\":" << report.sharedMemoryEndBytes
+        << "},\"memory\":{\"start\":";
+    appendMemorySnapshotJson(out, report.memoryStart);
+    out << ",\"end\":";
+    appendMemorySnapshotJson(out, report.memoryEnd);
+    out << ",\"heapUsedDeltaBytes\":" << heapDelta << "}}";
+    return out.str();
+}
+
+static void printBenchmarkSummary(
+    const mystral::RuntimeProfileReport& report,
+    int requestedFrames,
+    int warmupFrames) {
+    const double throughputFps = report.wallTimeMs > 0.0
+        ? static_cast<double>(report.sampledFrames) * 1000.0 / report.wallTimeMs
+        : 0.0;
+    const double heapDeltaMiB = (
+        static_cast<double>(report.memoryEnd.heapUsedBytes)
+        - static_cast<double>(report.memoryStart.heapUsedBytes)) / (1024.0 * 1024.0);
+
+    std::cout << "=== Runtime benchmark ===\n"
+              << "Frames: " << report.sampledFrames << "/" << requestedFrames
+              << " measured after " << warmupFrames << " warmup\n"
+              << "Engine: " << mystral::getJSEngine()
+              << " | WebGPU: " << mystral::getWebGPUBackend() << "\n\n"
+              << std::left << std::setw(18) << "Phase"
+              << std::right << std::setw(10) << "mean"
+              << std::setw(10) << "p50"
+              << std::setw(10) << "p95"
+              << std::setw(10) << "p99"
+              << std::setw(10) << "max" << "\n";
+
+    auto printPhase = [](const char* name, const mystral::RuntimeProfileStatistics& stats) {
+        std::cout << std::left << std::setw(18) << name
+                  << std::right << std::fixed << std::setprecision(3)
+                  << std::setw(10) << stats.meanMs
+                  << std::setw(10) << stats.p50Ms
+                  << std::setw(10) << stats.p95Ms
+                  << std::setw(10) << stats.p99Ms
+                  << std::setw(10) << stats.maxMs << "\n";
+    };
+
+    printPhase("frame", report.frame);
+    printPhase("events", report.events);
+    printPhase("async", report.asyncWork);
+    printPhase("callbacks", report.callbacks);
+    printPhase("animationFrame", report.animationFrame);
+    printPhase("cleanup", report.cleanup);
+
+    std::cout << "\nBudget misses: >8.33ms=" << report.framesOver8_33Ms
+              << " >16.67ms=" << report.framesOver16_67Ms
+              << " >33.33ms=" << report.framesOver33_33Ms << "\n"
+              << "Throughput: " << std::fixed << std::setprecision(1) << throughputFps << " frames/s\n"
+              << "Workers: created=" << report.workersCreated
+              << " messages=" << report.workerMessagesProcessed
+              << " timers=" << report.workerTimerCallbacks
+              << " rejected=" << report.workerMessagesRejected
+              << " busy=" << std::setprecision(3) << report.workerBusyTimeMs << " ms"
+              << " queuePeak=" << report.workerInputQueuePeakBytes
+              << "/" << report.workerOutputQueuePeakBytes << " bytes"
+              << " shared=" << report.sharedMemoryEndBytes << " bytes\n"
+              << "Heap delta: " << std::showpos << std::setprecision(3) << heapDeltaMiB
+              << std::noshowpos << " MiB\n";
+}
+
 int runScript(const CLIOptions& opts) {
+    const bool benchmarkMode = opts.benchmarkRequested;
+    if ((benchmarkMode && opts.benchmarkFrames <= 0) || opts.benchmarkWarmupFrames < 0) {
+        std::cerr << "Error: Benchmark frames must be positive and warmup frames non-negative." << std::endl;
+        return 1;
+    }
+    if (!benchmarkMode && !opts.benchmarkOutputPath.empty()) {
+        std::cerr << "Error: --benchmark-output requires --benchmark." << std::endl;
+        return 1;
+    }
+    if (benchmarkMode && (!opts.screenshotPath.empty() || !opts.videoPath.empty())) {
+        std::cerr << "Error: Benchmark mode cannot be combined with screenshot or video capture." << std::endl;
+        return 1;
+    }
+
     // Enable headless mode via environment variable (SDL3 uses this)
     if (opts.headless) {
         #ifdef _WIN32
@@ -1370,6 +1541,11 @@ int runScript(const CLIOptions& opts) {
         }
         if (opts.debugPort > 0) {
             std::cout << "Debug server: port " << opts.debugPort << std::endl;
+        }
+        if (benchmarkMode) {
+            std::cout << "Benchmark mode: " << opts.benchmarkFrames
+                      << " measured frames after " << opts.benchmarkWarmupFrames
+                      << " warmup frames" << std::endl;
         }
         std::cout << std::endl;
     }
@@ -1434,6 +1610,63 @@ int runScript(const CLIOptions& opts) {
     if (!runtime->loadScript(opts.scriptPath)) {
         std::cerr << "Error: Failed to evaluate script!" << std::endl;
         return 1;
+    }
+
+    if (benchmarkMode) {
+        for (int frame = 0; frame < opts.benchmarkWarmupFrames; frame++) {
+            if (!runtime->pollEvents()) {
+                std::cerr << "Error: Runtime quit during benchmark warmup at frame "
+                          << frame << "." << std::endl;
+                return 1;
+            }
+        }
+
+        runtime->startProfiler(static_cast<uint64_t>(opts.benchmarkFrames));
+        bool quitEarly = false;
+        for (int frame = 0; frame < opts.benchmarkFrames; frame++) {
+            if (!runtime->pollEvents()) {
+                quitEarly = frame + 1 < opts.benchmarkFrames;
+                break;
+            }
+        }
+        const mystral::RuntimeProfileReport report = runtime->stopProfiler();
+        const mystral::EvaluationResult workload = runtime->evaluateExpression(
+            "globalThis.__mystralRuntimeBenchmark ?? null");
+
+        if (!opts.quiet) {
+            printBenchmarkSummary(
+                report,
+                opts.benchmarkFrames,
+                opts.benchmarkWarmupFrames);
+        }
+
+        const std::string json = makeBenchmarkJson(
+            report,
+            opts.benchmarkFrames,
+            opts.benchmarkWarmupFrames,
+            opts.scriptPath,
+            workload.success ? workload.valueJson : "");
+        if (!opts.benchmarkOutputPath.empty()) {
+            std::ofstream output(opts.benchmarkOutputPath, std::ios::trunc);
+            if (!output.is_open()) {
+                std::cerr << "Error: Cannot write benchmark report: "
+                          << opts.benchmarkOutputPath << std::endl;
+                return 1;
+            }
+            output << json << "\n";
+            if (!opts.quiet) {
+                std::cout << "Report: " << opts.benchmarkOutputPath << std::endl;
+            }
+        } else if (opts.quiet) {
+            std::cout << json << std::endl;
+        }
+
+        if (quitEarly || report.sampledFrames != static_cast<uint64_t>(opts.benchmarkFrames)) {
+            std::cerr << "Error: Benchmark ended after " << report.sampledFrames
+                      << " of " << opts.benchmarkFrames << " measured frames." << std::endl;
+            return 1;
+        }
+        return runtime->getExitCode();
     }
 
     if (screenshotMode) {

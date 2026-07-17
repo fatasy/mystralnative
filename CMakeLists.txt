@@ -1,9 +1,10 @@
 cmake_minimum_required(VERSION 3.20)
 project(MystralNativeRuntime VERSION 0.1.5 LANGUAGES C CXX)
 
-# Windows: Use /MT (static CRT) for all builds
-# Both Skia and Dawn (from library-builder) are built with /MT static CRT.
-# The CI workflow passes -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded for all Windows builds.
+# Windows prebuilts must use a compatible MSVC runtime. The current V8 monolith
+# and Skia-bundled Dawn use /MT, while the official Dawn fallback uses /MD. Use
+# V8 with wgpu-native or Skia-bundled Dawn for the static-CRT matrix; use the
+# official Dawn fallback only with a dynamic-CRT matrix such as QuickJS + Dawn.
 
 # ============================================================================
 # Options
@@ -11,7 +12,6 @@ project(MystralNativeRuntime VERSION 0.1.5 LANGUAGES C CXX)
 
 # JS Engine (choose one)
 option(MYSTRAL_USE_V8 "Use V8 JavaScript engine" OFF)
-option(MYSTRAL_USE_JSC "Use JavaScriptCore engine" OFF)
 option(MYSTRAL_USE_QUICKJS "Use QuickJS engine" ON)  # Default - simplest to start
 option(MYSTRAL_USE_SWC "Enable SWC TypeScript transpiler" ON)
 
@@ -47,8 +47,7 @@ if(APPLE)
     if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
         set(MYSTRAL_PLATFORM "ios")
         set(MYSTRAL_USE_V8 OFF)
-        set(MYSTRAL_USE_JSC ON)      # JSC is free on iOS
-        set(MYSTRAL_USE_QUICKJS OFF)
+        set(MYSTRAL_USE_QUICKJS ON)
         set(MYSTRAL_USE_DAWN OFF)
         set(MYSTRAL_USE_WGPU ON)     # Dawn doesn't support iOS
     else()
@@ -60,7 +59,6 @@ elseif(ANDROID)
     set(MYSTRAL_PLATFORM "android")
     # Android uses QuickJS by default (simplest to integrate, no special runtime deps)
     set(MYSTRAL_USE_V8 OFF)
-    set(MYSTRAL_USE_JSC OFF)
     set(MYSTRAL_USE_QUICKJS ON)
     # wgpu-native has Android support
     set(MYSTRAL_USE_DAWN OFF)
@@ -70,7 +68,7 @@ elseif(UNIX)
 endif()
 
 message(STATUS "Mystral Platform: ${MYSTRAL_PLATFORM}")
-message(STATUS "JS Engine: V8=${MYSTRAL_USE_V8} JSC=${MYSTRAL_USE_JSC} QuickJS=${MYSTRAL_USE_QUICKJS}")
+message(STATUS "JS Engine: V8=${MYSTRAL_USE_V8} QuickJS=${MYSTRAL_USE_QUICKJS}")
 message(STATUS "WebGPU: Dawn=${MYSTRAL_USE_DAWN} wgpu=${MYSTRAL_USE_WGPU}")
 
 # ============================================================================
@@ -269,6 +267,7 @@ if(MYSTRAL_USE_DAWN)
 
             if(EXISTS ${DAWN_LIB_PATH})
                 set(DAWN_LIBRARY ${DAWN_LIB_PATH})
+                set(DAWN_REQUIRES_PROC_TABLE ON)
                 # Dawn headers in Skia build are split across two locations:
                 # 1. build/include/third_party/externals/dawn/include/webgpu/webgpu.h (wrapper)
                 # 2. build/include/dawn/webgpu.h (actual definitions)
@@ -375,6 +374,9 @@ if(MYSTRAL_USE_DAWN)
         # (can't have both WebGPU backends active)
         if(NOT MYSTRAL_WEBGPU_BACKEND_SET)
             add_compile_definitions(MYSTRAL_WEBGPU_DAWN)
+            if(DAWN_REQUIRES_PROC_TABLE)
+                add_compile_definitions(MYSTRAL_DAWN_USE_PROC_TABLE)
+            endif()
             set(MYSTRAL_WEBGPU_BACKEND_SET ON)
             message(STATUS "Using Dawn as WebGPU backend")
         else()
@@ -507,19 +509,6 @@ if(MYSTRAL_USE_V8)
         endif()
     else()
         message(WARNING "V8 not found. Run 'node scripts/download-deps.mjs --only v8' first.")
-    endif()
-endif()
-
-# JavaScriptCore (macOS/iOS)
-if(MYSTRAL_USE_JSC)
-    if(APPLE)
-        find_library(JAVASCRIPTCORE_FRAMEWORK JavaScriptCore)
-        if(JAVASCRIPTCORE_FRAMEWORK)
-            add_compile_definitions(MYSTRAL_JS_JSC)
-            message(STATUS "Found JavaScriptCore: ${JAVASCRIPTCORE_FRAMEWORK}")
-        endif()
-    else()
-        message(WARNING "JavaScriptCore is only available on Apple platforms")
     endif()
 endif()
 
@@ -975,6 +964,9 @@ set(MYSTRAL_SOURCES
     src/js/module_resolver.cpp
     src/js/module_system.cpp
     src/js/ts_transpiler.cpp
+    src/workers/shared_buffer.cpp
+    src/workers/worker_thread.cpp
+    src/workers/worker_registry.cpp
     src/webgpu/bindings.cpp
     src/webgpu/context.cpp
     src/canvas/canvas.cpp
@@ -1053,8 +1045,6 @@ target_include_directories(mystral-runtime PRIVATE
 # Determine JS engine name
 if(MYSTRAL_USE_V8)
     set(MYSTRAL_JS_ENGINE_NAME "v8")
-elseif(MYSTRAL_USE_JSC)
-    set(MYSTRAL_JS_ENGINE_NAME "jsc")
 else()
     set(MYSTRAL_JS_ENGINE_NAME "quickjs")
 endif()
@@ -1078,10 +1068,6 @@ if(APPLE)
         src/platform/surface_metal.mm
         src/video/screen_capture_kit.mm
     )
-    if(MYSTRAL_USE_JSC)
-        target_sources(mystral-runtime PRIVATE src/js/jsc_engine.mm)
-        target_link_libraries(mystral-runtime PRIVATE ${JAVASCRIPTCORE_FRAMEWORK})
-    endif()
     # ScreenCaptureKit for video recording (macOS 12.3+)
     # Note: Framework is weakly linked for backward compatibility with older macOS
     if(NOT MYSTRAL_PLATFORM STREQUAL "ios")
@@ -1361,9 +1347,57 @@ endif()
 # CLI Executable (desktop only)
 # ============================================================================
 
+if(WIN32)
+    set(MYSTRAL_WINDOWS_D3D_REDIST_DIR "" CACHE PATH
+        "Directory containing the Windows SDK D3D shader compiler redistributables")
+    if(MYSTRAL_USE_DAWN AND NOT MYSTRAL_WINDOWS_D3D_REDIST_DIR)
+        find_path(_MYSTRAL_WINDOWS_D3D_REDIST_DIR
+            NAMES dxcompiler.dll
+            PATHS
+                "$ENV{WindowsSdkDir}/Redist/D3D/x64"
+                "$ENV{ProgramFiles\(x86\)}/Windows Kits/10/Redist/D3D/x64"
+            NO_DEFAULT_PATH
+        )
+        if(_MYSTRAL_WINDOWS_D3D_REDIST_DIR)
+            set(MYSTRAL_WINDOWS_D3D_REDIST_DIR
+                "${_MYSTRAL_WINDOWS_D3D_REDIST_DIR}"
+                CACHE PATH
+                "Directory containing the Windows SDK D3D shader compiler redistributables"
+                FORCE)
+        endif()
+    endif()
+
+    function(mystral_copy_windows_gpu_runtime target)
+        if(MYSTRAL_USE_WGPU AND EXISTS "${WGPU_TARGET_DIR}/lib/wgpu_native.dll")
+            add_custom_command(TARGET ${target} POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${WGPU_TARGET_DIR}/lib/wgpu_native.dll"
+                    "$<TARGET_FILE_DIR:${target}>/wgpu_native.dll"
+                COMMENT "Copying wgpu-native runtime for ${target}"
+            )
+        endif()
+
+        if(MYSTRAL_USE_DAWN AND MYSTRAL_WINDOWS_D3D_REDIST_DIR)
+            foreach(_dll dxcompiler.dll dxil.dll d3dcompiler_47.dll)
+                if(EXISTS "${MYSTRAL_WINDOWS_D3D_REDIST_DIR}/${_dll}")
+                    add_custom_command(TARGET ${target} POST_BUILD
+                        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                            "${MYSTRAL_WINDOWS_D3D_REDIST_DIR}/${_dll}"
+                            "$<TARGET_FILE_DIR:${target}>/${_dll}"
+                        COMMENT "Copying ${_dll} for ${target}"
+                    )
+                endif()
+            endforeach()
+        endif()
+    endfunction()
+endif()
+
 if(NOT MYSTRAL_PLATFORM STREQUAL "ios" AND NOT MYSTRAL_PLATFORM STREQUAL "android")
     add_executable(mystral src/cli/main.cpp)
     target_link_libraries(mystral PRIVATE mystral-runtime)
+    if(WIN32)
+        mystral_copy_windows_gpu_runtime(mystral)
+    endif()
 
     # Add webp include directories and definitions for video recording
     if(TARGET webp::mux)
@@ -1403,6 +1437,16 @@ if(NOT MYSTRAL_PLATFORM STREQUAL "ios" AND NOT MYSTRAL_PLATFORM STREQUAL "androi
     install(TARGETS mystral
         RUNTIME DESTINATION bin
     )
+    if(WIN32 AND MYSTRAL_USE_WGPU AND EXISTS "${WGPU_TARGET_DIR}/lib/wgpu_native.dll")
+        install(FILES "${WGPU_TARGET_DIR}/lib/wgpu_native.dll" DESTINATION bin)
+    endif()
+    if(WIN32 AND MYSTRAL_USE_DAWN AND MYSTRAL_WINDOWS_D3D_REDIST_DIR)
+        foreach(_dll dxcompiler.dll dxil.dll d3dcompiler_47.dll)
+            if(EXISTS "${MYSTRAL_WINDOWS_D3D_REDIST_DIR}/${_dll}")
+                install(FILES "${MYSTRAL_WINDOWS_D3D_REDIST_DIR}/${_dll}" DESTINATION bin)
+            endif()
+        endforeach()
+    endif()
 
     # ============================================================================
     # Examples (desktop only)
@@ -1412,6 +1456,9 @@ if(NOT MYSTRAL_PLATFORM STREQUAL "ios" AND NOT MYSTRAL_PLATFORM STREQUAL "androi
     # For most development, use the CLI instead: mystral run game.js
     add_executable(embed-example examples/embed-example/main.cpp)
     target_link_libraries(embed-example PRIVATE mystral-runtime)
+    if(WIN32)
+        mystral_copy_windows_gpu_runtime(embed-example)
+    endif()
 
     # macOS: Set rpath for redistributable binary
     if(APPLE)
@@ -1444,3 +1491,14 @@ install(TARGETS mystral-runtime
 install(DIRECTORY include/mystral
     DESTINATION include
 )
+
+option(MYSTRAL_BUILD_NATIVE_TESTS "Build native runtime smoke tests" OFF)
+if(MYSTRAL_BUILD_NATIVE_TESTS AND (MYSTRAL_USE_V8 OR MYSTRAL_USE_QUICKJS))
+    enable_testing()
+    add_executable(mystral-worker-shared-smoke tests/native/worker-shared-smoke.cpp)
+    target_link_libraries(mystral-worker-shared-smoke PRIVATE mystral-runtime)
+    add_test(NAME mystral-worker-shared-smoke COMMAND mystral-worker-shared-smoke)
+    set_tests_properties(mystral-worker-shared-smoke PROPERTIES
+        TIMEOUT 30
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+endif()

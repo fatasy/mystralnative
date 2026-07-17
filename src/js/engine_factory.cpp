@@ -15,24 +15,12 @@ namespace js {
 std::unique_ptr<Engine> createQuickJSEngine();
 #endif
 
-#if defined(MYSTRAL_JS_JSC) && defined(__APPLE__)
-std::unique_ptr<Engine> createJSCEngine();
-#endif
-
 #if defined(MYSTRAL_JS_V8)
 std::unique_ptr<Engine> createV8Engine();
 #endif
 
 std::unique_ptr<Engine> createEngine() {
-    // Platform-specific defaults:
-    // - macOS/iOS: Prefer JSC (0 bytes, system framework)
-    // - Windows/Linux with V8: Use V8 (fastest)
-    // - Fallback: QuickJS (always available, small)
-
-#if defined(__APPLE__) && defined(MYSTRAL_JS_JSC)
-    std::cout << "[JS] Creating JavaScriptCore engine (platform default)" << std::endl;
-    return createJSCEngine();
-#elif defined(MYSTRAL_JS_V8)
+#if defined(MYSTRAL_JS_V8)
     std::cout << "[JS] Creating V8 engine (platform default)" << std::endl;
     return createV8Engine();
 #elif defined(MYSTRAL_JS_QUICKJS)
@@ -61,15 +49,6 @@ std::unique_ptr<Engine> createEngine(EngineType type) {
             return createV8Engine();
 #else
             std::cerr << "[JS] V8 not compiled in" << std::endl;
-            return nullptr;
-#endif
-
-        case EngineType::JavaScriptCore:
-#if defined(MYSTRAL_JS_JSC) && defined(__APPLE__)
-            std::cout << "[JS] Creating JavaScriptCore engine" << std::endl;
-            return createJSCEngine();
-#else
-            std::cerr << "[JS] JavaScriptCore not available (Apple platforms only)" << std::endl;
             return nullptr;
 #endif
 

@@ -122,5 +122,8 @@ describe("CLI Basic", () => {
     expect(stdout).toContain("--screenshot");
     expect(stdout).toContain("--frames");
     expect(stdout).toContain("--quiet");
+    expect(stdout).toContain("--benchmark");
+    expect(stdout).toContain("--warmup");
+    expect(stdout).toContain("--benchmark-output");
   });
 });

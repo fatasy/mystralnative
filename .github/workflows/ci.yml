@@ -40,12 +40,6 @@ jobs:
             js_engine: v8
             webgpu: wgpu
             name: macOS-arm64-v8-wgpu
-          # macOS ARM64 - JSC + wgpu
-          - os: macos-15
-            arch: arm64
-            js_engine: jsc
-            webgpu: wgpu
-            name: macOS-arm64-jsc-wgpu
           # macOS ARM64 - QuickJS + Dawn
           - os: macos-15
             arch: arm64
@@ -58,18 +52,12 @@ jobs:
             js_engine: v8
             webgpu: dawn
             name: macOS-arm64-v8-dawn
-          # macOS ARM64 - JSC + Dawn
-          - os: macos-15
-            arch: arm64
-            js_engine: jsc
-            webgpu: dawn
-            name: macOS-arm64-jsc-dawn
-          # macOS x64 - JSC + Dawn only (x64 Mac is legacy)
+          # macOS x64 - QuickJS + Dawn (x64 Mac is legacy)
           - os: macos-15-intel
             arch: x64
-            js_engine: jsc
+            js_engine: quickjs
             webgpu: dawn
-            name: macOS-x64-jsc-dawn
+            name: macOS-x64-quickjs-dawn
 
     name: Build - ${{ matrix.name }}
 
@@ -114,11 +102,9 @@ jobs:
           CMAKE_ARGS="-B build -DCMAKE_BUILD_TYPE=Release"
           # JS Engine
           if [ "${{ matrix.js_engine }}" == "quickjs" ]; then
-            CMAKE_ARGS="$CMAKE_ARGS -DMYSTRAL_USE_QUICKJS=ON -DMYSTRAL_USE_V8=OFF -DMYSTRAL_USE_JSC=OFF"
+            CMAKE_ARGS="$CMAKE_ARGS -DMYSTRAL_USE_QUICKJS=ON -DMYSTRAL_USE_V8=OFF"
           elif [ "${{ matrix.js_engine }}" == "v8" ]; then
-            CMAKE_ARGS="$CMAKE_ARGS -DMYSTRAL_USE_QUICKJS=OFF -DMYSTRAL_USE_V8=ON -DMYSTRAL_USE_JSC=OFF"
-          elif [ "${{ matrix.js_engine }}" == "jsc" ]; then
-            CMAKE_ARGS="$CMAKE_ARGS -DMYSTRAL_USE_QUICKJS=OFF -DMYSTRAL_USE_V8=OFF -DMYSTRAL_USE_JSC=ON"
+            CMAKE_ARGS="$CMAKE_ARGS -DMYSTRAL_USE_QUICKJS=OFF -DMYSTRAL_USE_V8=ON"
           fi
           # WebGPU backend
           if [ "${{ matrix.webgpu }}" == "wgpu" ]; then
@@ -254,9 +240,9 @@ jobs:
           CMAKE_ARGS="-B build -DCMAKE_BUILD_TYPE=Release"
           # JS Engine
           if [ "${{ matrix.js_engine }}" == "quickjs" ]; then
-            CMAKE_ARGS="$CMAKE_ARGS -DMYSTRAL_USE_QUICKJS=ON -DMYSTRAL_USE_V8=OFF -DMYSTRAL_USE_JSC=OFF"
+            CMAKE_ARGS="$CMAKE_ARGS -DMYSTRAL_USE_QUICKJS=ON -DMYSTRAL_USE_V8=OFF"
           elif [ "${{ matrix.js_engine }}" == "v8" ]; then
-            CMAKE_ARGS="$CMAKE_ARGS -DMYSTRAL_USE_QUICKJS=OFF -DMYSTRAL_USE_V8=ON -DMYSTRAL_USE_JSC=OFF"
+            CMAKE_ARGS="$CMAKE_ARGS -DMYSTRAL_USE_QUICKJS=OFF -DMYSTRAL_USE_V8=ON"
           fi
           # WebGPU backend
           if [ "${{ matrix.webgpu }}" == "wgpu" ]; then
@@ -347,9 +333,9 @@ jobs:
 
           # JS Engine
           if ("${{ matrix.js_engine }}" -eq "quickjs") {
-            $CMAKE_ARGS += "-DMYSTRAL_USE_QUICKJS=ON", "-DMYSTRAL_USE_V8=OFF", "-DMYSTRAL_USE_JSC=OFF"
+            $CMAKE_ARGS += "-DMYSTRAL_USE_QUICKJS=ON", "-DMYSTRAL_USE_V8=OFF"
           } elseif ("${{ matrix.js_engine }}" -eq "v8") {
-            $CMAKE_ARGS += "-DMYSTRAL_USE_QUICKJS=OFF", "-DMYSTRAL_USE_V8=ON", "-DMYSTRAL_USE_JSC=OFF"
+            $CMAKE_ARGS += "-DMYSTRAL_USE_QUICKJS=OFF", "-DMYSTRAL_USE_V8=ON"
             # V8 requires C++20
             $CMAKE_ARGS += "-DCMAKE_CXX_STANDARD=20"
           }
@@ -376,6 +362,7 @@ jobs:
           mkdir -p artifacts
           cp build/Release/mystral.exe artifacts/ || cp build/mystral.exe artifacts/
           cp build/Release/mystral-runtime.lib artifacts/ || cp build/mystral-runtime.lib artifacts/ || true
+          cp build/Release/*.dll artifacts/ 2>/dev/null || true
           # Include SDL3 DLL
           cp third_party/sdl3/bin/SDL3.dll artifacts/ || true
           cd artifacts && 7z a ../mystral-${{ matrix.name }}.zip .
@@ -476,9 +463,9 @@ jobs:
 
           # JS Engine
           if ("${{ matrix.js_engine }}" -eq "quickjs") {
-            $CMAKE_ARGS += "-DMYSTRAL_USE_QUICKJS=ON", "-DMYSTRAL_USE_V8=OFF", "-DMYSTRAL_USE_JSC=OFF"
+            $CMAKE_ARGS += "-DMYSTRAL_USE_QUICKJS=ON", "-DMYSTRAL_USE_V8=OFF"
           } elseif ("${{ matrix.js_engine }}" -eq "v8") {
-            $CMAKE_ARGS += "-DMYSTRAL_USE_QUICKJS=OFF", "-DMYSTRAL_USE_V8=ON", "-DMYSTRAL_USE_JSC=OFF"
+            $CMAKE_ARGS += "-DMYSTRAL_USE_QUICKJS=OFF", "-DMYSTRAL_USE_V8=ON"
             # V8 requires C++20
             $CMAKE_ARGS += "-DCMAKE_CXX_STANDARD=20"
           }
@@ -505,6 +492,7 @@ jobs:
           mkdir -p artifacts
           cp build/Release/mystral.exe artifacts/ || cp build/mystral.exe artifacts/
           cp build/Release/mystral-runtime.lib artifacts/ || cp build/mystral-runtime.lib artifacts/ || true
+          cp build/Release/*.dll artifacts/ 2>/dev/null || true
           # Include SDL3 DLL
           cp third_party/sdl3/bin/SDL3.dll artifacts/ || true
           cd artifacts && 7z a ../mystral-${{ matrix.name }}.zip .
@@ -541,11 +529,9 @@ jobs:
           for config in \
             "macOS-arm64-quickjs-wgpu" \
             "macOS-arm64-v8-wgpu" \
-            "macOS-arm64-jsc-wgpu" \
             "macOS-arm64-quickjs-dawn" \
             "macOS-arm64-v8-dawn" \
-            "macOS-arm64-jsc-dawn" \
-            "macOS-x64-jsc-dawn" \
+            "macOS-x64-quickjs-dawn" \
             "linux-x64-quickjs-wgpu" \
             "linux-x64-v8-wgpu" \
             "linux-x64-quickjs-dawn" \

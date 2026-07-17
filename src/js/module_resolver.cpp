@@ -67,6 +67,17 @@ bool ModuleResolver::resolve(const std::string& specifier,
         return false;
     }
 
+    if (normalized == "mystral/shared" || normalized == "mystral:shared") {
+        out.resolved = {"mystral:shared", true};
+        out.format = ModuleFormat::ESM;
+        return true;
+    }
+    if (normalized == "mystral/worker-pool" || normalized == "mystral:worker-pool") {
+        out.resolved = {"mystral:worker-pool", true};
+        out.format = ModuleFormat::ESM;
+        return true;
+    }
+
     if (normalized[0] == '#') {
         return resolveImports(normalized, referrer, mode, out, error);
     }
@@ -98,6 +109,16 @@ bool ModuleResolver::resolveResolvedPath(const std::string& resolvedPath,
                                          std::string& error) {
     error.clear();
     std::string normalized = normalizeSpecifier(resolvedPath);
+    if (normalized == "mystral:shared") {
+        out.resolved = {"mystral:shared", true};
+        out.format = ModuleFormat::ESM;
+        return true;
+    }
+    if (normalized == "mystral:worker-pool") {
+        out.resolved = {"mystral:worker-pool", true};
+        out.format = ModuleFormat::ESM;
+        return true;
+    }
     if (useBundle_) {
         if (startsWith(normalized, "/")) {
             normalized.erase(0, 1);
@@ -550,6 +571,27 @@ std::string ModuleResolver::detectPackageTypeForPath(const std::string& path) co
 bool ModuleResolver::readFile(const ResolvedPath& path, std::string& out, std::string& error) const {
     error.clear();
     out.clear();
+    if (path.path == "mystral:shared") {
+        out =
+            "const api = globalThis.__mystralShared;\n"
+            "if (!api) throw new Error('Mystral shared API is not initialized');\n"
+            "export const SharedBuffer = api.SharedBuffer;\n"
+            "export const SharedTable = api.SharedTable;\n"
+            "export const SharedQueue = api.SharedQueue;\n"
+            "export default api;\n";
+        return true;
+    }
+    if (path.path == "mystral:worker-pool") {
+        out =
+            "const api = globalThis.__mystralWorkerPool;\n"
+            "if (!api) throw new Error('Mystral WorkerPool API is not initialized');\n"
+            "export const WorkerPool = api.WorkerPool;\n"
+            "export const exposeWorkerTask = api.exposeWorkerTask;\n"
+            "export const transferResult = api.transferResult;\n"
+            "export const deterministicPartitions = api.deterministicPartitions;\n"
+            "export default api;\n";
+        return true;
+    }
     if (path.isBundle) {
         std::vector<uint8_t> data;
         if (!vfs::readEmbeddedFile(path.path, data)) {

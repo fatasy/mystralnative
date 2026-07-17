@@ -2,11 +2,12 @@
  * JavaScript Engine Abstraction
  *
  * This header defines a common interface for JavaScript engines.
- * Implementations exist for QuickJS, V8, and JavaScriptCore.
+ * Implementations exist for QuickJS and V8.
  */
 
 #pragma once
 
+#include <cstddef>
 #include <memory>
 #include <string>
 #include <functional>
@@ -47,13 +48,18 @@ struct MemoryStats {
     uint64_t frameHandles = 0;
 };
 
+struct TransferredArrayBuffer {
+    void* data = nullptr;
+    size_t size = 0;
+    std::shared_ptr<void> owner;
+};
+
 /**
  * Engine type enumeration
  */
 enum class EngineType {
     QuickJS,
     V8,
-    JavaScriptCore,
     Unknown
 };
 
@@ -152,6 +158,29 @@ public:
      * @return ArrayBuffer handle that directly references the external memory
      */
     virtual JSValueHandle newArrayBufferExternal(void* data, size_t length) = 0;
+
+    /** Detach a plain ArrayBuffer and retain ownership of its bytes. */
+    virtual bool transferArrayBuffer(JSValueHandle value, TransferredArrayBuffer& result) = 0;
+
+    /** Create a plain ArrayBuffer over transferred bytes without another copy. */
+    virtual JSValueHandle newTransferredArrayBuffer(const TransferredArrayBuffer& buffer) = 0;
+
+    /**
+     * Create a SharedArrayBuffer backed by externally owned memory.
+     * The owner is retained by the engine backing store until the JavaScript
+     * buffer is collected. Engines without external SharedArrayBuffer support
+     * return an empty handle.
+     */
+    virtual JSValueHandle newSharedArrayBuffer(void* data,
+                                               size_t length,
+                                               std::shared_ptr<void> owner) {
+        (void)data;
+        (void)length;
+        (void)owner;
+        return {};
+    }
+
+    virtual bool supportsSharedArrayBuffer() const { return false; }
 
     /**
      * Get the raw data pointer from an ArrayBuffer or TypedArray
@@ -280,6 +309,13 @@ public:
     virtual void clearFrameHandles() {}
 
     /**
+     * Request that currently executing JavaScript stop as soon as possible.
+     * This may be called from a thread other than the engine's owner thread.
+     * Returns false when the engine has no safe interruption mechanism.
+     */
+    virtual bool requestTermination() { return false; }
+
+    /**
      * Legacy no-ops retained for source compatibility. Native callbacks now
      * follow their JavaScript Function's GC lifetime instead of frame scope.
      */
@@ -341,15 +377,13 @@ public:
      * Get the raw engine-specific context
      * - QuickJS: JSContext*
      * - V8: v8::Isolate*
-     * - JSC: JSGlobalContextRef
      */
     virtual void* getRawContext() = 0;
 };
 
 /**
  * Create the default engine for the platform
- * - macOS/iOS: JavaScriptCore
- * - Other with MYSTRAL_USE_V8: V8
+ * - With MYSTRAL_USE_V8: V8
  * - Fallback: QuickJS
  */
 std::unique_ptr<Engine> createEngine();

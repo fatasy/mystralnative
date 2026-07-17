@@ -105,7 +105,7 @@ export default function HomePage() {
           <div className="feature">
             <h3>Multiple JS Engines</h3>
             <p>
-              Choose from V8, QuickJS, or JavaScriptCore. Pick the right engine
+              Choose between V8 and QuickJS. Pick the right engine
               for your platform and use case.
             </p>
           </div>

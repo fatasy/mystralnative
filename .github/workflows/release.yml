@@ -31,11 +31,6 @@ jobs:
             name: macOS-arm64-v8-wgpu
           - os: macos-15
             arch: arm64
-            js_engine: jsc
-            webgpu: wgpu
-            name: macOS-arm64-jsc-wgpu
-          - os: macos-15
-            arch: arm64
             js_engine: quickjs
             webgpu: dawn
             name: macOS-arm64-quickjs-dawn
@@ -44,17 +39,12 @@ jobs:
             js_engine: v8
             webgpu: dawn
             name: macOS-arm64-v8-dawn
-          - os: macos-15
-            arch: arm64
-            js_engine: jsc
-            webgpu: dawn
-            name: macOS-arm64-jsc-dawn
-          # macOS x64 - JSC + Dawn only (legacy platform)
+          # macOS x64 - QuickJS + Dawn (legacy platform)
           - os: macos-15-intel
             arch: x64
-            js_engine: jsc
+            js_engine: quickjs
             webgpu: dawn
-            name: macOS-x64-jsc-dawn
+            name: macOS-x64-quickjs-dawn
 
     name: Build - ${{ matrix.name }}
 
@@ -104,11 +94,9 @@ jobs:
         run: |
           CMAKE_ARGS="-B build -DCMAKE_BUILD_TYPE=Release"
           if [ "${{ matrix.js_engine }}" == "quickjs" ]; then
-            CMAKE_ARGS="$CMAKE_ARGS -DMYSTRAL_USE_QUICKJS=ON -DMYSTRAL_USE_V8=OFF -DMYSTRAL_USE_JSC=OFF"
+            CMAKE_ARGS="$CMAKE_ARGS -DMYSTRAL_USE_QUICKJS=ON -DMYSTRAL_USE_V8=OFF"
           elif [ "${{ matrix.js_engine }}" == "v8" ]; then
-            CMAKE_ARGS="$CMAKE_ARGS -DMYSTRAL_USE_QUICKJS=OFF -DMYSTRAL_USE_V8=ON -DMYSTRAL_USE_JSC=OFF"
-          elif [ "${{ matrix.js_engine }}" == "jsc" ]; then
-            CMAKE_ARGS="$CMAKE_ARGS -DMYSTRAL_USE_QUICKJS=OFF -DMYSTRAL_USE_V8=OFF -DMYSTRAL_USE_JSC=ON"
+            CMAKE_ARGS="$CMAKE_ARGS -DMYSTRAL_USE_QUICKJS=OFF -DMYSTRAL_USE_V8=ON"
           fi
           if [ "${{ matrix.webgpu }}" == "wgpu" ]; then
             CMAKE_ARGS="$CMAKE_ARGS -DMYSTRAL_USE_WGPU=ON -DMYSTRAL_USE_DAWN=OFF"
@@ -124,7 +112,7 @@ jobs:
         run: ./build/mystral --version
 
       - name: Verify macOS x64 deployment target
-        if: matrix.name == 'macOS-x64-jsc-dawn'
+        if: matrix.name == 'macOS-x64-quickjs-dawn'
         run: |
           echo "Checking deployment target for Intel Mac build..."
           # Check LC_BUILD_VERSION or LC_VERSION_MIN_MACOSX
@@ -262,9 +250,9 @@ jobs:
         run: |
           CMAKE_ARGS="-B build -DCMAKE_BUILD_TYPE=Release"
           if [ "${{ matrix.js_engine }}" == "quickjs" ]; then
-            CMAKE_ARGS="$CMAKE_ARGS -DMYSTRAL_USE_QUICKJS=ON -DMYSTRAL_USE_V8=OFF -DMYSTRAL_USE_JSC=OFF"
+            CMAKE_ARGS="$CMAKE_ARGS -DMYSTRAL_USE_QUICKJS=ON -DMYSTRAL_USE_V8=OFF"
           elif [ "${{ matrix.js_engine }}" == "v8" ]; then
-            CMAKE_ARGS="$CMAKE_ARGS -DMYSTRAL_USE_QUICKJS=OFF -DMYSTRAL_USE_V8=ON -DMYSTRAL_USE_JSC=OFF"
+            CMAKE_ARGS="$CMAKE_ARGS -DMYSTRAL_USE_QUICKJS=OFF -DMYSTRAL_USE_V8=ON"
           fi
           if [ "${{ matrix.webgpu }}" == "wgpu" ]; then
             CMAKE_ARGS="$CMAKE_ARGS -DMYSTRAL_USE_WGPU=ON -DMYSTRAL_USE_DAWN=OFF"
@@ -379,9 +367,9 @@ jobs:
         run: |
           $CMAKE_ARGS = @("-B", "build", "-DCMAKE_BUILD_TYPE=Release")
           if ("${{ matrix.js_engine }}" -eq "quickjs") {
-            $CMAKE_ARGS += "-DMYSTRAL_USE_QUICKJS=ON", "-DMYSTRAL_USE_V8=OFF", "-DMYSTRAL_USE_JSC=OFF"
+            $CMAKE_ARGS += "-DMYSTRAL_USE_QUICKJS=ON", "-DMYSTRAL_USE_V8=OFF"
           } elseif ("${{ matrix.js_engine }}" -eq "v8") {
-            $CMAKE_ARGS += "-DMYSTRAL_USE_QUICKJS=OFF", "-DMYSTRAL_USE_V8=ON", "-DMYSTRAL_USE_JSC=OFF"
+            $CMAKE_ARGS += "-DMYSTRAL_USE_QUICKJS=OFF", "-DMYSTRAL_USE_V8=ON"
           }
           if ("${{ matrix.webgpu }}" -eq "wgpu") {
             $CMAKE_ARGS += "-DMYSTRAL_USE_WGPU=ON", "-DMYSTRAL_USE_DAWN=OFF"
@@ -407,6 +395,7 @@ jobs:
           mkdir -p artifacts
           cp build/Release/mystral.exe artifacts/ || cp build/mystral.exe artifacts/
           cp build/Release/mystral-runtime.lib artifacts/ || cp build/mystral-runtime.lib artifacts/ || true
+          cp build/Release/*.dll artifacts/ 2>/dev/null || true
           cp third_party/sdl3/bin/SDL3.dll artifacts/ || true
           # Include examples for users to run immediately
           mkdir -p artifacts/examples/assets
@@ -496,15 +485,13 @@ jobs:
             |-----------|----------------|----------|
             | QuickJS | wgpu | `mystral-macOS-arm64-quickjs-wgpu.zip` |
             | V8 | wgpu | `mystral-macOS-arm64-v8-wgpu.zip` |
-            | JSC | wgpu | `mystral-macOS-arm64-jsc-wgpu.zip` |
             | QuickJS | Dawn | `mystral-macOS-arm64-quickjs-dawn.zip` |
             | V8 | Dawn | `mystral-macOS-arm64-v8-dawn.zip` |
-            | JSC | Dawn | `mystral-macOS-arm64-jsc-dawn.zip` |
 
             **macOS (Intel - x64):**
             | JS Engine | WebGPU Backend | Download |
             |-----------|----------------|----------|
-            | JSC | Dawn | `mystral-macOS-x64-jsc-dawn.zip` |
+            | QuickJS | Dawn | `mystral-macOS-x64-quickjs-dawn.zip` |
 
             **Linux (x64):**
             | JS Engine | WebGPU Backend | Download |
@@ -524,7 +511,7 @@ jobs:
 
             ### Recommended Configurations
 
-            - **macOS**: `jsc-wgpu` (uses system JavaScriptCore, best performance)
+            - **macOS**: `v8-wgpu` (best JavaScript performance)
             - **Linux**: `quickjs-wgpu` (smallest binary, good performance)
             - **Windows**: `v8-wgpu` (best JS performance)
 

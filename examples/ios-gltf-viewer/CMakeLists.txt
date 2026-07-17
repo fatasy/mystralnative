@@ -175,7 +175,6 @@ target_link_libraries(MystralGLTFViewer PRIVATE
     "-framework CoreFoundation"
     "-framework ImageIO"
     "-framework IOSurface"
-    "-framework JavaScriptCore"
     "-framework GameController"
     "-framework CoreHaptics"
     "-framework AVFAudio"

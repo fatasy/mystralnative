@@ -28,12 +28,10 @@ extern "C" int stbi_write_png(const char* filename, int w, int h, int comp, cons
 #include "mystral/webgpu_compat.h"
 #endif
 
-// Dawn-specific includes for proc table setup
-// Windows uses Skia's dawn_combined.lib which requires proc table initialization
-// Linux/macOS use official Dawn releases which have direct implementations
+// Dawn-specific native API used for adapter/device discovery.
 #if defined(MYSTRAL_WEBGPU_DAWN)
 #include "dawn/native/DawnNative.h"
-#if defined(_WIN32)
+#if defined(MYSTRAL_DAWN_USE_PROC_TABLE)
 #include "dawn/dawn_proc.h"
 #endif
 #endif
@@ -365,10 +363,7 @@ Context::~Context() {
 bool Context::initialize() {
     std::cout << "[WebGPU] Initializing..." << std::endl;
 
-#if defined(MYSTRAL_WEBGPU_DAWN) && defined(_WIN32)
-    // Windows Dawn (from Skia build) requires setting up the proc table before any WebGPU calls
-    // This connects the wgpu* function calls to Dawn's actual implementation
-    // Linux/macOS Dawn releases have direct implementations and don't need this
+#if defined(MYSTRAL_DAWN_USE_PROC_TABLE)
     dawnProcSetProcs(&dawn::native::GetProcs());
     std::cout << "[WebGPU] Dawn proc table initialized" << std::endl;
 #endif

@@ -57,7 +57,7 @@ Download the latest release for your platform from the [releases page](https://g
 | Platform | Download |
 |----------|----------|
 | macOS (Apple Silicon) | `mystral-macOS-arm64-v8-dawn.zip` |
-| macOS (Intel) | `mystral-macOS-x64-v8-dawn.zip` |
+| macOS (Intel) | `mystral-macOS-x64-quickjs-dawn.zip` |
 | Windows | `mystral-windows-x64-v8-dawn.zip` |
 | Linux | `mystral-linux-x64-v8-dawn.zip` |
 
@@ -278,7 +278,7 @@ Compile Options:
         │                │           │        │
         ▼                ▼           ▼        ▼
    ┌─────────┐    ┌───────────┐  ┌─────┐  ┌──────┐  ┌───────┐
-   │ V8/JSC/ │    │   Dawn/   │  │SDL3 │  │libcurl│  │ libuv │
+   │ V8/     │    │   Dawn/   │  │SDL3 │  │libcurl│  │ libuv │
    │ QuickJS │    │ wgpu-native│  │     │  │      │  │       │
    └─────────┘    └───────────┘  └─────┘  └──────┘  └───────┘
 ```
@@ -292,7 +292,9 @@ Compile Options:
 | Web Audio | ✅ Working |
 | fetch (file/http/https) | ✅ Working |
 | URL / URLSearchParams | ✅ Working |
-| Worker (main-thread) | ✅ Working |
+| Worker (native thread) | ✅ Working |
+| WorkerPool / transferable ArrayBuffer | ✅ V8 and QuickJS |
+| SharedBuffer / SharedTable / SharedQueue | ✅ V8 and QuickJS |
 | Gamepad | ✅ Working |
 | requestAnimationFrame | ✅ Working |
 | setTimeout/setInterval | ✅ Working |
@@ -304,11 +306,11 @@ Compile Options:
 
 | Platform | JS Engine Options | WebGPU Backend |
 |----------|-------------------|----------------|
-| macOS (arm64) | V8, JSC, QuickJS | Dawn, wgpu-native |
-| macOS (x64) | V8, JSC, QuickJS | Dawn, wgpu-native |
+| macOS (arm64) | V8, QuickJS | Dawn, wgpu-native |
+| macOS (x64) | V8, QuickJS | Dawn, wgpu-native |
 | Windows | V8, QuickJS | Dawn, wgpu-native |
 | Linux | V8, QuickJS | Dawn, wgpu-native |
-| iOS | JSC, QuickJS | wgpu-native |
+| iOS | QuickJS | wgpu-native |
 | Android | V8, QuickJS | wgpu-native |
 
 ## Build Options
@@ -328,7 +330,6 @@ Choose your JS engine:
 ```bash
 cmake -B build -DMYSTRAL_USE_V8=ON       # Recommended — Full V8 with JIT
 cmake -B build -DMYSTRAL_USE_QUICKJS=ON  # Smallest binary, good for CI
-cmake -B build -DMYSTRAL_USE_JSC=ON      # macOS/iOS system engine
 ```
 
 Choose your WebGPU backend:
@@ -367,7 +368,7 @@ All dependencies are downloaded automatically as prebuilt binaries:
 |------------|---------|
 | Dawn / wgpu-native | WebGPU implementation |
 | SDL3 | Windowing, input, audio |
-| V8 / QuickJS / JSC | JavaScript engine |
+| V8 / QuickJS | JavaScript engine |
 | Skia | Canvas 2D rendering |
 | libcurl | HTTP requests |
 | libuv | Async I/O, timers, file watching |

@@ -13,7 +13,7 @@ Instructions for AI agents working on MystralNative.
 | `include/mystral/gltf/gltf_loader.h` | DEPRECATED |
 | `third_party/cgltf/` | DEPRECATED |
 
-**Use the JavaScript loaders instead** - they run on the JS engine (V8/QuickJS/JSC) within MystralNative and provide the same functionality as the web engine.
+**Use the JavaScript loaders instead** - they run on the JS engine (V8/QuickJS) within MystralNative and provide the same functionality as the web engine.
 
 ## Quick Reference
 

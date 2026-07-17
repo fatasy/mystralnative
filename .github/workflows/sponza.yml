@@ -64,7 +64,6 @@ jobs:
           cmake -B build -DCMAKE_BUILD_TYPE=Release \
             -DMYSTRAL_USE_V8=ON \
             -DMYSTRAL_USE_QUICKJS=OFF \
-            -DMYSTRAL_USE_JSC=OFF \
             -DMYSTRAL_USE_DAWN=ON \
             -DMYSTRAL_USE_WGPU=OFF
 
@@ -238,7 +237,6 @@ jobs:
           cmake -B build -DCMAKE_BUILD_TYPE=Release \
             -DMYSTRAL_USE_V8=ON \
             -DMYSTRAL_USE_QUICKJS=OFF \
-            -DMYSTRAL_USE_JSC=OFF \
             -DMYSTRAL_USE_DAWN=ON \
             -DMYSTRAL_USE_WGPU=OFF
 
@@ -331,7 +329,6 @@ jobs:
             "-DCMAKE_BUILD_TYPE=Release",
             "-DMYSTRAL_USE_V8=ON",
             "-DMYSTRAL_USE_QUICKJS=OFF",
-            "-DMYSTRAL_USE_JSC=OFF",
             "-DMYSTRAL_USE_DAWN=ON",
             "-DMYSTRAL_USE_WGPU=OFF",
             "-DVCPKG_TARGET_TRIPLET=x64-windows-static",

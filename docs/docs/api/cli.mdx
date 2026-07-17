@@ -37,6 +37,9 @@ mystral run <script.js> [options]
 | `--quiet`, `-q` | flag | - | Suppress all output except errors |
 | `--debug` | flag | - | Enable verbose WebGPU/shader debug logging |
 | `--debug-port` | number | - | Enable debug server on specified port (for testing) |
+| `--benchmark` | number | - | Profile exactly this many frames, then exit |
+| `--warmup` | number | 120 | Frames to execute before profiling begins |
+| `--benchmark-output` | string | - | Write the benchmark report as JSON |
 
 ### Video Recording Options
 
@@ -76,6 +79,36 @@ mystral run game.js --headless --video demo.mp4 --end-frame 600
 # Enable verbose debug logging
 mystral run game.js --debug
 ```
+
+### Fixed Runtime Benchmark
+
+Use the repository's stable CPU workload to compare runtime builds. Warmup frames
+allow the selected JavaScript engine to optimize the workload before measurements
+begin:
+
+```bash
+mystral run benchmarks/runtime-core.js \
+  --no-sdl \
+  --benchmark 600 \
+  --warmup 120 \
+  --benchmark-output runtime-benchmark.json
+```
+
+The profiler reports mean, p50, p95, p99, and maximum time for the complete frame
+and for these runtime phases: events, asynchronous work, callbacks, animation frame,
+and cleanup. It also records frame-budget misses and JavaScript heap snapshots before
+and after the measured window.
+
+Native Worker activity is reported separately as Workers created, messages and
+timer callbacks processed, messages rejected, cumulative Worker busy time, input/output queue bytes at the
+end of the sample, lifetime input/output queue high-water bytes, and shared-memory
+bytes. Rejected messages indicate backpressure rather than silent dropping.
+Worker busy time is not added to main-thread frame time because Workers execute
+concurrently.
+
+The benchmark workload is versioned and intentionally avoids GPU rendering and
+per-frame allocations. Keep its contents unchanged when comparing commits. Use a
+separate script with the same CLI options to profile a real game scene.
 
 ### Agent and Test Automation
 

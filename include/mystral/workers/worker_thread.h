@@ -1,134 +1,158 @@
 #pragma once
 
-/**
- * WorkerThread - Web Worker implementation
- *
- * Each WorkerThread runs its own JavaScript engine in a separate thread,
- * communicating with the main thread via message passing.
- *
- * Usage:
- *   auto worker = std::make_unique<WorkerThread>(id, jsCode);
- *   worker->start();
- *   worker->postMessage(data, transfers);
- *   // ... later ...
- *   while (worker->hasMessages()) {
- *       auto msg = worker->popMessage();
- *       // Handle message from worker
- *   }
- *   worker->terminate();
- */
+#include "mystral/js/engine.h"
+#include "mystral/workers/shared_buffer.h"
 
-#include <memory>
-#include <string>
-#include <vector>
-#include <queue>
-#include <mutex>
-#include <condition_variable>
-#include <thread>
 #include <atomic>
-#include <functional>
+#include <cstddef>
+#include <cstdint>
+#include <condition_variable>
+#include <chrono>
+#include <memory>
+#include <mutex>
+#include <queue>
+#include <string>
+#include <thread>
+#include <unordered_map>
+#include <vector>
 
-namespace mystral {
-namespace workers {
+namespace mystral::workers {
 
-/**
- * Shared ArrayBuffer data for transfer between threads
- */
-struct ArrayBufferData {
-    std::vector<uint8_t> data;
-    bool transferred = false;  // If true, original is detached
+enum class WorkerSourceKind {
+    Script,
+    Module
 };
 
-/**
- * Message passed between main thread and worker
- */
+enum class WorkerState {
+    Created,
+    Starting,
+    Running,
+    Stopping,
+    Stopped,
+    Failed
+};
+
+enum class WorkerPostStatus {
+    Posted = 0,
+    NotRunning = 1,
+    QueueFull = 2,
+    MessageTooLarge = 3,
+    NotFound = 4,
+    InvalidTransfer = 5
+};
+
+struct WorkerQueueLimits {
+    size_t maxMessages = 1024;
+    size_t maxBytes = 16 * 1024 * 1024;
+};
+
+struct WorkerThreadStats {
+    WorkerState state = WorkerState::Created;
+    uint64_t processedMessages = 0;
+    uint64_t processedTimerCallbacks = 0;
+    uint64_t busyNanoseconds = 0;
+    uint64_t rejectedInputMessages = 0;
+    uint64_t rejectedOutputMessages = 0;
+    size_t queuedInputMessages = 0;
+    size_t queuedInputBytes = 0;
+    size_t queuedOutputMessages = 0;
+    size_t queuedOutputBytes = 0;
+    size_t peakQueuedInputBytes = 0;
+    size_t peakQueuedOutputBytes = 0;
+};
+
 struct WorkerMessage {
     enum class Type {
-        MESSAGE,    // Normal postMessage
-        ERROR,      // Error from worker
-        TERMINATE   // Termination request
+        Message,
+        Error,
+        Ready,
+        Exited
     };
 
-    Type type = Type::MESSAGE;
-    std::vector<uint8_t> payload;  // JSON-serialized data
-    std::vector<std::shared_ptr<ArrayBufferData>> transfers;
+    Type type = Type::Message;
+    std::string payload;
+    std::vector<js::TransferredArrayBuffer> transfers;
 };
 
-/**
- * Callback for receiving messages from a worker
- */
-using WorkerMessageCallback = std::function<void(int workerId, WorkerMessage msg)>;
+struct WorkerPayload {
+    std::string serialized;
+    std::vector<js::TransferredArrayBuffer> transfers;
+};
 
-/**
- * WorkerThread - Runs JS code in a separate thread
- */
 class WorkerThread {
 public:
-    /**
-     * Create a worker thread
-     * @param id Unique worker ID
-     * @param code JavaScript code to execute
-     */
-    WorkerThread(int id, const std::string& code);
+    WorkerThread(int id,
+                 js::EngineType engineType,
+                 WorkerSourceKind sourceKind,
+                 std::string source,
+                 std::string rootDir,
+                 std::string name,
+                 std::shared_ptr<SharedBufferRegistry> sharedBuffers,
+                 WorkerQueueLimits queueLimits = {});
     ~WorkerThread();
 
-    /**
-     * Start the worker thread
-     */
     void start();
-
-    /**
-     * Post a message to the worker
-     * @param data JSON-serialized message data
-     * @param transfers ArrayBuffers to transfer (not copy)
-     */
-    void postMessage(std::vector<uint8_t> data,
-                     std::vector<std::shared_ptr<ArrayBufferData>> transfers = {});
-
-    /**
-     * Terminate the worker
-     */
+    WorkerPostStatus postMessage(
+        std::string payload,
+        std::vector<js::TransferredArrayBuffer> transfers = {});
     void terminate();
+    std::vector<WorkerMessage> drainMessages();
 
-    /**
-     * Check if the worker has messages to process
-     */
-    bool hasMessages() const;
-
-    /**
-     * Pop a message from the worker's output queue
-     */
-    WorkerMessage popMessage();
-
-    /**
-     * Check if the worker is still running
-     */
-    bool isRunning() const { return running_.load(); }
-
-    /**
-     * Get the worker ID
-     */
-    int getId() const { return id_; }
+    bool isFinished() const;
+    int id() const { return id_; }
+    WorkerState state() const { return state_.load(); }
+    WorkerThreadStats stats() const;
 
 private:
-    int id_;
-    std::string code_;
-    std::unique_ptr<std::thread> thread_;
-
-    // Thread-safe message queues
-    mutable std::mutex inMutex_;
-    mutable std::mutex outMutex_;
-    std::queue<WorkerMessage> inQueue_;   // Main -> Worker
-    std::queue<WorkerMessage> outQueue_;  // Worker -> Main
-    std::condition_variable inCondition_;
-
-    std::atomic<bool> running_{false};
-    std::atomic<bool> terminated_{false};
+    struct WorkerTimer {
+        std::chrono::steady_clock::time_point due;
+        std::chrono::milliseconds interval{0};
+        bool repeat = false;
+    };
 
     void threadMain();
-    void processMessages(void* engine);  // void* is js::Engine*
-    void setupWorkerGlobals(void* engine);
+    bool setupWorkerGlobals(js::Engine* engine);
+    int scheduleTimer(double delayMs, bool repeat);
+    void cancelTimer(int id);
+    std::vector<int> collectDueTimers();
+    bool dispatchTimer(js::Engine* engine, int id);
+    bool dispatchMessage(js::Engine* engine, const WorkerPayload& payload);
+    WorkerPostStatus enqueueOutput(
+        WorkerMessage::Type type,
+        std::string payload,
+        std::vector<js::TransferredArrayBuffer> transfers = {});
+    void finishThread(js::Engine* engine, WorkerState finalState);
+
+    int id_ = 0;
+    js::EngineType engineType_ = js::EngineType::Unknown;
+    WorkerSourceKind sourceKind_ = WorkerSourceKind::Script;
+    std::string source_;
+    std::string rootDir_;
+    std::string name_;
+    std::shared_ptr<SharedBufferRegistry> sharedBuffers_;
+    WorkerQueueLimits queueLimits_;
+    std::thread thread_;
+
+    mutable std::mutex engineMutex_;
+    js::Engine* engine_ = nullptr;
+    mutable std::mutex inputMutex_;
+    mutable std::mutex outputMutex_;
+    std::queue<WorkerPayload> inputQueue_;
+    std::queue<WorkerMessage> outputQueue_;
+    size_t inputQueuedBytes_ = 0;
+    size_t outputQueuedBytes_ = 0;
+    size_t peakInputQueuedBytes_ = 0;
+    size_t peakOutputQueuedBytes_ = 0;
+    std::condition_variable inputCondition_;
+    std::unordered_map<int, WorkerTimer> timers_;
+    int nextTimerId_ = 1;
+    std::atomic<bool> terminated_{false};
+    std::atomic<WorkerState> state_{WorkerState::Created};
+    std::atomic<uint64_t> processedMessages_{0};
+    std::atomic<uint64_t> processedTimerCallbacks_{0};
+    std::atomic<uint64_t> busyNanoseconds_{0};
+    std::atomic<uint64_t> rejectedInputMessages_{0};
+    std::atomic<uint64_t> rejectedOutputMessages_{0};
 };
 
-}  // namespace workers
-}  // namespace mystral
+}  // namespace mystral::workers
