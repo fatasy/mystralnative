@@ -2,6 +2,8 @@
 
 MystralNative implements standard DOM input events, so browser-targeted game code works without changes. Under the hood, SDL3 native events are translated into familiar `KeyboardEvent`, `MouseEvent`, `PointerEvent`, `WheelEvent`, and Gamepad API objects.
 
+Events follow the DOM capture, target, and bubble phases. `stopPropagation()` prevents the event from reaching later targets while allowing the remaining listeners on the current target to run. `stopImmediatePropagation()` also stops the remaining listeners on the current target.
+
 ## Event Targets
 
 Events can be listened on three targets, matching browser behavior:
@@ -336,6 +338,55 @@ Each entry in `gamepad.buttons` has:
 }
 ```
 
+## Text Input and IME
+
+Use a focused `input` or `textarea` when accepting user text. Focusing the element starts the platform text input service, including the on-screen keyboard and IME where the operating system provides them. The committed text is UTF-8 and updates the element's `value` and selection.
+
+```javascript
+const input = document.createElement('input');
+input.placeholder = 'Character name';
+
+input.addEventListener('beforeinput', (event) => {
+  // Cancel here to reject the edit before value is changed.
+  if (event.data?.includes('\n')) event.preventDefault();
+});
+
+input.addEventListener('input', () => {
+  console.log(input.value, input.selectionStart, input.selectionEnd);
+});
+
+input.focus();
+```
+
+The runtime exposes these text events:
+
+| Event | Purpose |
+|-------|---------|
+| `beforeinput` | Cancelable event before committed text changes `value` |
+| `input` | Fired after committed text changes `value` |
+| `compositionstart` | An IME composition begins |
+| `compositionupdate` | The current IME pre-edit text changes |
+| `compositionend` | The IME commits or cancels the composition |
+
+`beforeinput` and `input` provide `data`, `inputType`, and `isComposing`. Composition events provide `data`; `start` and `length` expose SDL's current pre-edit selection. Use `element.blur()` to stop native text input.
+
+For a custom rendered editor, position the OS candidate window near the caret:
+
+```javascript
+input.setTextInputArea(caretX, caretY, lineHeight, lineHeight, 0);
+```
+
+## Clipboard
+
+The system text clipboard is available through the standard promise-based API:
+
+```javascript
+await navigator.clipboard.writeText(input.value);
+const pastedText = await navigator.clipboard.readText();
+```
+
+Clipboard access is unavailable in `--no-sdl` mode; `writeText()` rejects and `readText()` returns an empty string there.
+
 ### Deadzone Handling
 
 Analog sticks rarely return exactly 0 when idle. Apply a deadzone:
@@ -427,10 +478,11 @@ window.addEventListener('resize', () => {
 
 ## Notes and Limitations
 
-- **`preventDefault()` and `stopPropagation()`** are available on all events but are no-ops in the native runtime (there's no browser default behavior to prevent).
+- **`preventDefault()`** cancels the built-in text mutation for `beforeinput`. Other native input events currently have no browser default action to cancel.
+- **`stopPropagation()`** and **`stopImmediatePropagation()`** follow DOM propagation semantics across `window`, `document`, and the event target.
 - **Pointer lock** (`requestPointerLock`) is not yet implemented. Use `movementX`/`movementY` from `pointermove` events for relative mouse movement.
 - **Touch events** (`touchstart`, `touchmove`, `touchend`) are not yet available. Use pointer events instead, touch events will be supported in a future release.
-- **Focus events** (`focus`, `blur`) are not implemented. The native window is always considered focused.
+- **Focus events** are available for runtime-created `input` and `textarea` elements. The canvas itself is still considered focused whenever no text control is active.
 - Up to **4 gamepads** can be connected simultaneously.
 
 ## Next Steps

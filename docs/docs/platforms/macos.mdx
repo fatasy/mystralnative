@@ -15,9 +15,6 @@ For macOS, we recommend:
 ```bash
 # Apple Silicon
 mystral-macOS-arm64-v8-dawn.zip
-
-# Intel Mac
-mystral-macOS-x64-quickjs-dawn.zip
 ```
 
 **V8 + Dawn** provides the best experience with full ES2024+ JavaScript and Chrome's WebGPU implementation.
@@ -91,8 +88,7 @@ Build for both arm64 and x64:
 
 ```bash
 cmake -B build \
-    -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" \
-    -DMYSTRAL_USE_V8=ON \
+    -DCMAKE_OSX_ARCHITECTURES="arm64" \
     -DMYSTRAL_USE_DAWN=ON
 
 cmake --build build
@@ -104,8 +100,6 @@ cmake --build build
 |-----------|----------------|-------|
 | V8 | Dawn | Recommended, full ES2024+ |
 | V8 | wgpu-native | Good compatibility |
-| QuickJS | Dawn | Smaller binary |
-| QuickJS | wgpu-native | Smallest binary |
 
 ## Known Issues
 

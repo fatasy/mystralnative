@@ -13,6 +13,7 @@
 #include "mystral/audio/audio_bindings.h"
 #include "mystral/vfs/embedded_bundle.h"
 #include "mystral/async/event_loop.h"
+#include "mystral/async/job_system.h"
 #include "mystral/workers/shared_buffer.h"
 #include "mystral/workers/worker_registry.h"
 #include "storage/local_storage.h"
@@ -503,13 +504,20 @@ public:
         installCrashHandlers();
 
         if (initializeServices) {
+            // Reserve the main thread for rendering and run asset work on the
+            // runtime-owned priority pool.
+            async::getJobSystem().start();
+            std::cout << "[JobSystem] Initialized with "
+                      << async::getJobSystem().stats().workerCount
+                      << " worker threads" << std::endl;
+
             // Initialize libuv event loop for async I/O (HTTP, file, timers)
             async::EventLoop::instance().init();
 
             // Initialize async HTTP client (uses libuv for non-blocking I/O)
             http::getAsyncHttpClient().init();
 
-            // Initialize async file reader (uses libuv thread pool)
+            // Initialize asset file reads on the native job system.
             fs::getAsyncFileReader().init();
 
             // Initialize file watcher (uses libuv fs_event for hot reload)
@@ -535,6 +543,11 @@ public:
         // Clean up audio resources FIRST before touching JS objects
         // (Audio callback thread may be accessing JS handles)
         audio::cleanupAudioBindings();
+
+        fs::getAsyncFileReader().shutdown();
+        async::getJobSystem().cancelGeneration(jsGeneration_);
+        async::getJobSystem().shutdown();
+        clearPendingFileCallbacks();
 
         // Clean up ray tracing resources
 #ifdef MYSTRAL_HAS_RAYTRACING
@@ -787,6 +800,13 @@ public:
         std::cout << "[HotReload] Reloading script: " << scriptPath_ << std::endl;
         logHotReloadStats("before dispose");
 
+        // Finish cancellation on the main thread before the old V8 isolate is
+        // destroyed, so protected callbacks never outlive their generation.
+        async::getJobSystem().cancelGeneration(jsGeneration_);
+        async::getJobSystem().waitIdle();
+        async::getJobSystem().processCompletions();
+        clearPendingFileCallbacks();
+
         // Give the application one synchronous chance to release its scene,
         // renderer and JS-owned GPU wrappers before native callbacks vanish.
         auto disposeHook = jsEngine_->getGlobalProperty("__laasHotDispose");
@@ -947,7 +967,7 @@ private:
             moduleSystem_.reset();
         }
 
-        while (!pendingFileCallbacks_.empty()) pendingFileCallbacks_.pop();
+        clearPendingFileCallbacks();
 #ifdef MYSTRAL_HAS_DRACO
         {
             std::lock_guard<std::mutex> lock(dracoMutex_);
@@ -1007,6 +1027,7 @@ public:
             // In no-SDL (headless) mode, exit when there's no more work to do
             if (config_.noSdl) {
                 bool hasWork = !rafCallbacks_.empty() || hasActiveTimers() ||
+                               async::getJobSystem().stats().inFlight > 0 ||
                                (workerRegistry_ && workerRegistry_->size() > 0) ||
                                webtransport::hasActiveSessions();
                 if (!hasWork) {
@@ -1080,6 +1101,8 @@ public:
         }
 
         if (paused_ && stepFramesRemaining_ == 0) {
+            // Release native job results even while JavaScript callbacks are paused.
+            async::getJobSystem().processCompletions();
             return running_;
         }
 
@@ -1090,10 +1113,9 @@ public:
         // Drive WebTransport QUIC sessions and dispatch their JS events (main thread)
         webtransport::processEvents();
 
-        // Process completed async file reads (queues their callbacks)
-        // Note: We don't process the pending callbacks immediately because we might
-        // still be in a nested callback stack. The callbacks will be processed next frame.
-        fs::getAsyncFileReader().processCompletedReads();
+        // Drain native job completions on the main thread. File completions
+        // enqueue their JavaScript callbacks for the callback phase below.
+        async::getJobSystem().processCompletions();
 
         // Process file watch events (for hot reload)
         fs::getFileWatcher().processPendingEvents();
@@ -1199,6 +1221,8 @@ public:
             ? workerRegistry_->stats()
             : workers::WorkerRegistryStats{};
         profilerSharedMemoryStartBytes_ = sharedBuffers_ ? sharedBuffers_->allocatedBytes() : 0;
+        profilerJobStart_ = async::getJobSystem().stats();
+        async::getJobSystem().resetHighWaterMarks();
         profilerStartedAt_ = std::chrono::steady_clock::now();
         profilerActive_ = true;
     }
@@ -1247,6 +1271,37 @@ public:
         report.workerOutputQueuePeakBytes = workerEnd.peakQueuedOutputBytes;
         report.sharedMemoryStartBytes = profilerSharedMemoryStartBytes_;
         report.sharedMemoryEndBytes = sharedBuffers_ ? sharedBuffers_->allocatedBytes() : 0;
+
+        const auto jobEnd = async::getJobSystem().stats();
+        const auto delta = [](uint64_t start, uint64_t end) {
+            return end >= start ? end - start : 0;
+        };
+        report.jobsSubmitted = delta(profilerJobStart_.submitted, jobEnd.submitted);
+        report.jobsCompleted = delta(profilerJobStart_.completed, jobEnd.completed);
+        report.jobsCancelled = delta(profilerJobStart_.cancelled, jobEnd.cancelled);
+        report.jobsFailed = delta(profilerJobStart_.failed, jobEnd.failed);
+        report.jobsRejected = delta(profilerJobStart_.rejected, jobEnd.rejected);
+        report.jobQueueEnd = jobEnd.queued;
+        report.jobQueuePeak = jobEnd.queueHighWater;
+        report.jobInFlightEnd = jobEnd.inFlight;
+        report.jobInFlightPeak = jobEnd.inFlightHighWater;
+        report.jobWorkerCount = jobEnd.workerCount;
+        const auto copyJobLatency = [](const async::JobLatencySummary& source) {
+            RuntimeProfileStatistics result;
+            result.minMs = source.minMs;
+            result.meanMs = source.meanMs;
+            result.p50Ms = source.p50Ms;
+            result.p95Ms = source.p95Ms;
+            result.p99Ms = source.p99Ms;
+            result.maxMs = source.maxMs;
+            return result;
+        };
+        report.jobQueueWait = copyJobLatency(async::summarizeJobLatency(
+            profilerJobStart_.queueWait,
+            jobEnd.queueWait));
+        report.jobExecution = copyJobLatency(async::summarizeJobLatency(
+            profilerJobStart_.execution,
+            jobEnd.execution));
 
         std::vector<double> values;
         values.reserve(profilerSamples_.size());
@@ -2201,7 +2256,7 @@ private:
             })
         );
 
-        // Async file reading function - uses libuv thread pool for non-blocking I/O
+        // Async asset file reading through the native priority job system.
         // Takes (path, callback) where callback receives (data, error)
         jsEngine_->setGlobalProperty("__readFileAsync",
             jsEngine_->newFunction("__readFileAsync", [this](void* ctx, const std::vector<js::JSValueHandle>& args) {
@@ -2237,18 +2292,16 @@ private:
                     return jsEngine_->newUndefined();
                 }
 
-                // Use the async file reader with libuv thread pool
-                // The callback will be queued and invoked during processCompletedReads()
+                // The callback is completed on the main thread when native jobs drain.
                 fs::getAsyncFileReader().readFile(path, [this, callback, generation](std::vector<uint8_t> data, std::string error) {
                     if (generation != jsGeneration_) return;
-                    // This callback runs on the main thread during processCompletedReads()
                     // Queue the callback with data for processing in the main loop
                     pendingFileCallbacks_.push({
                         callback,
                         std::move(data),
                         std::move(error)
                     });
-                });
+                }, generation, async::JobPriority::Streaming);
 
                 return jsEngine_->newUndefined();
             })
@@ -4061,6 +4114,13 @@ globalThis.__mystralNativeDecodeDracoAsync = function(buffer, attrs) {
         }
     }
 
+    void clearPendingFileCallbacks() {
+        while (!pendingFileCallbacks_.empty()) {
+            if (jsEngine_) jsEngine_->unprotect(pendingFileCallbacks_.front().callback);
+            pendingFileCallbacks_.pop();
+        }
+    }
+
     void processWorkerMessages() {
         if (!workerRegistry_ || !jsEngine_) return;
 
@@ -4076,42 +4136,38 @@ globalThis.__mystralNativeDecodeDracoAsync = function(buffer, attrs) {
 
                 auto transfers = jsEngine_->newArray(message.transfers.size());
                 for (uint32_t index = 0; index < message.transfers.size(); index++) {
-                    jsEngine_->setPropertyIndex(
-                        transfers,
-                        index,
-                        jsEngine_->newTransferredArrayBuffer(message.transfers[index]));
+                    auto transferredBuffer =
+                        jsEngine_->newTransferredArrayBuffer(message.transfers[index]);
+                    jsEngine_->setPropertyIndex(transfers, index, transferredBuffer);
+                    jsEngine_->releaseValue(transferredBuffer);
                 }
 
-                auto result = jsEngine_->call(dispatch, jsEngine_->newUndefined(), {
-                    jsEngine_->newNumber(id),
-                    jsEngine_->newString(type),
-                    jsEngine_->newString(message.payload.c_str()),
+                auto idValue = jsEngine_->newNumber(id);
+                auto typeValue = jsEngine_->newString(type);
+                auto payloadValue = jsEngine_->newString(message.payload.c_str());
+                auto thisArg = jsEngine_->newUndefined();
+                auto result = jsEngine_->call(dispatch, thisArg, {
+                    idValue,
+                    typeValue,
+                    payloadValue,
                     transfers,
                 });
-                (void)result;
+                jsEngine_->releaseValue(result);
+                jsEngine_->releaseValue(thisArg);
+                jsEngine_->releaseValue(payloadValue);
+                jsEngine_->releaseValue(typeValue);
+                jsEngine_->releaseValue(idValue);
+                jsEngine_->releaseValue(transfers);
                 if (jsEngine_->hasException()) {
                     std::cerr << "[Worker] Main-thread message handler failed: "
                               << jsEngine_->getException() << std::endl;
                 }
             });
+        jsEngine_->releaseValue(dispatch);
     }
 
     void processMicrotasks() {
-        // Process the microtask queue (for Promises)
-        // This is engine-specific:
-        // - QuickJS: Call js_std_loop or execute pending jobs
-        // - V8: Microtasks are usually auto-processed
-
-        // For now, QuickJS needs explicit job execution
-        if (jsEngine_ && jsEngine_->getType() == js::EngineType::QuickJS) {
-            // QuickJS has a job queue for promises
-            // We can run pending jobs by evaluating a small script that triggers the queue
-            // Note: A proper implementation would call JS_ExecutePendingJob directly
-            // but that requires access to the raw context
-        }
-
-        // V8 handles microtasks automatically; QuickJS drains pending jobs in engine calls.
-        // So we don't need to do anything special for them
+        // V8 performs microtask checkpoints after engine calls.
     }
 
     RuntimeConfig config_;
@@ -4125,6 +4181,7 @@ globalThis.__mystralNativeDecodeDracoAsync = function(buffer, attrs) {
     RuntimeMemorySnapshot profilerMemoryStart_;
     workers::WorkerRegistryStats profilerWorkerStart_;
     uint64_t profilerSharedMemoryStartBytes_ = 0;
+    async::JobSystemStats profilerJobStart_;
     std::vector<FrameProfileSample> profilerSamples_;
     int width_;
     int height_;
@@ -4228,6 +4285,9 @@ globalThis.__mystralNativeDecodeDracoAsync = function(buffer, attrs) {
     // Cached canvas element (created once, returned by getElementById)
     js::JSValueHandle canvasElement_;
 
+    // Currently focused input/textarea. Protected while SDL text input is active.
+    js::JSValueHandle activeTextElement_;
+
     // Hot reload state
     std::string scriptPath_;  // Path to the currently loaded script
     std::string watchedScriptName_;
@@ -4240,6 +4300,15 @@ globalThis.__mystralNativeDecodeDracoAsync = function(buffer, attrs) {
     std::chrono::steady_clock::time_point reloadCandidateSince_{};
 
     void clearDOMEventListeners() {
+        if (activeTextElement_.ptr) {
+            if (jsEngine_) {
+                jsEngine_->unprotect(activeTextElement_);
+            }
+            activeTextElement_ = {};
+            if (!config_.noSdl) {
+                platform::stopTextInput();
+            }
+        }
         if (!jsEngine_) {
             eventListeners_.clear();
             return;
@@ -4259,6 +4328,19 @@ globalThis.__mystralNativeDecodeDracoAsync = function(buffer, attrs) {
         if (count > 0) {
             std::cout << "[HotReload] Released " << count << " DOM listeners" << std::endl;
         }
+    }
+
+    bool listenerUsesCapture(const std::vector<js::JSValueHandle>& args) {
+        if (args.size() < 3 || jsEngine_->isUndefined(args[2]) || jsEngine_->isNull(args[2])) {
+            return false;
+        }
+        if (jsEngine_->isBoolean(args[2])) {
+            return jsEngine_->toBoolean(args[2]);
+        }
+        if (jsEngine_->isObject(args[2])) {
+            return jsEngine_->toBoolean(jsEngine_->getProperty(args[2], "capture"));
+        }
+        return false;
     }
 
     void setupDOMEvents() {
@@ -4284,7 +4366,7 @@ globalThis.__mystralNativeDecodeDracoAsync = function(buffer, attrs) {
 
                 std::string eventType = jsEngine_->toString(args[0]);
                 js::JSValueHandle callback = args[1];
-                bool useCapture = args.size() > 2 ? jsEngine_->toBoolean(args[2]) : false;
+                bool useCapture = listenerUsesCapture(args);
 
                 jsEngine_->protect(callback);
                 eventListeners_["canvas"][eventType].push_back({callback, useCapture});
@@ -4393,7 +4475,7 @@ globalThis.__mystralNativeDecodeDracoAsync = function(buffer, attrs) {
 
                 std::string eventType = jsEngine_->toString(args[0]);
                 js::JSValueHandle callback = args[1];
-                bool useCapture = args.size() > 2 ? jsEngine_->toBoolean(args[2]) : false;
+                bool useCapture = listenerUsesCapture(args);
 
                 jsEngine_->protect(callback);
                 eventListeners_["document"][eventType].push_back({callback, useCapture});
@@ -4440,7 +4522,7 @@ globalThis.__mystralNativeDecodeDracoAsync = function(buffer, attrs) {
             })
         );
 
-        // Global helper for canvas.toDataURL - avoids nested lambda issues in QuickJS
+        // Global helper for canvas.toDataURL.
         jsEngine_->setGlobalProperty("__nativeCanvasToDataURL",
             jsEngine_->newFunction("__nativeCanvasToDataURL", [this](void* ctx, const std::vector<js::JSValueHandle>& args) {
                 std::string mimeType = "image/png";
@@ -4499,10 +4581,163 @@ globalThis.__mystralNativeDecodeDracoAsync = function(buffer, attrs) {
 
         jsEngine_->setGlobalProperty("document", document);
 
+        jsEngine_->setGlobalProperty("__nativeFocusTextInput",
+            jsEngine_->newMethod("__nativeFocusTextInput", [this](void*, js::JSValueHandle receiver,
+                                                                  const std::vector<js::JSValueHandle>&) {
+                if (activeTextElement_.ptr) {
+                    jsEngine_->unprotect(activeTextElement_);
+                }
+                activeTextElement_ = receiver;
+                jsEngine_->protect(activeTextElement_);
+
+                auto document = jsEngine_->getGlobalProperty("document");
+                jsEngine_->setProperty(document, "activeElement", receiver);
+                const bool started = config_.noSdl ? false : platform::startTextInput();
+                return jsEngine_->newBoolean(started);
+            }));
+
+        jsEngine_->setGlobalProperty("__nativeBlurTextInput",
+            jsEngine_->newMethod("__nativeBlurTextInput", [this](void*, js::JSValueHandle,
+                                                                 const std::vector<js::JSValueHandle>&) {
+                if (!config_.noSdl) {
+                    platform::stopTextInput();
+                }
+                if (activeTextElement_.ptr) {
+                    jsEngine_->unprotect(activeTextElement_);
+                    activeTextElement_ = {};
+                }
+                auto document = jsEngine_->getGlobalProperty("document");
+                jsEngine_->setProperty(document, "activeElement", jsEngine_->getProperty(document, "body"));
+                return jsEngine_->newUndefined();
+            }));
+
+        jsEngine_->setGlobalProperty("__nativeSetTextInputArea",
+            jsEngine_->newFunction("__nativeSetTextInputArea", [this](void*, const std::vector<js::JSValueHandle>& args) {
+                if (config_.noSdl || args.size() < 4) return jsEngine_->newBoolean(false);
+                const int cursor = args.size() > 4 ? static_cast<int>(jsEngine_->toNumber(args[4])) : 0;
+                return jsEngine_->newBoolean(platform::setTextInputArea(
+                    static_cast<int>(jsEngine_->toNumber(args[0])),
+                    static_cast<int>(jsEngine_->toNumber(args[1])),
+                    static_cast<int>(jsEngine_->toNumber(args[2])),
+                    static_cast<int>(jsEngine_->toNumber(args[3])), cursor));
+            }));
+
+        jsEngine_->setGlobalProperty("__nativeClipboardReadText",
+            jsEngine_->newFunction("__nativeClipboardReadText", [this](void*, const std::vector<js::JSValueHandle>&) {
+                if (config_.noSdl) return jsEngine_->newString("");
+                const std::string text = platform::getClipboardText();
+                return jsEngine_->newString(text.c_str());
+            }));
+
+        jsEngine_->setGlobalProperty("__nativeClipboardWriteText",
+            jsEngine_->newFunction("__nativeClipboardWriteText", [this](void*, const std::vector<js::JSValueHandle>& args) {
+                if (config_.noSdl || args.empty()) return jsEngine_->newBoolean(false);
+                return jsEngine_->newBoolean(platform::setClipboardText(jsEngine_->toString(args[0])));
+            }));
+
         // Set up document.createElement entirely in JavaScript for proper value handling
         // This must run AFTER document is set as a global
         const char* createElementSetup = R"(
+            function installEventTarget(target) {
+                const listeners = Object.create(null);
+                target.addEventListener = function(type, callback, options) {
+                    if (typeof callback !== 'function' && !callback?.handleEvent) return;
+                    const capture = typeof options === 'boolean' ? options : !!options?.capture;
+                    (listeners[String(type)] ??= []).push({ callback, capture });
+                };
+                target.removeEventListener = function(type, callback, options) {
+                    const capture = typeof options === 'boolean' ? options : !!options?.capture;
+                    const entries = listeners[String(type)];
+                    if (!entries) return;
+                    const index = entries.findIndex(entry => entry.callback === callback && entry.capture === capture);
+                    if (index >= 0) entries.splice(index, 1);
+                };
+                target.__dispatchListeners = function(event, capture) {
+                    const entries = (listeners[event.type] || []).slice();
+                    for (const entry of entries) {
+                        if (entry.capture !== capture) continue;
+                        if (typeof entry.callback === 'function') entry.callback.call(this, event);
+                        else entry.callback.handleEvent.call(entry.callback, event);
+                        if (event.__immediatePropagationStopped) break;
+                    }
+                    if (!capture && !event.__immediatePropagationStopped) {
+                        const handler = this['on' + event.type];
+                        if (typeof handler === 'function') handler.call(this, event);
+                    }
+                };
+                target.dispatchEvent = function(event) {
+                    if (!event || !event.type) throw new TypeError('Invalid event');
+                    event.target = this;
+                    event.currentTarget = this;
+                    event.eventPhase = Event.AT_TARGET;
+                    this.__dispatchListeners(event, true);
+                    if (!event.__immediatePropagationStopped) this.__dispatchListeners(event, false);
+                    event.currentTarget = null;
+                    event.eventPhase = Event.NONE;
+                    return !event.defaultPrevented;
+                };
+                return target;
+            }
+
+            function createTextControl(tagName) {
+                const element = installEventTarget({
+                    tagName: tagName.toUpperCase(),
+                    type: tagName === 'input' ? 'text' : undefined,
+                    value: '',
+                    defaultValue: '',
+                    disabled: false,
+                    readOnly: false,
+                    placeholder: '',
+                    selectionStart: 0,
+                    selectionEnd: 0,
+                    selectionDirection: 'none',
+                    style: {},
+                    className: '',
+                    id: ''
+                });
+                element.focus = function() {
+                    if (this.disabled || this.readOnly) return;
+                    if (document.activeElement === this) return;
+                    if (document.activeElement && document.activeElement !== document.body &&
+                        typeof document.activeElement.blur === 'function') {
+                        document.activeElement.blur();
+                    }
+                    __nativeFocusTextInput.call(this);
+                    this.dispatchEvent(new Event('focus'));
+                };
+                element.blur = function() {
+                    if (document.activeElement !== this) return;
+                    __nativeBlurTextInput.call(this);
+                    this.dispatchEvent(new Event('blur'));
+                };
+                element.select = function() {
+                    this.selectionStart = 0;
+                    this.selectionEnd = this.value.length;
+                    this.selectionDirection = 'none';
+                };
+                element.setSelectionRange = function(start, end, direction) {
+                    const length = this.value.length;
+                    this.selectionStart = Math.max(0, Math.min(length, Number(start) || 0));
+                    this.selectionEnd = Math.max(this.selectionStart, Math.min(length, Number(end) || 0));
+                    this.selectionDirection = direction || 'none';
+                };
+                element.setTextInputArea = function(x, y, width, height, cursor) {
+                    return __nativeSetTextInputArea(x, y, width, height, cursor || 0);
+                };
+                element.__applyTextInput = function(text) {
+                    if (this.disabled || this.readOnly) return;
+                    text = String(text);
+                    const start = this.selectionStart == null ? this.value.length : this.selectionStart;
+                    const end = this.selectionEnd == null ? start : this.selectionEnd;
+                    this.value = this.value.slice(0, start) + text + this.value.slice(end);
+                    this.selectionStart = this.selectionEnd = start + text.length;
+                    this.selectionDirection = 'none';
+                };
+                return element;
+            }
+
             document.createElement = function(tagName) {
+                tagName = String(tagName || '').toLowerCase();
                 if (tagName === 'canvas') {
                     return {
                         tagName: 'CANVAS',
@@ -4532,6 +4767,9 @@ globalThis.__mystralNativeDecodeDracoAsync = function(buffer, attrs) {
                         textContent: ''
                     };
                 }
+                if (tagName === 'input' || tagName === 'textarea') {
+                    return createTextControl(tagName);
+                }
                 if (tagName === 'div' || tagName === 'span' || tagName === 'img') {
                     return {
                         tagName: (tagName || '').toUpperCase(),
@@ -4556,17 +4794,34 @@ globalThis.__mystralNativeDecodeDracoAsync = function(buffer, attrs) {
                 globalThis.Event = class Event {
                     constructor(type, init) {
                         this.type = String(type || '');
+                        this.bubbles = !!init?.bubbles;
+                        this.cancelable = !!init?.cancelable;
+                        this.defaultPrevented = false;
+                        this.cancelBubble = false;
+                        this.target = null;
+                        this.currentTarget = null;
+                        this.eventPhase = 0;
+                        this.__immediatePropagationStopped = false;
                         Object.assign(this, init || {});
                     }
-                    preventDefault() {}
-                    stopPropagation() {}
+                    preventDefault() { if (this.cancelable) this.defaultPrevented = true; }
+                    stopPropagation() { this.cancelBubble = true; }
+                    stopImmediatePropagation() {
+                        this.cancelBubble = true;
+                        this.__immediatePropagationStopped = true;
+                    }
                 };
+                Object.assign(globalThis.Event, { NONE: 0, CAPTURING_PHASE: 1, AT_TARGET: 2, BUBBLING_PHASE: 3 });
+                Object.assign(globalThis.Event.prototype, { NONE: 0, CAPTURING_PHASE: 1, AT_TARGET: 2, BUBBLING_PHASE: 3 });
             }
             globalThis.UIEvent ??= class UIEvent extends globalThis.Event {};
             globalThis.MouseEvent ??= class MouseEvent extends globalThis.UIEvent {};
             globalThis.PointerEvent ??= class PointerEvent extends globalThis.MouseEvent {};
             globalThis.WheelEvent ??= class WheelEvent extends globalThis.MouseEvent {};
             globalThis.KeyboardEvent ??= class KeyboardEvent extends globalThis.UIEvent {};
+            globalThis.InputEvent ??= class InputEvent extends globalThis.UIEvent {};
+            globalThis.CompositionEvent ??= class CompositionEvent extends globalThis.UIEvent {};
+            document.activeElement = document.body;
         )";
         jsEngine_->eval(createElementSetup, "createElement-setup");
 
@@ -4589,7 +4844,7 @@ globalThis.__mystralNativeDecodeDracoAsync = function(buffer, attrs) {
 
                 std::string eventType = jsEngine_->toString(args[0]);
                 js::JSValueHandle callback = args[1];
-                bool useCapture = args.size() > 2 ? jsEngine_->toBoolean(args[2]) : false;
+                bool useCapture = listenerUsesCapture(args);
 
                 jsEngine_->protect(callback);
                 eventListeners_["window"][eventType].push_back({callback, useCapture});
@@ -4615,6 +4870,14 @@ globalThis.__mystralNativeDecodeDracoAsync = function(buffer, attrs) {
         // Set up input event callbacks
         platform::setKeyboardCallback([this](const platform::KeyboardEventData& e) {
             dispatchKeyboardEvent(e);
+        });
+
+        platform::setTextInputCallback([this](const platform::TextInputEventData& e) {
+            dispatchTextInputEvent(e);
+        });
+
+        platform::setCompositionCallback([this](const platform::CompositionEventData& e) {
+            dispatchCompositionEvent(e);
         });
 
         platform::setMouseCallback([this](const platform::MouseEventData& e) {
@@ -4643,6 +4906,19 @@ globalThis.__mystralNativeDecodeDracoAsync = function(buffer, attrs) {
             navigator = jsEngine_->newObject();
             jsEngine_->setGlobalProperty("navigator", navigator);
         }
+
+        const char* clipboardSetup = R"(
+            navigator.clipboard ??= {
+                readText() {
+                    return Promise.resolve(__nativeClipboardReadText());
+                },
+                writeText(text) {
+                    if (__nativeClipboardWriteText(String(text))) return Promise.resolve();
+                    return Promise.reject(new Error('System clipboard is unavailable'));
+                }
+            };
+        )";
+        jsEngine_->eval(clipboardSetup, "clipboard-setup");
 
         jsEngine_->setProperty(navigator, "getGamepads",
             jsEngine_->newFunction("getGamepads", [this](void* ctx, const std::vector<js::JSValueHandle>& args) {
@@ -4708,6 +4984,135 @@ globalThis.__mystralNativeDecodeDracoAsync = function(buffer, attrs) {
         std::cout << "[Mystral] DOM event system initialized" << std::endl;
     }
 
+    void installEventMethods(js::JSValueHandle event, bool bubbles, bool cancelable) {
+        jsEngine_->setProperty(event, "bubbles", jsEngine_->newBoolean(bubbles));
+        jsEngine_->setProperty(event, "cancelable", jsEngine_->newBoolean(cancelable));
+        jsEngine_->setProperty(event, "defaultPrevented", jsEngine_->newBoolean(false));
+        jsEngine_->setProperty(event, "cancelBubble", jsEngine_->newBoolean(false));
+        jsEngine_->setProperty(event, "eventPhase", jsEngine_->newNumber(0));
+        jsEngine_->setProperty(event, "target", jsEngine_->newNull());
+        jsEngine_->setProperty(event, "currentTarget", jsEngine_->newNull());
+        jsEngine_->setProperty(event, "__immediatePropagationStopped", jsEngine_->newBoolean(false));
+
+        jsEngine_->setProperty(event, "preventDefault",
+            jsEngine_->newMethod("preventDefault", [this](void*, js::JSValueHandle receiver,
+                                                          const std::vector<js::JSValueHandle>&) {
+                if (jsEngine_->toBoolean(jsEngine_->getProperty(receiver, "cancelable"))) {
+                    jsEngine_->setProperty(receiver, "defaultPrevented", jsEngine_->newBoolean(true));
+                }
+                return jsEngine_->newUndefined();
+            }));
+        jsEngine_->setProperty(event, "stopPropagation",
+            jsEngine_->newMethod("stopPropagation", [this](void*, js::JSValueHandle receiver,
+                                                            const std::vector<js::JSValueHandle>&) {
+                jsEngine_->setProperty(receiver, "cancelBubble", jsEngine_->newBoolean(true));
+                return jsEngine_->newUndefined();
+            }));
+        jsEngine_->setProperty(event, "stopImmediatePropagation",
+            jsEngine_->newMethod("stopImmediatePropagation", [this](void*, js::JSValueHandle receiver,
+                                                                     const std::vector<js::JSValueHandle>&) {
+                jsEngine_->setProperty(receiver, "cancelBubble", jsEngine_->newBoolean(true));
+                jsEngine_->setProperty(receiver, "__immediatePropagationStopped", jsEngine_->newBoolean(true));
+                return jsEngine_->newUndefined();
+            }));
+    }
+
+    bool eventFlag(js::JSValueHandle event, const char* name) {
+        return jsEngine_->toBoolean(jsEngine_->getProperty(event, name));
+    }
+
+    js::JSValueHandle eventTargetObject(const std::string& target) {
+        if (target == "window") return jsEngine_->getGlobal();
+        if (target == "document") return jsEngine_->getGlobalProperty("document");
+        return canvasElement_;
+    }
+
+    void dispatchToListeners(const std::string& target, const std::string& eventType,
+                             js::JSValueHandle event, bool capture, int eventPhase) {
+        auto targetIt = eventListeners_.find(target);
+        if (targetIt == eventListeners_.end()) return;
+
+        auto typeIt = targetIt->second.find(eventType);
+        if (typeIt == targetIt->second.end()) return;
+
+        const auto currentTarget = eventTargetObject(target);
+        jsEngine_->setProperty(event, "currentTarget", currentTarget);
+        jsEngine_->setProperty(event, "eventPhase", jsEngine_->newNumber(eventPhase));
+
+        // Copy listeners in case a callback changes the registration list.
+        const auto listeners = typeIt->second;
+        for (const auto& listener : listeners) {
+            if (listener.useCapture != capture) continue;
+            jsEngine_->call(listener.callback, currentTarget, {event});
+            if (eventFlag(event, "__immediatePropagationStopped")) break;
+        }
+    }
+
+    void dispatchToTextElement(js::JSValueHandle target, js::JSValueHandle event, bool capture) {
+        jsEngine_->setProperty(event, "currentTarget", target);
+        jsEngine_->setProperty(event, "eventPhase", jsEngine_->newNumber(2));
+        auto dispatch = jsEngine_->getProperty(target, "__dispatchListeners");
+        if (jsEngine_->isFunction(dispatch)) {
+            jsEngine_->call(dispatch, target, {event, jsEngine_->newBoolean(capture)});
+        }
+    }
+
+    void finishEventDispatch(js::JSValueHandle event) {
+        jsEngine_->setProperty(event, "currentTarget", jsEngine_->newNull());
+        jsEngine_->setProperty(event, "eventPhase", jsEngine_->newNumber(0));
+    }
+
+    void dispatchEventPath(const std::string& eventType, js::JSValueHandle event,
+                           const std::string& targetName,
+                           js::JSValueHandle textTarget = {}) {
+        const auto target = textTarget.ptr ? textTarget : eventTargetObject(targetName);
+        jsEngine_->setProperty(event, "target", target);
+
+        if (targetName != "window") {
+            dispatchToListeners("window", eventType, event, true, 1);
+            if (eventFlag(event, "cancelBubble")) {
+                finishEventDispatch(event);
+                return;
+            }
+        }
+        if (targetName != "window" && targetName != "document") {
+            dispatchToListeners("document", eventType, event, true, 1);
+            if (eventFlag(event, "cancelBubble")) {
+                finishEventDispatch(event);
+                return;
+            }
+        }
+
+        if (textTarget.ptr) {
+            dispatchToTextElement(textTarget, event, true);
+            if (!eventFlag(event, "__immediatePropagationStopped")) {
+                dispatchToTextElement(textTarget, event, false);
+            }
+        } else {
+            dispatchToListeners(targetName, eventType, event, true, 2);
+            if (!eventFlag(event, "__immediatePropagationStopped")) {
+                dispatchToListeners(targetName, eventType, event, false, 2);
+            }
+        }
+
+        if (!eventFlag(event, "bubbles") || eventFlag(event, "cancelBubble")) {
+            finishEventDispatch(event);
+            return;
+        }
+
+        if (targetName != "window" && targetName != "document") {
+            dispatchToListeners("document", eventType, event, false, 3);
+            if (eventFlag(event, "cancelBubble")) {
+                finishEventDispatch(event);
+                return;
+            }
+        }
+        if (targetName != "window") {
+            dispatchToListeners("window", eventType, event, false, 3);
+        }
+        finishEventDispatch(event);
+    }
+
     void dispatchKeyboardEvent(const platform::KeyboardEventData& e) {
         auto event = jsEngine_->newObject();
         jsEngine_->setProperty(event, "type", jsEngine_->newString(e.type.c_str()));
@@ -4720,22 +5125,52 @@ globalThis.__mystralNativeDecodeDracoAsync = function(buffer, attrs) {
         jsEngine_->setProperty(event, "altKey", jsEngine_->newBoolean(e.altKey));
         jsEngine_->setProperty(event, "metaKey", jsEngine_->newBoolean(e.metaKey));
 
-        // preventDefault and stopPropagation (stubs)
-        jsEngine_->setProperty(event, "preventDefault",
-            jsEngine_->newFunction("preventDefault", [](void* ctx, const std::vector<js::JSValueHandle>& args) {
-                return js::JSValueHandle{nullptr, nullptr};
-            })
-        );
-        jsEngine_->setProperty(event, "stopPropagation",
-            jsEngine_->newFunction("stopPropagation", [](void* ctx, const std::vector<js::JSValueHandle>& args) {
-                return js::JSValueHandle{nullptr, nullptr};
-            })
-        );
+        installEventMethods(event, true, true);
+        if (activeTextElement_.ptr) {
+            dispatchEventPath(e.type, event, "text", activeTextElement_);
+        } else {
+            dispatchEventPath(e.type, event, "canvas");
+        }
+    }
 
-        // Dispatch to document, window, and canvas listeners
-        dispatchToListeners("document", e.type, event);
-        dispatchToListeners("window", e.type, event);
-        dispatchToListeners("canvas", e.type, event);
+    void dispatchTextInputEvent(const platform::TextInputEventData& e) {
+        if (!activeTextElement_.ptr) return;
+        const auto target = activeTextElement_;
+        const char* inputType = e.fromComposition ? "insertCompositionText" : "insertText";
+
+        auto beforeInput = jsEngine_->newObject();
+        jsEngine_->setProperty(beforeInput, "type", jsEngine_->newString("beforeinput"));
+        jsEngine_->setProperty(beforeInput, "data", jsEngine_->newString(e.text.c_str()));
+        jsEngine_->setProperty(beforeInput, "inputType", jsEngine_->newString(inputType));
+        jsEngine_->setProperty(beforeInput, "isComposing", jsEngine_->newBoolean(false));
+        installEventMethods(beforeInput, true, true);
+        dispatchEventPath("beforeinput", beforeInput, "text", target);
+        if (eventFlag(beforeInput, "defaultPrevented")) return;
+
+        auto applyText = jsEngine_->getProperty(target, "__applyTextInput");
+        if (jsEngine_->isFunction(applyText)) {
+            jsEngine_->call(applyText, target, {jsEngine_->newString(e.text.c_str())});
+        }
+
+        auto input = jsEngine_->newObject();
+        jsEngine_->setProperty(input, "type", jsEngine_->newString("input"));
+        jsEngine_->setProperty(input, "data", jsEngine_->newString(e.text.c_str()));
+        jsEngine_->setProperty(input, "inputType", jsEngine_->newString(inputType));
+        jsEngine_->setProperty(input, "isComposing", jsEngine_->newBoolean(false));
+        installEventMethods(input, true, false);
+        dispatchEventPath("input", input, "text", target);
+    }
+
+    void dispatchCompositionEvent(const platform::CompositionEventData& e) {
+        if (!activeTextElement_.ptr) return;
+        auto event = jsEngine_->newObject();
+        jsEngine_->setProperty(event, "type", jsEngine_->newString(e.type.c_str()));
+        jsEngine_->setProperty(event, "data", jsEngine_->newString(e.data.c_str()));
+        jsEngine_->setProperty(event, "start", jsEngine_->newNumber(e.start));
+        jsEngine_->setProperty(event, "length", jsEngine_->newNumber(e.length));
+        jsEngine_->setProperty(event, "isComposing", jsEngine_->newBoolean(e.type != "compositionend"));
+        installEventMethods(event, true, false);
+        dispatchEventPath(e.type, event, "text", activeTextElement_);
     }
 
     void dispatchMouseEvent(const platform::MouseEventData& e) {
@@ -4756,20 +5191,8 @@ globalThis.__mystralNativeDecodeDracoAsync = function(buffer, attrs) {
         jsEngine_->setProperty(event, "altKey", jsEngine_->newBoolean(e.altKey));
         jsEngine_->setProperty(event, "metaKey", jsEngine_->newBoolean(e.metaKey));
 
-        jsEngine_->setProperty(event, "preventDefault",
-            jsEngine_->newFunction("preventDefault", [](void* ctx, const std::vector<js::JSValueHandle>& args) {
-                return js::JSValueHandle{nullptr, nullptr};
-            })
-        );
-        jsEngine_->setProperty(event, "stopPropagation",
-            jsEngine_->newFunction("stopPropagation", [](void* ctx, const std::vector<js::JSValueHandle>& args) {
-                return js::JSValueHandle{nullptr, nullptr};
-            })
-        );
-
-        dispatchToListeners("document", e.type, event);
-        dispatchToListeners("window", e.type, event);
-        dispatchToListeners("canvas", e.type, event);
+        installEventMethods(event, true, true);
+        dispatchEventPath(e.type, event, "canvas");
     }
 
     void dispatchPointerEvent(const platform::PointerEventData& e) {
@@ -4797,20 +5220,8 @@ globalThis.__mystralNativeDecodeDracoAsync = function(buffer, attrs) {
         jsEngine_->setProperty(event, "height", jsEngine_->newNumber(e.height));
         jsEngine_->setProperty(event, "pressure", jsEngine_->newNumber(e.pressure));
 
-        jsEngine_->setProperty(event, "preventDefault",
-            jsEngine_->newFunction("preventDefault", [](void* ctx, const std::vector<js::JSValueHandle>& args) {
-                return js::JSValueHandle{nullptr, nullptr};
-            })
-        );
-        jsEngine_->setProperty(event, "stopPropagation",
-            jsEngine_->newFunction("stopPropagation", [](void* ctx, const std::vector<js::JSValueHandle>& args) {
-                return js::JSValueHandle{nullptr, nullptr};
-            })
-        );
-
-        dispatchToListeners("document", e.type, event);
-        dispatchToListeners("window", e.type, event);
-        dispatchToListeners("canvas", e.type, event);
+        installEventMethods(event, true, true);
+        dispatchEventPath(e.type, event, "canvas");
     }
 
     void dispatchWheelEvent(const platform::WheelEventData& e) {
@@ -4827,15 +5238,8 @@ globalThis.__mystralNativeDecodeDracoAsync = function(buffer, attrs) {
         jsEngine_->setProperty(event, "altKey", jsEngine_->newBoolean(e.altKey));
         jsEngine_->setProperty(event, "metaKey", jsEngine_->newBoolean(e.metaKey));
 
-        jsEngine_->setProperty(event, "preventDefault",
-            jsEngine_->newFunction("preventDefault", [](void* ctx, const std::vector<js::JSValueHandle>& args) {
-                return js::JSValueHandle{nullptr, nullptr};
-            })
-        );
-
-        dispatchToListeners("document", e.type, event);
-        dispatchToListeners("window", e.type, event);
-        dispatchToListeners("canvas", e.type, event);
+        installEventMethods(event, true, true);
+        dispatchEventPath(e.type, event, "canvas");
     }
 
     void dispatchGamepadEvent(const platform::GamepadEventData& e) {
@@ -4850,7 +5254,8 @@ globalThis.__mystralNativeDecodeDracoAsync = function(buffer, attrs) {
 
         jsEngine_->setProperty(event, "gamepad", gamepad);
 
-        dispatchToListeners("window", e.type, event);
+        installEventMethods(event, false, false);
+        dispatchEventPath(e.type, event, "window");
     }
 
     void dispatchResizeEvent(const platform::ResizeEventData& e) {
@@ -4866,29 +5271,8 @@ globalThis.__mystralNativeDecodeDracoAsync = function(buffer, attrs) {
         auto event = jsEngine_->newObject();
         jsEngine_->setProperty(event, "type", jsEngine_->newString("resize"));
 
-        dispatchToListeners("window", "resize", event);
-    }
-
-    void dispatchToListeners(const std::string& target, const std::string& eventType, js::JSValueHandle event) {
-        auto targetIt = eventListeners_.find(target);
-        if (targetIt == eventListeners_.end()) {
-            // Debug: no listeners registered for this target
-            return;
-        }
-
-        auto typeIt = targetIt->second.find(eventType);
-        if (typeIt == targetIt->second.end()) {
-            // Debug: no listeners for this event type on this target
-            return;
-        }
-
-        // Copy listeners in case they modify the list during iteration
-        auto listeners = typeIt->second;
-
-        for (const auto& listener : listeners) {
-            std::vector<js::JSValueHandle> args = {event};
-            jsEngine_->call(listener.callback, jsEngine_->newUndefined(), args);
-        }
+        installEventMethods(event, false, false);
+        dispatchEventPath("resize", event, "window");
     }
 
     // Test function to send a mock pointer event - call this after script evaluation

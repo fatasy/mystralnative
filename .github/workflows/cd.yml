@@ -68,29 +68,12 @@ jobs:
         include:
           - os: macos-15
             arch: arm64
-            js_engine: quickjs
-            webgpu: wgpu
-            name: macOS-arm64-quickjs-wgpu
-          - os: macos-15
-            arch: arm64
-            js_engine: v8
             webgpu: wgpu
             name: macOS-arm64-v8-wgpu
           - os: macos-15
             arch: arm64
-            js_engine: quickjs
-            webgpu: dawn
-            name: macOS-arm64-quickjs-dawn
-          - os: macos-15
-            arch: arm64
-            js_engine: v8
             webgpu: dawn
             name: macOS-arm64-v8-dawn
-          - os: macos-15-intel
-            arch: x64
-            js_engine: quickjs
-            webgpu: dawn
-            name: macOS-x64-quickjs-dawn
 
     name: Build - ${{ matrix.name }}
 
@@ -118,12 +101,6 @@ jobs:
         if: steps.cache-deps.outputs.cache-hit != 'true'
         run: node scripts/download-deps.mjs
 
-      - name: Download V8 (if needed)
-        if: matrix.js_engine == 'v8' && steps.cache-deps.outputs.cache-hit != 'true'
-        run: |
-          brew install p7zip || true
-          node scripts/download-deps.mjs --only v8
-
       - name: Download Dawn (if needed)
         if: matrix.webgpu == 'dawn' && steps.cache-deps.outputs.cache-hit != 'true'
         run: node scripts/download-deps.mjs --only dawn
@@ -131,11 +108,6 @@ jobs:
       - name: Configure CMake
         run: |
           CMAKE_ARGS="-B build -DCMAKE_BUILD_TYPE=Release"
-          if [ "${{ matrix.js_engine }}" == "quickjs" ]; then
-            CMAKE_ARGS="$CMAKE_ARGS -DMYSTRAL_USE_QUICKJS=ON -DMYSTRAL_USE_V8=OFF"
-          elif [ "${{ matrix.js_engine }}" == "v8" ]; then
-            CMAKE_ARGS="$CMAKE_ARGS -DMYSTRAL_USE_QUICKJS=OFF -DMYSTRAL_USE_V8=ON"
-          fi
           if [ "${{ matrix.webgpu }}" == "wgpu" ]; then
             CMAKE_ARGS="$CMAKE_ARGS -DMYSTRAL_USE_WGPU=ON -DMYSTRAL_USE_DAWN=OFF"
           elif [ "${{ matrix.webgpu }}" == "dawn" ]; then
@@ -189,17 +161,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - js_engine: quickjs
-            webgpu: wgpu
-            name: linux-x64-quickjs-wgpu
-          - js_engine: v8
-            webgpu: wgpu
+          - webgpu: wgpu
             name: linux-x64-v8-wgpu
-          - js_engine: quickjs
-            webgpu: dawn
-            name: linux-x64-quickjs-dawn
-          - js_engine: v8
-            webgpu: dawn
+          - webgpu: dawn
             name: linux-x64-v8-dawn
 
     name: Build - ${{ matrix.name }}
@@ -237,10 +201,6 @@ jobs:
         if: steps.cache-deps.outputs.cache-hit != 'true'
         run: node scripts/download-deps.mjs
 
-      - name: Download V8 (if needed)
-        if: matrix.js_engine == 'v8' && steps.cache-deps.outputs.cache-hit != 'true'
-        run: node scripts/download-deps.mjs --only v8
-
       - name: Download Dawn (if needed)
         if: matrix.webgpu == 'dawn' && steps.cache-deps.outputs.cache-hit != 'true'
         run: node scripts/download-deps.mjs --only dawn
@@ -249,11 +209,6 @@ jobs:
         run: |
           # SDL3 is built from source via add_subdirectory (static linking)
           CMAKE_ARGS="-B build -DCMAKE_BUILD_TYPE=Release"
-          if [ "${{ matrix.js_engine }}" == "quickjs" ]; then
-            CMAKE_ARGS="$CMAKE_ARGS -DMYSTRAL_USE_QUICKJS=ON -DMYSTRAL_USE_V8=OFF"
-          elif [ "${{ matrix.js_engine }}" == "v8" ]; then
-            CMAKE_ARGS="$CMAKE_ARGS -DMYSTRAL_USE_QUICKJS=OFF -DMYSTRAL_USE_V8=ON"
-          fi
           if [ "${{ matrix.webgpu }}" == "wgpu" ]; then
             CMAKE_ARGS="$CMAKE_ARGS -DMYSTRAL_USE_WGPU=ON -DMYSTRAL_USE_DAWN=OFF"
           elif [ "${{ matrix.webgpu }}" == "dawn" ]; then
@@ -307,10 +262,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - js_engine: quickjs
-            name: windows-x64-quickjs-wgpu
-          - js_engine: v8
-            name: windows-x64-v8-wgpu
+          - name: windows-x64-v8-wgpu
 
     name: Build - ${{ matrix.name }}
 
@@ -342,13 +294,6 @@ jobs:
           export PATH="/c/Program Files/7-Zip:$PATH"
           node scripts/download-deps.mjs
 
-      - name: Download V8 (if needed)
-        if: matrix.js_engine == 'v8' && steps.cache-deps.outputs.cache-hit != 'true'
-        shell: bash
-        run: |
-          export PATH="/c/Program Files/7-Zip:$PATH"
-          node scripts/download-deps.mjs --only v8
-
       - name: Install vcpkg dependencies
         run: |
           vcpkg install curl:x64-windows-static zlib:x64-windows-static
@@ -357,13 +302,6 @@ jobs:
       - name: Configure CMake
         run: |
           $CMAKE_ARGS = @("-B", "build", "-DCMAKE_BUILD_TYPE=Release")
-          if ("${{ matrix.js_engine }}" -eq "quickjs") {
-            $CMAKE_ARGS += "-DMYSTRAL_USE_QUICKJS=ON", "-DMYSTRAL_USE_V8=OFF"
-          } elseif ("${{ matrix.js_engine }}" -eq "v8") {
-            $CMAKE_ARGS += "-DMYSTRAL_USE_QUICKJS=OFF", "-DMYSTRAL_USE_V8=ON"
-            # V8 requires C++20
-            $CMAKE_ARGS += "-DCMAKE_CXX_STANDARD=20"
-          }
           $CMAKE_ARGS += "-DMYSTRAL_USE_WGPU=ON", "-DMYSTRAL_USE_DAWN=OFF"
           $CMAKE_ARGS += "-DVCPKG_TARGET_TRIPLET=x64-windows-static"
           $CMAKE_ARGS += "-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded"
@@ -413,10 +351,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - js_engine: quickjs
-            name: windows-x64-quickjs-dawn
-          - js_engine: v8
-            name: windows-x64-v8-dawn
+          - name: windows-x64-v8-dawn
 
     name: Build - ${{ matrix.name }}
 
@@ -449,13 +384,6 @@ jobs:
           # Exclude skia and dawn - we'll use skia-win-static from library-builder instead
           # which includes both Skia and Dawn with matching /MT static CRT
           node scripts/download-deps.mjs --exclude skia,dawn
-
-      - name: Download V8 (if needed)
-        if: matrix.js_engine == 'v8' && steps.cache-deps.outputs.cache-hit != 'true'
-        shell: bash
-        run: |
-          export PATH="/c/Program Files/7-Zip:$PATH"
-          node scripts/download-deps.mjs --only v8
 
       - name: Download Skia with Dawn for Windows builds
         if: steps.cache-deps.outputs.cache-hit != 'true'
@@ -494,13 +422,6 @@ jobs:
       - name: Configure CMake
         run: |
           $CMAKE_ARGS = @("-B", "build", "-DCMAKE_BUILD_TYPE=Release")
-          if ("${{ matrix.js_engine }}" -eq "quickjs") {
-            $CMAKE_ARGS += "-DMYSTRAL_USE_QUICKJS=ON", "-DMYSTRAL_USE_V8=OFF"
-          } elseif ("${{ matrix.js_engine }}" -eq "v8") {
-            $CMAKE_ARGS += "-DMYSTRAL_USE_QUICKJS=OFF", "-DMYSTRAL_USE_V8=ON"
-            # V8 requires C++20
-            $CMAKE_ARGS += "-DCMAKE_CXX_STANDARD=20"
-          }
           $CMAKE_ARGS += "-DMYSTRAL_USE_WGPU=OFF", "-DMYSTRAL_USE_DAWN=ON"
           $CMAKE_ARGS += "-DVCPKG_TARGET_TRIPLET=x64-windows-static"
           $CMAKE_ARGS += "-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded"

@@ -290,11 +290,17 @@ bool WorkerThread::dispatchMessage(js::Engine* engine, const WorkerPayload& mess
     auto payload = engine->newString(message.serialized.c_str());
     auto transferred = engine->newArray(message.transfers.size());
     for (uint32_t index = 0; index < message.transfers.size(); index++) {
-        engine->setPropertyIndex(
-            transferred, index, engine->newTransferredArrayBuffer(message.transfers[index]));
+        auto transferredBuffer = engine->newTransferredArrayBuffer(message.transfers[index]);
+        engine->setPropertyIndex(transferred, index, transferredBuffer);
+        engine->releaseValue(transferredBuffer);
     }
-    auto result = engine->call(dispatch, engine->newUndefined(), {payload, transferred});
-    (void)result;
+    auto thisArg = engine->newUndefined();
+    auto result = engine->call(dispatch, thisArg, {payload, transferred});
+    engine->releaseValue(result);
+    engine->releaseValue(thisArg);
+    engine->releaseValue(transferred);
+    engine->releaseValue(payload);
+    engine->releaseValue(dispatch);
     bool succeeded = true;
     if (engine->hasException()) {
         const std::string error = engine->getException();

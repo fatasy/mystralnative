@@ -5,6 +5,7 @@
  */
 
 #include "mystral/platform/input.h"
+#include "mystral/platform/window.h"
 #include <SDL3/SDL.h>
 #include <iostream>
 #include <unordered_map>
@@ -15,6 +16,8 @@ namespace platform {
 
 // Event callbacks
 static KeyboardCallback g_keyboardCallback;
+static TextInputCallback g_textInputCallback;
+static CompositionCallback g_compositionCallback;
 static MouseCallback g_mouseCallback;
 static PointerCallback g_pointerCallback;
 static WheelCallback g_wheelCallback;
@@ -30,6 +33,8 @@ static bool g_ctrlKey = false;
 static bool g_shiftKey = false;
 static bool g_altKey = false;
 static bool g_metaKey = false;
+static bool g_compositionActive = false;
+static bool g_compositionEndPending = false;
 
 // Mouse button state
 static int g_mouseButtons = 0;
@@ -263,6 +268,14 @@ void setKeyboardCallback(KeyboardCallback callback) {
     g_keyboardCallback = callback;
 }
 
+void setTextInputCallback(TextInputCallback callback) {
+    g_textInputCallback = callback;
+}
+
+void setCompositionCallback(CompositionCallback callback) {
+    g_compositionCallback = callback;
+}
+
 void setMouseCallback(MouseCallback callback) {
     g_mouseCallback = callback;
 }
@@ -308,6 +321,90 @@ void processKeyboardEvent(const SDL_KeyboardEvent& event, bool isDown) {
     }
 
     g_keyboardCallback(data);
+}
+
+void processTextEditing(const SDL_TextEditingEvent& event) {
+    if (!g_compositionCallback) return;
+
+    const std::string text = event.text ? event.text : "";
+    if (g_compositionEndPending && !text.empty()) {
+        g_compositionCallback({"compositionend", "", 0, 0});
+        g_compositionActive = false;
+        g_compositionEndPending = false;
+    }
+    if (!g_compositionActive && !text.empty()) {
+        g_compositionActive = true;
+        g_compositionCallback({"compositionstart", "", event.start, event.length});
+    }
+
+    if (g_compositionActive) {
+        if (text.empty()) {
+            // SDL sends an empty edit immediately before committed text. Defer
+            // compositionend until the rest of this SDL event batch is read.
+            g_compositionEndPending = true;
+        } else {
+            g_compositionCallback({"compositionupdate", text, event.start, event.length});
+        }
+    }
+}
+
+void processTextInput(const SDL_TextInputEvent& event) {
+    const std::string text = event.text ? event.text : "";
+    const bool wasComposing = g_compositionActive;
+
+    if (g_compositionActive && g_compositionCallback) {
+        g_compositionCallback({"compositionend", text, 0, 0});
+        g_compositionActive = false;
+        g_compositionEndPending = false;
+    }
+
+    if (g_textInputCallback && !text.empty()) {
+        g_textInputCallback({text, wasComposing});
+    }
+}
+
+void flushTextInputEvents() {
+    if (g_compositionActive && g_compositionEndPending && g_compositionCallback) {
+        g_compositionCallback({"compositionend", "", 0, 0});
+        g_compositionActive = false;
+        g_compositionEndPending = false;
+    }
+}
+
+bool startTextInput() {
+    SDL_Window* window = getSDLWindow();
+    return window && SDL_StartTextInput(window);
+}
+
+void stopTextInput() {
+    SDL_Window* window = getSDLWindow();
+    if (window) {
+        SDL_StopTextInput(window);
+    }
+    if (g_compositionActive && g_compositionCallback) {
+        g_compositionCallback({"compositionend", "", 0, 0});
+    }
+    g_compositionActive = false;
+    g_compositionEndPending = false;
+}
+
+bool setTextInputArea(int x, int y, int width, int height, int cursor) {
+    SDL_Window* window = getSDLWindow();
+    if (!window) return false;
+    const SDL_Rect rect{x, y, width, height};
+    return SDL_SetTextInputArea(window, &rect, cursor);
+}
+
+std::string getClipboardText() {
+    char* text = SDL_GetClipboardText();
+    if (!text) return "";
+    std::string result(text);
+    SDL_free(text);
+    return result;
+}
+
+bool setClipboardText(const std::string& text) {
+    return SDL_SetClipboardText(text.c_str());
 }
 
 /**

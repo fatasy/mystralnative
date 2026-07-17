@@ -71,6 +71,18 @@ struct RuntimeProfileReport {
     uint64_t workerOutputQueuePeakBytes = 0;
     uint64_t sharedMemoryStartBytes = 0;
     uint64_t sharedMemoryEndBytes = 0;
+    uint64_t jobsSubmitted = 0;
+    uint64_t jobsCompleted = 0;
+    uint64_t jobsCancelled = 0;
+    uint64_t jobsFailed = 0;
+    uint64_t jobsRejected = 0;
+    uint64_t jobQueueEnd = 0;
+    uint64_t jobQueuePeak = 0;
+    uint64_t jobInFlightEnd = 0;
+    uint64_t jobInFlightPeak = 0;
+    uint32_t jobWorkerCount = 0;
+    RuntimeProfileStatistics jobQueueWait;
+    RuntimeProfileStatistics jobExecution;
 };
 
 using ConsoleCallback = std::function<void(const std::string& type, const std::string& message)>;
@@ -79,7 +91,7 @@ using ConsoleCallback = std::function<void(const std::string& type, const std::s
  * Mystral Native Runtime
  *
  * A lightweight runtime for JavaScript/TypeScript games using WebGPU.
- * Combines SDL3 for windowing/input, wgpu/Dawn for WebGPU, and V8/QuickJS for JS.
+ * Combines SDL3 for windowing/input, wgpu/Dawn for WebGPU, and V8 for JS.
  *
  * Example usage:
  *   auto runtime = mystral::Runtime::create({.width = 1280, .height = 720});
@@ -212,9 +224,7 @@ public:
     // ========================================================================
 
     /**
-     * Get the underlying JS context (type depends on engine)
-     * - QuickJS: JSContext*
-     * - V8: v8::Isolate*
+     * Get the underlying V8 isolate (`v8::Isolate*`).
      */
     virtual void* getJSContext() = 0;
 
@@ -279,7 +289,7 @@ inline const char* getVersion() {
 
 // Build configuration - uses CMake-defined values
 #ifndef MYSTRAL_JS_ENGINE
-#define MYSTRAL_JS_ENGINE "quickjs"
+#define MYSTRAL_JS_ENGINE "v8"
 #endif
 
 #ifndef MYSTRAL_WEBGPU_BACKEND

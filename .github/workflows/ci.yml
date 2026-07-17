@@ -28,36 +28,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # macOS ARM64 - QuickJS + wgpu (default)
-          - os: macos-15
-            arch: arm64
-            js_engine: quickjs
-            webgpu: wgpu
-            name: macOS-arm64-quickjs-wgpu
           # macOS ARM64 - V8 + wgpu
           - os: macos-15
             arch: arm64
-            js_engine: v8
             webgpu: wgpu
             name: macOS-arm64-v8-wgpu
-          # macOS ARM64 - QuickJS + Dawn
-          - os: macos-15
-            arch: arm64
-            js_engine: quickjs
-            webgpu: dawn
-            name: macOS-arm64-quickjs-dawn
           # macOS ARM64 - V8 + Dawn
           - os: macos-15
             arch: arm64
-            js_engine: v8
             webgpu: dawn
             name: macOS-arm64-v8-dawn
-          # macOS x64 - QuickJS + Dawn (x64 Mac is legacy)
-          - os: macos-15-intel
-            arch: x64
-            js_engine: quickjs
-            webgpu: dawn
-            name: macOS-x64-quickjs-dawn
 
     name: Build - ${{ matrix.name }}
 
@@ -80,12 +60,6 @@ jobs:
         if: steps.cache-deps.outputs.cache-hit != 'true'
         run: node scripts/download-deps.mjs
 
-      - name: Download V8 (if needed)
-        if: matrix.js_engine == 'v8' && steps.cache-deps.outputs.cache-hit != 'true'
-        run: |
-          brew install p7zip || true
-          node scripts/download-deps.mjs --only v8
-
       - name: Download Dawn (if needed)
         if: matrix.webgpu == 'dawn' && steps.cache-deps.outputs.cache-hit != 'true'
         run: node scripts/download-deps.mjs --only dawn
@@ -99,13 +73,7 @@ jobs:
 
       - name: Configure CMake
         run: |
-          CMAKE_ARGS="-B build -DCMAKE_BUILD_TYPE=Release"
-          # JS Engine
-          if [ "${{ matrix.js_engine }}" == "quickjs" ]; then
-            CMAKE_ARGS="$CMAKE_ARGS -DMYSTRAL_USE_QUICKJS=ON -DMYSTRAL_USE_V8=OFF"
-          elif [ "${{ matrix.js_engine }}" == "v8" ]; then
-            CMAKE_ARGS="$CMAKE_ARGS -DMYSTRAL_USE_QUICKJS=OFF -DMYSTRAL_USE_V8=ON"
-          fi
+          CMAKE_ARGS="-B build -DCMAKE_BUILD_TYPE=Release -DMYSTRAL_BUILD_NATIVE_TESTS=ON"
           # WebGPU backend
           if [ "${{ matrix.webgpu }}" == "wgpu" ]; then
             CMAKE_ARGS="$CMAKE_ARGS -DMYSTRAL_USE_WGPU=ON -DMYSTRAL_USE_DAWN=OFF"
@@ -120,6 +88,9 @@ jobs:
 
       - name: Test CLI
         run: ./build/mystral --version
+
+      - name: Test native runtime smoke tests
+        run: ctest --test-dir build -C Release -R "mystral-.*-smoke" --output-on-failure
 
       - name: Package artifacts
         run: |
@@ -151,21 +122,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Linux x64 - QuickJS + wgpu (default)
-          - js_engine: quickjs
-            webgpu: wgpu
-            name: linux-x64-quickjs-wgpu
           # Linux x64 - V8 + wgpu
-          - js_engine: v8
-            webgpu: wgpu
+          - webgpu: wgpu
             name: linux-x64-v8-wgpu
-          # Linux x64 - QuickJS + Dawn
-          - js_engine: quickjs
-            webgpu: dawn
-            name: linux-x64-quickjs-dawn
           # Linux x64 - V8 + Dawn
-          - js_engine: v8
-            webgpu: dawn
+          - webgpu: dawn
             name: linux-x64-v8-dawn
 
     name: Build - ${{ matrix.name }}
@@ -212,10 +173,6 @@ jobs:
         if: steps.cache-deps.outputs.cache-hit != 'true'
         run: node scripts/download-deps.mjs
 
-      - name: Download V8 (if needed)
-        if: matrix.js_engine == 'v8' && steps.cache-deps.outputs.cache-hit != 'true'
-        run: node scripts/download-deps.mjs --only v8
-
       - name: Download Dawn (if needed)
         if: matrix.webgpu == 'dawn' && steps.cache-deps.outputs.cache-hit != 'true'
         run: node scripts/download-deps.mjs --only dawn
@@ -237,13 +194,7 @@ jobs:
 
       - name: Configure CMake
         run: |
-          CMAKE_ARGS="-B build -DCMAKE_BUILD_TYPE=Release"
-          # JS Engine
-          if [ "${{ matrix.js_engine }}" == "quickjs" ]; then
-            CMAKE_ARGS="$CMAKE_ARGS -DMYSTRAL_USE_QUICKJS=ON -DMYSTRAL_USE_V8=OFF"
-          elif [ "${{ matrix.js_engine }}" == "v8" ]; then
-            CMAKE_ARGS="$CMAKE_ARGS -DMYSTRAL_USE_QUICKJS=OFF -DMYSTRAL_USE_V8=ON"
-          fi
+          CMAKE_ARGS="-B build -DCMAKE_BUILD_TYPE=Release -DMYSTRAL_BUILD_NATIVE_TESTS=ON"
           # WebGPU backend
           if [ "${{ matrix.webgpu }}" == "wgpu" ]; then
             CMAKE_ARGS="$CMAKE_ARGS -DMYSTRAL_USE_WGPU=ON -DMYSTRAL_USE_DAWN=OFF"
@@ -258,6 +209,9 @@ jobs:
 
       - name: Test CLI
         run: ./build/mystral --version
+
+      - name: Test native runtime smoke tests
+        run: ctest --test-dir build -C Release -R "mystral-.*-smoke" --output-on-failure
 
       - name: Package artifacts
         run: |
@@ -285,10 +239,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - js_engine: quickjs
-            name: windows-x64-quickjs-wgpu
-          - js_engine: v8
-            name: windows-x64-v8-wgpu
+          - name: windows-x64-v8-wgpu
 
     name: Build - ${{ matrix.name }}
 
@@ -314,13 +265,6 @@ jobs:
           export PATH="/c/Program Files/7-Zip:$PATH"
           node scripts/download-deps.mjs
 
-      - name: Download V8 (if needed)
-        if: matrix.js_engine == 'v8' && steps.cache-deps.outputs.cache-hit != 'true'
-        shell: bash
-        run: |
-          export PATH="/c/Program Files/7-Zip:$PATH"
-          node scripts/download-deps.mjs --only v8
-
       - name: Install vcpkg dependencies
         run: |
           # Use static triplet for wgpu builds (/MT)
@@ -329,16 +273,7 @@ jobs:
 
       - name: Configure CMake
         run: |
-          $CMAKE_ARGS = @("-B", "build", "-DCMAKE_BUILD_TYPE=Release")
-
-          # JS Engine
-          if ("${{ matrix.js_engine }}" -eq "quickjs") {
-            $CMAKE_ARGS += "-DMYSTRAL_USE_QUICKJS=ON", "-DMYSTRAL_USE_V8=OFF"
-          } elseif ("${{ matrix.js_engine }}" -eq "v8") {
-            $CMAKE_ARGS += "-DMYSTRAL_USE_QUICKJS=OFF", "-DMYSTRAL_USE_V8=ON"
-            # V8 requires C++20
-            $CMAKE_ARGS += "-DCMAKE_CXX_STANDARD=20"
-          }
+          $CMAKE_ARGS = @("-B", "build", "-DCMAKE_BUILD_TYPE=Release", "-DMYSTRAL_BUILD_NATIVE_TESTS=ON")
 
           # WebGPU backend - wgpu with static CRT (/MT)
           $CMAKE_ARGS += "-DMYSTRAL_USE_WGPU=ON", "-DMYSTRAL_USE_DAWN=OFF"
@@ -355,6 +290,9 @@ jobs:
       - name: Test CLI
         shell: bash
         run: ./build/Release/mystral.exe --version || echo "Build complete"
+
+      - name: Test native runtime smoke tests
+        run: ctest --test-dir build -C Release -R "mystral-.*-smoke" --output-on-failure
 
       - name: Package artifacts
         shell: bash
@@ -384,10 +322,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - js_engine: quickjs
-            name: windows-x64-quickjs-dawn
-          - js_engine: v8
-            name: windows-x64-v8-dawn
+          - name: windows-x64-v8-dawn
 
     name: Build - ${{ matrix.name }}
 
@@ -414,13 +349,6 @@ jobs:
           # Exclude skia and dawn - we'll use skia-win-static from library-builder instead
           # which includes both Skia and Dawn with matching /MT static CRT
           node scripts/download-deps.mjs --exclude skia,dawn
-
-      - name: Download V8 (if needed)
-        if: matrix.js_engine == 'v8' && steps.cache-deps.outputs.cache-hit != 'true'
-        shell: bash
-        run: |
-          export PATH="/c/Program Files/7-Zip:$PATH"
-          node scripts/download-deps.mjs --only v8
 
       - name: Download Skia with Dawn for Windows builds
         if: steps.cache-deps.outputs.cache-hit != 'true'
@@ -459,16 +387,7 @@ jobs:
 
       - name: Configure CMake
         run: |
-          $CMAKE_ARGS = @("-B", "build", "-DCMAKE_BUILD_TYPE=Release")
-
-          # JS Engine
-          if ("${{ matrix.js_engine }}" -eq "quickjs") {
-            $CMAKE_ARGS += "-DMYSTRAL_USE_QUICKJS=ON", "-DMYSTRAL_USE_V8=OFF"
-          } elseif ("${{ matrix.js_engine }}" -eq "v8") {
-            $CMAKE_ARGS += "-DMYSTRAL_USE_QUICKJS=OFF", "-DMYSTRAL_USE_V8=ON"
-            # V8 requires C++20
-            $CMAKE_ARGS += "-DCMAKE_CXX_STANDARD=20"
-          }
+          $CMAKE_ARGS = @("-B", "build", "-DCMAKE_BUILD_TYPE=Release", "-DMYSTRAL_BUILD_NATIVE_TESTS=ON")
 
           # WebGPU backend - Dawn with static CRT (/MT)
           $CMAKE_ARGS += "-DMYSTRAL_USE_WGPU=OFF", "-DMYSTRAL_USE_DAWN=ON"
@@ -485,6 +404,9 @@ jobs:
       - name: Test CLI
         shell: bash
         run: ./build/Release/mystral.exe --version || echo "Build complete"
+
+      - name: Test native runtime smoke tests
+        run: ctest --test-dir build -C Release -R "mystral-.*-smoke" --output-on-failure
 
       - name: Package artifacts
         shell: bash
@@ -527,18 +449,11 @@ jobs:
 
           # Check each expected artifact
           for config in \
-            "macOS-arm64-quickjs-wgpu" \
             "macOS-arm64-v8-wgpu" \
-            "macOS-arm64-quickjs-dawn" \
             "macOS-arm64-v8-dawn" \
-            "macOS-x64-quickjs-dawn" \
-            "linux-x64-quickjs-wgpu" \
             "linux-x64-v8-wgpu" \
-            "linux-x64-quickjs-dawn" \
             "linux-x64-v8-dawn" \
-            "windows-x64-quickjs-wgpu" \
             "windows-x64-v8-wgpu" \
-            "windows-x64-quickjs-dawn" \
             "windows-x64-v8-dawn"
           do
             # Parse config name

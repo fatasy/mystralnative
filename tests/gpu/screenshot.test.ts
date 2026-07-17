@@ -72,7 +72,7 @@ describe("Screenshot Capture", () => {
     console.log("stdout:", stdout);
     if (stderr) console.log("stderr:", stderr);
 
-    // Check screenshot was saved (ignore exit code - QuickJS has GC assertion at shutdown)
+    // Check screenshot was saved
     expect(stdout).toContain("Screenshot saved");
     expect(existsSync(outputPath)).toBe(true);
 
@@ -121,7 +121,7 @@ describe("Screenshot Capture", () => {
     const stdout = await new Response(proc.stdout).text();
     await proc.exited;
 
-    // Check screenshot was saved (ignore exit code - QuickJS GC issue)
+    // Check screenshot was saved
     expect(stdout).toContain("Screenshot saved");
     expect(existsSync(outputPath)).toBe(true);
 
@@ -222,7 +222,7 @@ describe("Screenshot Capture", () => {
 
     console.log("stdout:", stdout);
 
-    // Check screenshot was saved (ignore exit code - QuickJS GC issue)
+    // Check screenshot was saved
     expect(stdout).toContain("Screenshot saved");
     expect(existsSync(outputPath)).toBe(true);
 

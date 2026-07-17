@@ -37,8 +37,8 @@ export default function HomePage() {
             style={{ maxWidth: '500px', width: '100%', marginBottom: '24px', borderRadius: '12px' }}
           />
           <p>
-            Run WebGPU games natively with JavaScript. Write once, run everywhere —
-            macOS, Windows, Linux, iOS, and Android.
+            Run WebGPU games natively with JavaScript and V8 on Apple Silicon macOS,
+            Windows, and Linux.
           </p>
 
           <div className="install-tabs">
@@ -103,9 +103,9 @@ export default function HomePage() {
           </div>
 
           <div className="feature">
-            <h3>Multiple JS Engines</h3>
+            <h3>V8 JavaScript</h3>
             <p>
-              Choose between V8 and QuickJS. Pick the right engine
+              V8 powers modern JavaScript with JIT performance
               for your platform and use case.
             </p>
           </div>
@@ -113,7 +113,7 @@ export default function HomePage() {
           <div className="feature">
             <h3>Cross-Platform</h3>
             <p>
-              Build for macOS (arm64/x64), Windows, Linux, iOS, and Android
+              Build for Apple Silicon macOS, Windows, and Linux
               from a single JavaScript codebase.
             </p>
           </div>
@@ -137,8 +137,8 @@ export default function HomePage() {
           <div className="feature">
             <h3>Embeddable</h3>
             <p>
-              Embed the runtime in your own applications. Use as a library
-              for iOS and Android native apps.
+              Embed the runtime in your own desktop applications and custom
+              launchers.
             </p>
           </div>
         </section>

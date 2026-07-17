@@ -62,8 +62,6 @@ jobs:
       - name: Configure CMake (V8 + Dawn)
         run: |
           cmake -B build -DCMAKE_BUILD_TYPE=Release \
-            -DMYSTRAL_USE_V8=ON \
-            -DMYSTRAL_USE_QUICKJS=OFF \
             -DMYSTRAL_USE_DAWN=ON \
             -DMYSTRAL_USE_WGPU=OFF
 
@@ -235,8 +233,6 @@ jobs:
       - name: Configure CMake (V8 + Dawn)
         run: |
           cmake -B build -DCMAKE_BUILD_TYPE=Release \
-            -DMYSTRAL_USE_V8=ON \
-            -DMYSTRAL_USE_QUICKJS=OFF \
             -DMYSTRAL_USE_DAWN=ON \
             -DMYSTRAL_USE_WGPU=OFF
 
@@ -327,8 +323,6 @@ jobs:
           $CMAKE_ARGS = @(
             "-B", "build",
             "-DCMAKE_BUILD_TYPE=Release",
-            "-DMYSTRAL_USE_V8=ON",
-            "-DMYSTRAL_USE_QUICKJS=OFF",
             "-DMYSTRAL_USE_DAWN=ON",
             "-DMYSTRAL_USE_WGPU=OFF",
             "-DVCPKG_TARGET_TRIPLET=x64-windows-static",

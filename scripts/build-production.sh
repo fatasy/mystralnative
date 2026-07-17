@@ -99,10 +99,10 @@ if [ "$SKIP_BUILD" = false ]; then
     # Detect available features
     CMAKE_EXTRA_ARGS=""
     if [ -d "third_party/v8" ]; then
-        CMAKE_EXTRA_ARGS="$CMAKE_EXTRA_ARGS -DMYSTRAL_USE_V8=ON -DMYSTRAL_USE_QUICKJS=OFF"
         echo "  V8: ON"
     else
-        echo "  V8: OFF (using QuickJS)"
+        echo "  ERROR: V8 dependency not found"
+        exit 1
     fi
     if [ -d "third_party/dawn" ]; then
         CMAKE_EXTRA_ARGS="$CMAKE_EXTRA_ARGS -DMYSTRAL_USE_DAWN=ON -DMYSTRAL_USE_WGPU=OFF"

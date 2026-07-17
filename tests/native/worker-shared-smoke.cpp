@@ -36,10 +36,8 @@ int main() {
 
 #if defined(MYSTRAL_JS_V8)
     constexpr js::EngineType engineType = js::EngineType::V8;
-#elif defined(MYSTRAL_JS_QUICKJS)
-    constexpr js::EngineType engineType = js::EngineType::QuickJS;
 #else
-#error "worker-shared-smoke requires V8 or QuickJS"
+#error "worker-shared-smoke requires V8"
 #endif
 
     auto mainEngine = js::createEngine(engineType);

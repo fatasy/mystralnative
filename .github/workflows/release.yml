@@ -18,33 +18,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # macOS ARM64 - all configurations
+          # macOS ARM64 - V8 configurations
           - os: macos-15
             arch: arm64
-            js_engine: quickjs
-            webgpu: wgpu
-            name: macOS-arm64-quickjs-wgpu
-          - os: macos-15
-            arch: arm64
-            js_engine: v8
             webgpu: wgpu
             name: macOS-arm64-v8-wgpu
           - os: macos-15
             arch: arm64
-            js_engine: quickjs
-            webgpu: dawn
-            name: macOS-arm64-quickjs-dawn
-          - os: macos-15
-            arch: arm64
-            js_engine: v8
             webgpu: dawn
             name: macOS-arm64-v8-dawn
-          # macOS x64 - QuickJS + Dawn (legacy platform)
-          - os: macos-15-intel
-            arch: x64
-            js_engine: quickjs
-            webgpu: dawn
-            name: macOS-x64-quickjs-dawn
 
     name: Build - ${{ matrix.name }}
 
@@ -73,12 +55,6 @@ jobs:
         if: steps.cache-deps.outputs.cache-hit != 'true'
         run: node scripts/download-deps.mjs
 
-      - name: Download V8 (if needed)
-        if: matrix.js_engine == 'v8' && steps.cache-deps.outputs.cache-hit != 'true'
-        run: |
-          brew install p7zip || true
-          node scripts/download-deps.mjs --only v8
-
       - name: Download Dawn (if needed)
         if: matrix.webgpu == 'dawn' && steps.cache-deps.outputs.cache-hit != 'true'
         run: node scripts/download-deps.mjs --only dawn
@@ -93,11 +69,6 @@ jobs:
       - name: Configure CMake
         run: |
           CMAKE_ARGS="-B build -DCMAKE_BUILD_TYPE=Release"
-          if [ "${{ matrix.js_engine }}" == "quickjs" ]; then
-            CMAKE_ARGS="$CMAKE_ARGS -DMYSTRAL_USE_QUICKJS=ON -DMYSTRAL_USE_V8=OFF"
-          elif [ "${{ matrix.js_engine }}" == "v8" ]; then
-            CMAKE_ARGS="$CMAKE_ARGS -DMYSTRAL_USE_QUICKJS=OFF -DMYSTRAL_USE_V8=ON"
-          fi
           if [ "${{ matrix.webgpu }}" == "wgpu" ]; then
             CMAKE_ARGS="$CMAKE_ARGS -DMYSTRAL_USE_WGPU=ON -DMYSTRAL_USE_DAWN=OFF"
           elif [ "${{ matrix.webgpu }}" == "dawn" ]; then
@@ -110,35 +81,6 @@ jobs:
 
       - name: Test CLI
         run: ./build/mystral --version
-
-      - name: Verify macOS x64 deployment target
-        if: matrix.name == 'macOS-x64-quickjs-dawn'
-        run: |
-          echo "Checking deployment target for Intel Mac build..."
-          # Check LC_BUILD_VERSION or LC_VERSION_MIN_MACOSX
-          otool -l ./build/mystral | grep -A4 "LC_BUILD_VERSION\|LC_VERSION_MIN_MACOSX" || true
-
-          # Extract and verify the minimum macOS version
-          MIN_VERSION=$(otool -l ./build/mystral | grep -A3 "LC_BUILD_VERSION" | grep "minos" | awk '{print $2}' || true)
-          if [ -z "$MIN_VERSION" ]; then
-            MIN_VERSION=$(otool -l ./build/mystral | grep -A2 "LC_VERSION_MIN_MACOSX" | grep "version" | awk '{print $2}' || true)
-          fi
-
-          echo "Detected minimum macOS version: $MIN_VERSION"
-
-          # Warn if deployment target is too high (> 13.x means older Intel Macs won't work)
-          if [ -n "$MIN_VERSION" ]; then
-            MAJOR=$(echo "$MIN_VERSION" | cut -d. -f1)
-            if [ "$MAJOR" -ge 14 ]; then
-              echo "::warning::Deployment target $MIN_VERSION may not support older Intel Macs (macOS 12/13)"
-            else
-              echo "✓ Deployment target $MIN_VERSION should support older Intel Macs"
-            fi
-          fi
-
-          # Also run a simple JS test to verify basic functionality
-          echo 'console.log("Intel Mac verification test passed"); process.exit(0);' > /tmp/test.js
-          timeout 30 ./build/mystral run /tmp/test.js --headless || echo "::warning::Headless test failed (may need GPU)"
 
       - name: Package artifacts
         run: |
@@ -172,17 +114,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - js_engine: quickjs
-            webgpu: wgpu
-            name: linux-x64-quickjs-wgpu
-          - js_engine: v8
-            webgpu: wgpu
+          - webgpu: wgpu
             name: linux-x64-v8-wgpu
-          - js_engine: quickjs
-            webgpu: dawn
-            name: linux-x64-quickjs-dawn
-          - js_engine: v8
-            webgpu: dawn
+          - webgpu: dawn
             name: linux-x64-v8-dawn
 
     name: Build - ${{ matrix.name }}
@@ -223,10 +157,6 @@ jobs:
         if: steps.cache-deps.outputs.cache-hit != 'true'
         run: node scripts/download-deps.mjs
 
-      - name: Download V8 (if needed)
-        if: matrix.js_engine == 'v8' && steps.cache-deps.outputs.cache-hit != 'true'
-        run: node scripts/download-deps.mjs --only v8
-
       - name: Download Dawn (if needed)
         if: matrix.webgpu == 'dawn' && steps.cache-deps.outputs.cache-hit != 'true'
         run: node scripts/download-deps.mjs --only dawn
@@ -249,11 +179,6 @@ jobs:
       - name: Configure CMake
         run: |
           CMAKE_ARGS="-B build -DCMAKE_BUILD_TYPE=Release"
-          if [ "${{ matrix.js_engine }}" == "quickjs" ]; then
-            CMAKE_ARGS="$CMAKE_ARGS -DMYSTRAL_USE_QUICKJS=ON -DMYSTRAL_USE_V8=OFF"
-          elif [ "${{ matrix.js_engine }}" == "v8" ]; then
-            CMAKE_ARGS="$CMAKE_ARGS -DMYSTRAL_USE_QUICKJS=OFF -DMYSTRAL_USE_V8=ON"
-          fi
           if [ "${{ matrix.webgpu }}" == "wgpu" ]; then
             CMAKE_ARGS="$CMAKE_ARGS -DMYSTRAL_USE_WGPU=ON -DMYSTRAL_USE_DAWN=OFF"
           elif [ "${{ matrix.webgpu }}" == "dawn" ]; then
@@ -296,17 +221,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - js_engine: quickjs
-            webgpu: wgpu
-            name: windows-x64-quickjs-wgpu
-          - js_engine: v8
-            webgpu: wgpu
+          - webgpu: wgpu
             name: windows-x64-v8-wgpu
-          - js_engine: quickjs
-            webgpu: dawn
-            name: windows-x64-quickjs-dawn
-          - js_engine: v8
-            webgpu: dawn
+          - webgpu: dawn
             name: windows-x64-v8-dawn
 
     name: Build - ${{ matrix.name }}
@@ -340,13 +257,6 @@ jobs:
           export PATH="/c/Program Files/7-Zip:$PATH"
           node scripts/download-deps.mjs
 
-      - name: Download V8 (if needed)
-        if: matrix.js_engine == 'v8' && steps.cache-deps.outputs.cache-hit != 'true'
-        shell: bash
-        run: |
-          export PATH="/c/Program Files/7-Zip:$PATH"
-          node scripts/download-deps.mjs --only v8
-
       - name: Download Dawn (if needed)
         if: matrix.webgpu == 'dawn' && steps.cache-deps.outputs.cache-hit != 'true'
         shell: bash
@@ -366,11 +276,6 @@ jobs:
       - name: Configure CMake
         run: |
           $CMAKE_ARGS = @("-B", "build", "-DCMAKE_BUILD_TYPE=Release")
-          if ("${{ matrix.js_engine }}" -eq "quickjs") {
-            $CMAKE_ARGS += "-DMYSTRAL_USE_QUICKJS=ON", "-DMYSTRAL_USE_V8=OFF"
-          } elseif ("${{ matrix.js_engine }}" -eq "v8") {
-            $CMAKE_ARGS += "-DMYSTRAL_USE_QUICKJS=OFF", "-DMYSTRAL_USE_V8=ON"
-          }
           if ("${{ matrix.webgpu }}" -eq "wgpu") {
             $CMAKE_ARGS += "-DMYSTRAL_USE_WGPU=ON", "-DMYSTRAL_USE_DAWN=OFF"
           } elseif ("${{ matrix.webgpu }}" -eq "dawn") {
@@ -483,36 +388,25 @@ jobs:
             **macOS (Apple Silicon - ARM64):**
             | JS Engine | WebGPU Backend | Download |
             |-----------|----------------|----------|
-            | QuickJS | wgpu | `mystral-macOS-arm64-quickjs-wgpu.zip` |
             | V8 | wgpu | `mystral-macOS-arm64-v8-wgpu.zip` |
-            | QuickJS | Dawn | `mystral-macOS-arm64-quickjs-dawn.zip` |
             | V8 | Dawn | `mystral-macOS-arm64-v8-dawn.zip` |
-
-            **macOS (Intel - x64):**
-            | JS Engine | WebGPU Backend | Download |
-            |-----------|----------------|----------|
-            | QuickJS | Dawn | `mystral-macOS-x64-quickjs-dawn.zip` |
 
             **Linux (x64):**
             | JS Engine | WebGPU Backend | Download |
             |-----------|----------------|----------|
-            | QuickJS | wgpu | `mystral-linux-x64-quickjs-wgpu.zip` |
             | V8 | wgpu | `mystral-linux-x64-v8-wgpu.zip` |
-            | QuickJS | Dawn | `mystral-linux-x64-quickjs-dawn.zip` |
             | V8 | Dawn | `mystral-linux-x64-v8-dawn.zip` |
 
             **Windows (x64):**
             | JS Engine | WebGPU Backend | Download |
             |-----------|----------------|----------|
-            | QuickJS | wgpu | `mystral-windows-x64-quickjs-wgpu.zip` |
             | V8 | wgpu | `mystral-windows-x64-v8-wgpu.zip` |
-            | QuickJS | Dawn | `mystral-windows-x64-quickjs-dawn.zip` |
             | V8 | Dawn | `mystral-windows-x64-v8-dawn.zip` |
 
             ### Recommended Configurations
 
             - **macOS**: `v8-wgpu` (best JavaScript performance)
-            - **Linux**: `quickjs-wgpu` (smallest binary, good performance)
+            - **Linux**: `v8-wgpu` (best JavaScript performance)
             - **Windows**: `v8-wgpu` (best JS performance)
 
             ### Quick Start

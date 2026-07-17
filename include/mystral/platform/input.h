@@ -30,6 +30,24 @@ struct KeyboardEventData {
 };
 
 /**
+ * Committed UTF-8 text from the platform text input service.
+ */
+struct TextInputEventData {
+    std::string text;
+    bool fromComposition;
+};
+
+/**
+ * IME composition event data.
+ */
+struct CompositionEventData {
+    std::string type;       // "compositionstart", "compositionupdate", "compositionend"
+    std::string data;
+    int start;
+    int length;
+};
+
+/**
  * Mouse event data (matches DOM MouseEvent)
  */
 struct MouseEventData {
@@ -121,6 +139,8 @@ struct ResizeEventData {
  * Input event callback types
  */
 using KeyboardCallback = std::function<void(const KeyboardEventData&)>;
+using TextInputCallback = std::function<void(const TextInputEventData&)>;
+using CompositionCallback = std::function<void(const CompositionEventData&)>;
 using MouseCallback = std::function<void(const MouseEventData&)>;
 using PointerCallback = std::function<void(const PointerEventData&)>;
 using WheelCallback = std::function<void(const WheelEventData&)>;
@@ -131,11 +151,26 @@ using ResizeCallback = std::function<void(const ResizeEventData&)>;
  * Set event callbacks
  */
 void setKeyboardCallback(KeyboardCallback callback);
+void setTextInputCallback(TextInputCallback callback);
+void setCompositionCallback(CompositionCallback callback);
 void setMouseCallback(MouseCallback callback);
 void setPointerCallback(PointerCallback callback);
 void setWheelCallback(WheelCallback callback);
 void setGamepadCallback(GamepadCallback callback);
 void setResizeCallback(ResizeCallback callback);
+
+/**
+ * Control the platform text input service and IME candidate window.
+ */
+bool startTextInput();
+void stopTextInput();
+bool setTextInputArea(int x, int y, int width, int height, int cursor);
+
+/**
+ * UTF-8 system clipboard access.
+ */
+std::string getClipboardText();
+bool setClipboardText(const std::string& text);
 
 /**
  * Get current gamepad state

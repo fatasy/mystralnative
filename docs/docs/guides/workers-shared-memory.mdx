@@ -39,9 +39,8 @@ This is intentionally not a shared JavaScript heap. The runtime shares storage; 
 | Main-thread Worker facade and event-loop draining | `src/runtime.cpp` |
 | JavaScript engine shared/transfer backing-store contract | `include/mystral/js/engine.h` |
 | V8 external shared and transferable backing stores | `src/js/v8_engine.cpp` |
-| QuickJS shared/transfer backing stores and Atomics fallback | `src/js/quickjs_engine.cpp` |
 | Virtual `mystral/shared` and `mystral/worker-pool` modules | `src/js/module_resolver.cpp` |
-| Fixed benchmark | `benchmarks/worker-shared.mjs`, `benchmarks/worker-shared-worker.mjs`, `benchmarks/worker-shared-schema.mjs` |
+| Fixed benchmarks | `benchmarks/worker-shared.mjs`, `benchmarks/worker-shared-worker.mjs`, `benchmarks/worker-shared-schema.mjs`, `benchmarks/worker-transfer.mjs` |
 | Native cross-isolate smoke test | `tests/native/worker-shared-smoke.cpp`, `tests/native/fixtures/worker-shared-module.mjs`, `tests/native/fixtures/worker-pool-module.mjs` |
 
 When changing behavior, update the native contract and the JavaScript facade together. Do not patch only the browser-like wrapper in `runtime.cpp`.
@@ -57,7 +56,7 @@ The current lifecycle is:
 5. Incoming messages and monotonic timer deadlines wait on a `condition_variable`. There is no polling loop.
 6. The Worker parses a message, reconstructs transferred buffers, calls its `message` listeners and `onmessage`, then queues outbound messages produced by `postMessage`.
 7. The main runtime calls `processWorkerMessages()` during its event loop. It drains native outbound queues and invokes `__mystralDispatchWorkerMessage` in the main isolate.
-8. `terminate()`, runtime shutdown, and hot reload request stop, interrupt currently executing JavaScript on V8/QuickJS, and join Worker threads before destroying the main JavaScript engine.
+8. `terminate()`, runtime shutdown, and hot reload request stop, interrupt currently executing JavaScript on V8, and join Worker threads before destroying the main JavaScript engine.
 
 Internally the lifecycle is explicit: `Created`, `Starting`, `Running`, `Stopping`, `Stopped`, or `Failed`. A Worker also emits an internal exit message so the main-side facade removes Workers that call `close()` or fail during startup.
 
@@ -96,7 +95,7 @@ worker.postMessage({ bytes }, [bytes]);
 // bytes.byteLength === 0
 ```
 
-The serialized payload contains an indexed transfer marker and the native queue owns the backing bytes until the receiver constructs its local `ArrayBuffer`. Queue byte accounting includes both JSON and transferred bytes. V8 detaches and moves its backing store without copying. QuickJS performs one extraction copy because its engine API cannot safely move an arbitrary heap-owned buffer, then attaches the retained native bytes at the receiver without another copy. Duplicate entries, non-`ArrayBuffer` entries, and buffers already transferred through the public API fail explicitly.
+The serialized payload contains an indexed transfer marker and the native queue owns the backing bytes until the receiver constructs its local `ArrayBuffer`. Queue byte accounting includes both JSON and transferred bytes. V8 detaches and moves its backing store without copying. Duplicate entries, non-`ArrayBuffer` entries, and buffers already transferred through the public API fail explicitly.
 
 Shared-memory handles are JSON objects whose underlying buffer marker is:
 
@@ -117,9 +116,6 @@ Engine status:
 | Engine | Worker isolation | Forced termination | Shared memory |
 | --- | --- | --- | --- |
 | V8 | Supported | `TerminateExecution()` | Supported with an external `v8::SharedArrayBuffer` backing store |
-| QuickJS | Supported | Runtime interrupt handler | Supported with a shared external `ArrayBuffer` and native sequentially consistent Atomics fallback |
-
-QuickJS's fallback Atomics currently supports `Int32Array` operations: `load`, `store`, `add`, `sub`, `exchange`, `compareExchange`, `and`, `or`, `xor`, `isLockFree(4)`, and a no-op `notify`. It does not implement `Atomics.wait`.
 
 ## Public shared API
 
@@ -278,17 +274,23 @@ These rules are part of the implementation contract:
 
 Shared memory removes serialization and copying cost for bulk state, but introduces data races, false sharing, cache-coherency traffic, fixed-capacity planning, and more difficult debugging. Parallel execution is only faster when each task contains enough work to amortize scheduling and synchronization.
 
-## Profiling and fixed benchmark
+## Profiling and fixed benchmarks
 
 The runtime profiler records Worker count, processed messages, processed timer callbacks, rejected messages, cumulative Worker busy time, input/output queue bytes at sample end, lifetime queue high-water bytes, and shared-memory bytes at start/end. Use those measurements together with frame/tick time; Worker utilization by itself does not prove a faster game loop. Any rejected message means a producer reached backpressure and must reduce traffic, batch work, or use a shared queue.
 
-The fixed benchmark uses 200,000 rows, four Workers, ten warmup samples, and fifty measured samples. It initializes baseline and parallel tables identically, assigns exclusive row partitions, and validates checksum equality before reporting median, p95, and p99.
+The fixed shared-memory benchmark uses 200,000 rows, four Workers, ten warmup samples, and fifty measured samples. It initializes baseline and parallel tables identically, assigns exclusive row partitions, and validates checksum equality before reporting median, p95, and p99.
 
 ```bash
 mystral run benchmarks/worker-shared.mjs
 ```
 
-Do not change its fixed inputs when comparing runtime changes. Create an additional benchmark if a different workload is needed.
+The transferable-buffer benchmark moves the same buffer from the main isolate to a Worker and back. It covers 64 KiB, 1 MiB, and 8 MiB payloads, checks sender detachment and sentinel bytes on every round, and reports round-trip median/p95/p99, effective bidirectional throughput, and heap snapshots as JSON:
+
+```bash
+mystral run benchmarks/worker-transfer.mjs --no-sdl
+```
+
+The machine-readable report is the line prefixed with `[WorkerTransferBenchmark]`. Redirect or filter that line to retain the JSON result in automation. Heap snapshots are observational and do not force garbage collection. Do not change the fixed inputs of either benchmark when comparing runtime changes. Create an additional benchmark if a different workload is needed.
 
 ## Validation commands
 
@@ -296,16 +298,14 @@ Recommended V8 + Dawn build:
 
 ```bash
 cmake -B build \
-  -DMYSTRAL_USE_V8=ON \
   -DMYSTRAL_USE_DAWN=ON \
-  -DMYSTRAL_USE_QUICKJS=OFF \
   -DMYSTRAL_USE_WGPU=OFF \
   -DMYSTRAL_BUILD_NATIVE_TESTS=ON
 cmake --build build --parallel
 ctest --test-dir build -R mystral-worker-shared-smoke --output-on-failure
 ```
 
-Then run the fixed benchmark with the built `mystral` executable. The native smoke test verifies both virtual modules, schema mismatch rejection, explicit table grow/shrink migration, shared-queue full/wrap behavior, cross-isolate attachment and mutation, transferable-buffer detach/round-trip behavior, real timers and cancellation, deterministic WorkerPool partitions/barriers, input/output backpressure, oversized-message rejection, forced interruption of an infinite loop, `close()`, startup failure, rapid registry shutdown, and clean teardown on V8 and QuickJS.
+Then run both fixed benchmarks with the built `mystral` executable. The native smoke test verifies both virtual modules, schema mismatch rejection, explicit table grow/shrink migration, shared-queue full/wrap behavior, cross-isolate attachment and mutation, transferable-buffer detach/round-trip behavior, real timers and cancellation, deterministic WorkerPool partitions/barriers, input/output backpressure, oversized-message rejection, forced interruption of an infinite loop, `close()`, startup failure, rapid registry shutdown, and clean teardown on V8.
 
 ## Safe extension guide
 
@@ -322,15 +322,15 @@ When extending this subsystem:
 Before considering a Worker/shared-memory change complete, verify:
 
 - Main and Worker isolates still own independent JS heaps.
-- Worker shutdown interrupts executing JavaScript on V8/QuickJS and joins all native threads.
+- Worker shutdown interrupts executing JavaScript on V8 and joins all native threads.
 - Input/output queues remain bounded and rejection metrics are observable.
 - Shared backing storage cannot be freed while an engine wrapper uses it.
 - Schema/layout mismatch fails explicitly.
 - Every shared mutable region has a documented writer.
 - Queue producer/consumer cardinality matches its contract.
 - Correctness is checked with deterministic output/checksum, not timing alone.
-- V8 and QuickJS paths are tested when changed.
+- The V8 path is tested when changed.
 - Timer callbacks sleep until their deadline and remain interruptible during shutdown.
 - WorkerPool partitions and barrier result order remain deterministic.
-- Profiler metrics and the fixed benchmark still work.
+- Profiler metrics and both fixed benchmarks still work.
 - Public docs and this handoff are updated when the contract changes.

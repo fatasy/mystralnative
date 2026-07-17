@@ -46,7 +46,6 @@ private:
     std::string makeEsmWrapper(const std::string& resolvedPath) const;
     std::string makeAbsoluteSpecifier(const ResolvedModule& resolved) const;
     std::string escapeJsString(const std::string& input) const;
-    std::string transpileEsmToCjs(const std::string& source) const;
     bool maybeTranspileTypeScript(const ResolvedModule& resolved,
                                   std::string& source,
                                   std::string& error);

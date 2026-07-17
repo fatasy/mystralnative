@@ -1,33 +1,22 @@
 cmake_minimum_required(VERSION 3.20)
 project(MystralNativeRuntime VERSION 0.1.5 LANGUAGES C CXX)
 
-# Windows prebuilts must use a compatible MSVC runtime. The current V8 monolith
-# and Skia-bundled Dawn use /MT, while the official Dawn fallback uses /MD. Use
-# V8 with wgpu-native or Skia-bundled Dawn for the static-CRT matrix; use the
-# official Dawn fallback only with a dynamic-CRT matrix such as QuickJS + Dawn.
+# Windows prebuilts must use a compatible MSVC runtime. The V8 monolith and
+# Skia-bundled Dawn use /MT, while the official Dawn fallback uses /MD.
 
 # ============================================================================
 # Options
 # ============================================================================
 
-# JS Engine (choose one)
-option(MYSTRAL_USE_V8 "Use V8 JavaScript engine" OFF)
-option(MYSTRAL_USE_QUICKJS "Use QuickJS engine" ON)  # Default - simplest to start
 option(MYSTRAL_USE_SWC "Enable SWC TypeScript transpiler" ON)
 
-# V8 requires C++20, so use that if V8 is enabled, otherwise C++17
-# Must be after option() definitions so MYSTRAL_USE_V8 is properly set
-if(MYSTRAL_USE_V8)
-    set(CMAKE_CXX_STANDARD 20)
-    message(STATUS "V8 enabled - using C++20")
-    # MSVC needs explicit flag for C++20 in CMAKE_CXX_FLAGS
-    # (add_compile_options can be overridden by vcpkg toolchain)
-    if(MSVC)
-        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /std:c++20")
-    endif()
-else()
-    set(CMAKE_CXX_STANDARD 17)
-    message(STATUS "V8 disabled - using C++17")
+# V8 requires C++20.
+set(CMAKE_CXX_STANDARD 20)
+message(STATUS "V8 enabled - using C++20")
+# MSVC needs explicit flag for C++20 in CMAKE_CXX_FLAGS
+# (add_compile_options can be overridden by vcpkg toolchain)
+if(MSVC)
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /std:c++20")
 endif()
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
@@ -45,30 +34,20 @@ option(MYSTRAL_USE_RAYTRACING "Enable hardware ray tracing support" OFF)
 
 if(APPLE)
     if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
-        set(MYSTRAL_PLATFORM "ios")
-        set(MYSTRAL_USE_V8 OFF)
-        set(MYSTRAL_USE_QUICKJS ON)
-        set(MYSTRAL_USE_DAWN OFF)
-        set(MYSTRAL_USE_WGPU ON)     # Dawn doesn't support iOS
+        message(FATAL_ERROR "iOS is not supported by the V8-only runtime")
     else()
         set(MYSTRAL_PLATFORM "macos")
     endif()
 elseif(WIN32)
     set(MYSTRAL_PLATFORM "windows")
 elseif(ANDROID)
-    set(MYSTRAL_PLATFORM "android")
-    # Android uses QuickJS by default (simplest to integrate, no special runtime deps)
-    set(MYSTRAL_USE_V8 OFF)
-    set(MYSTRAL_USE_QUICKJS ON)
-    # wgpu-native has Android support
-    set(MYSTRAL_USE_DAWN OFF)
-    set(MYSTRAL_USE_WGPU ON)
+    message(FATAL_ERROR "Android is not supported by the V8-only runtime")
 elseif(UNIX)
     set(MYSTRAL_PLATFORM "linux")
 endif()
 
 message(STATUS "Mystral Platform: ${MYSTRAL_PLATFORM}")
-message(STATUS "JS Engine: V8=${MYSTRAL_USE_V8} QuickJS=${MYSTRAL_USE_QUICKJS}")
+message(STATUS "JS Engine: V8")
 message(STATUS "WebGPU: Dawn=${MYSTRAL_USE_DAWN} wgpu=${MYSTRAL_USE_WGPU}")
 
 # ============================================================================
@@ -394,61 +373,10 @@ if(MYSTRAL_USE_DAWN)
     endif()
 endif()
 
-# QuickJS-NG (actively maintained fork with MSVC/Windows support)
-if(MYSTRAL_USE_QUICKJS)
-    set(QUICKJS_DIR ${THIRD_PARTY_DIR}/quickjs)
-    if(EXISTS ${QUICKJS_DIR})
-        # Try to find in subdirectory first (GitHub archives extract with version dir)
-        file(GLOB QUICKJS_SUBDIRS ${QUICKJS_DIR}/quickjs-*)
-        if(QUICKJS_SUBDIRS)
-            list(GET QUICKJS_SUBDIRS 0 QUICKJS_ACTUAL_DIR)
-        else()
-            set(QUICKJS_ACTUAL_DIR ${QUICKJS_DIR})
-        endif()
-
-        # QuickJS is just source files - compile them
-        # Note: quickjs-ng integrates libbf into quickjs.c, and adds dtoa.c for number conversion
-        file(GLOB QUICKJS_SOURCES
-            ${QUICKJS_ACTUAL_DIR}/quickjs.c
-            ${QUICKJS_ACTUAL_DIR}/cutils.c
-            ${QUICKJS_ACTUAL_DIR}/dtoa.c
-            ${QUICKJS_ACTUAL_DIR}/libregexp.c
-            ${QUICKJS_ACTUAL_DIR}/libunicode.c
-        )
-        if(QUICKJS_SOURCES)
-            add_library(quickjs STATIC ${QUICKJS_SOURCES})
-            # Use SYSTEM to prevent QuickJS's "version" file from shadowing C++ <version>
-            target_include_directories(quickjs SYSTEM PUBLIC ${QUICKJS_ACTUAL_DIR})
-            target_compile_definitions(quickjs PRIVATE
-                CONFIG_VERSION="0.11.0"
-                CONFIG_BIGNUM
-            )
-            # Suppress warnings in third-party code
-            if(MSVC)
-                target_compile_options(quickjs PRIVATE /W0)
-                # Enable C11 for MSVC - required for C11 atomics used by QuickJS
-                target_compile_options(quickjs PRIVATE /std:c11)
-                # WIN32_LEAN_AND_MEAN prevents winsock.h from being included
-                # via windows.h, avoiding conflicts with winsock2.h
-                target_compile_definitions(quickjs PRIVATE WIN32_LEAN_AND_MEAN)
-            else()
-                target_compile_options(quickjs PRIVATE -w)
-            endif()
-            add_compile_definitions(MYSTRAL_JS_QUICKJS)
-            message(STATUS "Found QuickJS-NG in ${QUICKJS_ACTUAL_DIR}")
-        else()
-            message(WARNING "QuickJS-NG sources not found in ${QUICKJS_ACTUAL_DIR}")
-        endif()
-    else()
-        message(WARNING "QuickJS-NG not found. Run 'npm run deps:download' first.")
-    endif()
-endif()
-
 # V8
 # Prebuilts from kuoruan/libv8: https://github.com/kuoruan/libv8/releases
 # See docs/V8_PREBUILTS.md for fork/update information
-if(MYSTRAL_USE_V8)
-    set(V8_DIR ${THIRD_PARTY_DIR}/v8)
+set(V8_DIR ${THIRD_PARTY_DIR}/v8)
     if(EXISTS ${V8_DIR})
         # kuoruan/libv8 structure: v8/include/, v8/lib/
         # Library is libv8_monolith.a (macOS/Linux) or v8_monolith.lib (Windows)
@@ -502,14 +430,12 @@ if(MYSTRAL_USE_V8)
                 set(V8_SYSTEM_LIBS winmm dbghelp shlwapi)
             endif()
         else()
-            message(WARNING "V8 not found:")
-            message(WARNING "  Library: ${V8_LIBRARY}")
-            message(WARNING "  Include: ${V8_INCLUDE_DIR}")
-            message(WARNING "Run 'node scripts/download-deps.mjs --only v8' first.")
+            message(FATAL_ERROR
+                "V8 library or headers not found. "
+                "Run 'node scripts/download-deps.mjs --only v8' first.")
         endif()
     else()
-        message(WARNING "V8 not found. Run 'node scripts/download-deps.mjs --only v8' first.")
-    endif()
+        message(FATAL_ERROR "V8 not found. Run 'node scripts/download-deps.mjs --only v8' first.")
 endif()
 
 # libwebp (for WebP image decoding and animated WebP video recording)
@@ -989,6 +915,7 @@ set(MYSTRAL_SOURCES
     src/vfs/embedded_bundle.cpp
     src/storage/local_storage.cpp
     src/async/event_loop.cpp
+    src/async/job_system.cpp
     src/debug/debug_server.cpp
     src/video/async_capture.cpp
     src/video/video_recorder.cpp
@@ -1042,12 +969,7 @@ target_include_directories(mystral-runtime PRIVATE
 )
 
 # Pass build configuration to source code
-# Determine JS engine name
-if(MYSTRAL_USE_V8)
-    set(MYSTRAL_JS_ENGINE_NAME "v8")
-else()
-    set(MYSTRAL_JS_ENGINE_NAME "quickjs")
-endif()
+set(MYSTRAL_JS_ENGINE_NAME "v8")
 
 # Determine WebGPU backend name
 if(MYSTRAL_USE_DAWN)
@@ -1109,12 +1031,7 @@ elseif(UNIX)
 endif()
 
 # JS engine linkage
-if(MYSTRAL_USE_QUICKJS AND TARGET quickjs)
-    target_sources(mystral-runtime PRIVATE src/js/quickjs_engine.cpp)
-    target_link_libraries(mystral-runtime PRIVATE quickjs)
-endif()
-
-if(MYSTRAL_USE_V8 AND TARGET v8::v8)
+if(TARGET v8::v8)
     target_sources(mystral-runtime PRIVATE src/js/v8_engine.cpp)
     # V8 requires C++20 - force it at target level for MSVC
     # MSVC needs /Zc:__cplusplus to report the correct __cplusplus value
@@ -1173,7 +1090,7 @@ endif()
 if(MYSTRAL_USE_DAWN AND TARGET dawn::webgpu)
     # Dawn and V8 both include Abseil library, causing duplicate symbol errors.
     # On macOS, we need to handle the link order and flags carefully.
-    if(APPLE AND MYSTRAL_USE_V8)
+    if(APPLE)
         # Use -force_load for V8 to ensure its Abseil symbols are loaded first,
         # then link Dawn normally. The linker will use the first definition.
         # We also suppress the deprecated -ld_classic warning and use -dead_strip
@@ -1202,15 +1119,11 @@ if(MYSTRAL_USE_DAWN AND TARGET dawn::webgpu)
         target_link_libraries(mystral-runtime PUBLIC OneCoreUap.lib)
         # Dawn and V8 both include Abseil library, causing duplicate symbol errors.
         # Use /FORCE:MULTIPLE to ignore duplicate definitions on MSVC.
-        if(MYSTRAL_USE_V8)
-            target_link_options(mystral-runtime PUBLIC "/FORCE:MULTIPLE")
-        endif()
+        target_link_options(mystral-runtime PUBLIC "/FORCE:MULTIPLE")
     elseif(UNIX)
         # Dawn and V8 both include Abseil library, causing multiple definition errors.
         # Allow multiple definitions to resolve this conflict.
-        if(MYSTRAL_USE_V8)
-            target_link_options(mystral-runtime PUBLIC "-Wl,--allow-multiple-definition")
-        endif()
+        target_link_options(mystral-runtime PUBLIC "-Wl,--allow-multiple-definition")
     endif()
     # Note: Linux Dawn builds require Ubuntu 24.04+ (GCC 13+) for proper libstdc++ ABI
 endif()
@@ -1493,8 +1406,13 @@ install(DIRECTORY include/mystral
 )
 
 option(MYSTRAL_BUILD_NATIVE_TESTS "Build native runtime smoke tests" OFF)
-if(MYSTRAL_BUILD_NATIVE_TESTS AND (MYSTRAL_USE_V8 OR MYSTRAL_USE_QUICKJS))
+if(MYSTRAL_BUILD_NATIVE_TESTS)
     enable_testing()
+    add_executable(mystral-job-system-smoke tests/native/job-system-smoke.cpp)
+    target_link_libraries(mystral-job-system-smoke PRIVATE mystral-runtime)
+    add_test(NAME mystral-job-system-smoke COMMAND mystral-job-system-smoke)
+    set_tests_properties(mystral-job-system-smoke PROPERTIES TIMEOUT 30)
+
     add_executable(mystral-worker-shared-smoke tests/native/worker-shared-smoke.cpp)
     target_link_libraries(mystral-worker-shared-smoke PRIVATE mystral-runtime)
     add_test(NAME mystral-worker-shared-smoke COMMAND mystral-worker-shared-smoke)

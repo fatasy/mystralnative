@@ -6,7 +6,6 @@ Use Mystral Native.js as a C++ library in your own applications.
 
 Mystral Native.js can be embedded in native applications to run JavaScript games within your own windowing and rendering context. This is useful for:
 
-- iOS and Android apps with native UI
 - Desktop applications with embedded game views
 - Custom launchers and game platforms
 
@@ -75,71 +74,6 @@ public:
 };
 ```
 
-## iOS Integration
-
-For iOS apps, use Mystral Native.js with a Metal-backed view:
-
-```swift
-import MystralNative
-
-class GameViewController: UIViewController {
-    var runtime: MystralRuntime?
-
-    override func viewDidLoad() {
-        super.viewDidLoad()
-
-        let config = MystralConfig()
-        config.width = Int(view.bounds.width)
-        config.height = Int(view.bounds.height)
-
-        runtime = MystralRuntime(config: config, metalView: metalView)
-        runtime?.loadScript("game.js")
-    }
-
-    override func viewDidAppear(_ animated: Bool) {
-        super.viewDidAppear(animated)
-        runtime?.run()
-    }
-}
-```
-
-## Android Integration
-
-For Android apps, use Mystral Native.js with a SurfaceView:
-
-```kotlin
-class GameActivity : Activity() {
-    private lateinit var runtime: MystralRuntime
-
-    override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate(savedInstanceState)
-
-        val surfaceView = SurfaceView(this)
-        setContentView(surfaceView)
-
-        surfaceView.holder.addCallback(object : SurfaceHolder.Callback {
-            override fun surfaceCreated(holder: SurfaceHolder) {
-                val config = MystralConfig().apply {
-                    width = surfaceView.width
-                    height = surfaceView.height
-                }
-                runtime = MystralRuntime(config, holder.surface)
-                runtime.loadScript("game.js")
-                runtime.run()
-            }
-
-            override fun surfaceDestroyed(holder: SurfaceHolder) {
-                runtime.stop()
-            }
-
-            override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
-                runtime.resize(width, height)
-            }
-        })
-    }
-}
-```
-
 ## CMake Integration
 
 Add Mystral Native.js to your CMake project:
@@ -172,10 +106,6 @@ runtime->onMouseMove(x, y);
 runtime->onMouseDown(button, x, y);
 runtime->onMouseUp(button, x, y);
 
-// Touch (mobile)
-runtime->onTouchStart(id, x, y);
-runtime->onTouchMove(id, x, y);
-runtime->onTouchEnd(id);
 ```
 
 ## Limitations

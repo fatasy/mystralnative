@@ -1,8 +1,7 @@
 /**
  * JavaScript Engine Abstraction
  *
- * This header defines a common interface for JavaScript engines.
- * Implementations exist for QuickJS and V8.
+ * This header defines the interface used by the V8 JavaScript engine.
  */
 
 #pragma once
@@ -58,7 +57,6 @@ struct TransferredArrayBuffer {
  * Engine type enumeration
  */
 enum class EngineType {
-    QuickJS,
     V8,
     Unknown
 };
@@ -374,23 +372,18 @@ public:
     // ========================================================================
 
     /**
-     * Get the raw engine-specific context
-     * - QuickJS: JSContext*
-     * - V8: v8::Isolate*
+     * Get the raw V8 context (`v8::Isolate*`).
      */
     virtual void* getRawContext() = 0;
 };
 
 /**
- * Create the default engine for the platform
- * - With MYSTRAL_USE_V8: V8
- * - Fallback: QuickJS
+ * Create the V8 engine.
  */
 std::unique_ptr<Engine> createEngine();
 
 /**
- * Create a specific engine type
- * Returns nullptr if that engine is not compiled in
+ * Create the requested engine type. Returns nullptr for unsupported types.
  */
 std::unique_ptr<Engine> createEngine(EngineType type);
 

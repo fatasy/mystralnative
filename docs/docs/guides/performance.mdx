@@ -124,6 +124,36 @@ lod.addLevel(lowDetailMesh, 200);   // Far
 
 ## Profiling
 
+### Reproducible Runtime Benchmark
+
+The CLI profiler measures a fixed number of frames after an explicit warmup and can export the result as JSON:
+
+```bash
+mystral run benchmarks/runtime-core.js --no-sdl \
+  --benchmark 240 --warmup 120 \
+  --benchmark-output runtime-core.json
+```
+
+The report includes frame-phase percentiles, frame-budget misses, V8 heap snapshots, Worker activity, and native job-system metrics. Keep the script, warmup, measured frame count, build type, and machine unchanged when comparing commits.
+
+### Native Job-System Streaming Benchmark
+
+Local asset reads made through `fetch()` run on the native priority job system and complete on the main thread. Use the included workload to measure that path:
+
+```bash
+mystral run benchmarks/job-system-streaming.mjs --no-sdl \
+  --benchmark 240 --warmup 120 \
+  --benchmark-output job-system-streaming.json
+```
+
+The exported `jobs` object contains:
+
+- `submitted`, `completed`, `cancelled`, `failed`, and `rejected` counters for the measured interval
+- `queueEnd`/`queuePeak` and `inFlightEnd`/`inFlightPeak` for detecting saturation
+- `queueWait` and `execution` latency distributions with mean, p50, p95, p99, and maximum values
+
+A rising `queueWait.p95Ms` with stable execution time indicates contention. A non-zero `rejected` count means the in-flight backpressure limit was reached. For gameplay, keep frame-critical work short and split large streaming/decode operations into cancellable jobs.
+
 ### Frame Time
 
 Log frame timing to identify bottlenecks:

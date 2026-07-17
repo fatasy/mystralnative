@@ -15,6 +15,9 @@ namespace platform {
 
 // Forward declarations for input processing (implemented in input.cpp)
 void processKeyboardEvent(const SDL_KeyboardEvent& event, bool isDown);
+void processTextInput(const SDL_TextInputEvent& event);
+void processTextEditing(const SDL_TextEditingEvent& event);
+void flushTextInputEvents();
 void processMouseMotion(const SDL_MouseMotionEvent& event);
 void processMouseButton(const SDL_MouseButtonEvent& event, bool isDown);
 void processMouseWheel(const SDL_MouseWheelEvent& event);
@@ -158,6 +161,14 @@ bool pollEvents() {
                 processKeyboardEvent(event.key, false);
                 break;
 
+            case SDL_EVENT_TEXT_INPUT:
+                processTextInput(event.text);
+                break;
+
+            case SDL_EVENT_TEXT_EDITING:
+                processTextEditing(event.edit);
+                break;
+
             case SDL_EVENT_MOUSE_MOTION:
                 processMouseMotion(event.motion);
                 break;
@@ -183,6 +194,8 @@ bool pollEvents() {
                 break;
         }
     }
+
+    flushTextInputEvents();
 
     return !g_window.shouldQuit;
 }

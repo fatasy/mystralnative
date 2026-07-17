@@ -80,9 +80,7 @@ The project uses CMake with several options:
 ```bash
 # Recommended: V8 + Dawn for full shader compatibility
 cmake -B build \
-  -DMYSTRAL_USE_V8=ON \
   -DMYSTRAL_USE_DAWN=ON \
-  -DMYSTRAL_USE_QUICKJS=OFF \
   -DMYSTRAL_USE_WGPU=OFF
 
 cmake --build build --parallel
@@ -160,7 +158,7 @@ Use the local production build script to build, strip, filter assets, and packag
 ```
 
 The script automatically:
-- Detects V8/Dawn/Draco from `third_party/` and sets CMake flags
+- Verifies V8 and detects Dawn/Draco from `third_party/`
 - Strips the binary (saves debug copy as `build/mystral-debug`)
 - Filters assets: includes only files needed for the target demo
 - Excludes WASM Draco decoder files when native C++ Draco is compiled in
@@ -183,7 +181,7 @@ git tag v0.1.0
 git push origin v0.1.0
 ```
 
-This triggers `release.yml` which builds the supported platform/engine/backend combinations (macOS, Linux, Windows x V8, QuickJS x Dawn, wgpu) and creates a GitHub Release with download artifacts.
+This triggers `release.yml`, which builds the supported V8/WebGPU combinations for macOS, Linux, and Windows and creates a GitHub Release with download artifacts.
 
 Tags containing `alpha`, `beta`, or `rc` are marked as prerelease.
 

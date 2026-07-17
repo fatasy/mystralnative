@@ -1,5 +1,5 @@
 /**
- * Simple GLB Parser for QuickJS
+ * Simple GLB Parser for the native runtime
  *
  * Parses GLB (binary GLTF) files and returns mesh data, materials, and images.
  * Works with basic GLB files - no Draco compression, no extensions.

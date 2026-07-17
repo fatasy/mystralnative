@@ -12,7 +12,7 @@
  *   node scripts/download-deps.mjs --only skia-ios  # Download only iOS Skia
  *   node scripts/download-deps.mjs --force      # Re-download even if exists
  *
- * Desktop deps: wgpu, sdl3, dawn, v8, quickjs, stb, cgltf, webp, skia, swc
+ * Desktop deps: wgpu, sdl3, dawn, v8, stb, cgltf, webp, skia, swc
  * iOS deps: wgpu-ios, skia-ios (for cross-compilation from macOS)
  * Android deps: wgpu-android, sdl3-android
  */
@@ -142,15 +142,6 @@ const DEPS = {
     extractTo: 'v8',
     // Library names differ by platform
     libName: platformName === 'windows' ? 'v8_monolith.lib' : 'libv8_monolith.a',
-  },
-  quickjs: {
-    // quickjs-ng - actively maintained fork with MSVC/Windows support
-    version: '0.11.0',
-    getUrl: () => {
-      // QuickJS-NG source from GitHub
-      return `https://github.com/quickjs-ng/quickjs/archive/refs/tags/v${DEPS.quickjs.version}.zip`;
-    },
-    extractTo: 'quickjs',
   },
   quiche: {
     // Cloudflare quiche - QUIC + HTTP/3 (native backend for the WebTransport API).
@@ -695,23 +686,6 @@ async function downloadDep(name) {
       }
     }
 
-    // Post-install fixes
-    if (name === 'quickjs') {
-      // QuickJS has a 'version' file that conflicts with C++ <version> header
-      // Rename it to avoid the conflict
-      const versionFile = join(destDir, 'quickjs-2024-01-13', 'version');
-      const versionFileNew = join(destDir, 'quickjs-2024-01-13', 'VERSION.txt');
-      try {
-        const { renameSync, existsSync: exists } = await import('fs');
-        if (exists(versionFile)) {
-          renameSync(versionFile, versionFileNew);
-          console.log('Renamed version -> VERSION.txt (C++ header conflict fix)');
-        }
-      } catch (e) {
-        console.warn('Could not rename version file:', e.message);
-      }
-    }
-
     if (name === 'swc') {
       normalizeSwcLayout(destDir);
     }
@@ -748,7 +722,7 @@ async function main() {
   const onlyIndex = args.indexOf('--only');
 
   // Desktop deps (downloaded by default)
-  const desktopDeps = ['wgpu', 'sdl3', 'dawn', 'v8', 'quickjs', 'stb', 'cgltf', 'webp', 'skia', 'swc', 'libuv', 'draco', 'quiche'];
+  const desktopDeps = ['wgpu', 'sdl3', 'dawn', 'v8', 'stb', 'cgltf', 'webp', 'skia', 'swc', 'libuv', 'draco', 'quiche'];
 
   // iOS deps (only downloaded with --only or --ios)
   const iosDeps = ['wgpu-ios', 'skia-ios', 'quiche-ios'];

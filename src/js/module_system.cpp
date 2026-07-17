@@ -2,10 +2,7 @@
 
 #include "mystral/js/ts_transpiler.h"
 
-#include <cctype>
 #include <iostream>
-#include <regex>
-#include <sstream>
 
 namespace mystral {
 namespace js {
@@ -25,49 +22,6 @@ bool isTypeScriptPath(const std::string& path) {
     }
     std::string ext = path.substr(dot);
     return ext == ".ts" || ext == ".tsx" || ext == ".mts" || ext == ".cts";
-}
-
-std::string trimLeft(const std::string& value) {
-    size_t start = 0;
-    while (start < value.size() && std::isspace(static_cast<unsigned char>(value[start]))) {
-        start++;
-    }
-    return value.substr(start);
-}
-
-std::vector<std::string> splitCommaSeparated(const std::string& value) {
-    std::vector<std::string> parts;
-    std::string current;
-    int depth = 0;
-    for (char c : value) {
-        if (c == '{' || c == '[' || c == '(') {
-            depth++;
-        } else if (c == '}' || c == ']' || c == ')') {
-            depth--;
-        }
-        if (c == ',' && depth == 0) {
-            parts.push_back(current);
-            current.clear();
-        } else {
-            current.push_back(c);
-        }
-    }
-    if (!current.empty()) {
-        parts.push_back(current);
-    }
-    return parts;
-}
-
-std::string trim(const std::string& value) {
-    size_t start = 0;
-    while (start < value.size() && std::isspace(static_cast<unsigned char>(value[start]))) {
-        start++;
-    }
-    size_t end = value.size();
-    while (end > start && std::isspace(static_cast<unsigned char>(value[end - 1]))) {
-        end--;
-    }
-    return value.substr(start, end - start);
 }
 
 }  // namespace
@@ -125,15 +79,6 @@ bool ModuleSystem::loadEntry(const std::string& entryPath) {
     }
 
     if (resolved.format == ModuleFormat::ESM) {
-        // QuickJS uses the CJS transpilation path for entry ESM.
-        // V8 has native ESM support via its module API (handled by loadEsmEntry).
-        if (engine_->getType() == EngineType::QuickJS) {
-            std::string cjs = transpileEsmToCjs(source);
-            ResolvedModule cjsModule = resolved;
-            cjsModule.format = ModuleFormat::CJS;
-            JSValueHandle result = executeCjsModule(cjsModule, cjs, false);
-            return result.ptr != nullptr;
-        }
         return loadEsmEntry(resolved, source);
     }
 
@@ -163,25 +108,6 @@ JSValueHandle ModuleSystem::require(const std::string& specifier, const std::str
     }
 
     if (resolved.format == ModuleFormat::ESM) {
-        // QuickJS uses the CJS transpilation path for required ESM.
-        if (engine_->getType() == EngineType::QuickJS) {
-            std::string source;
-            if (!resolver_.readFile(resolved.resolved, source, error)) {
-                std::cerr << "[Modules] Failed to read module: " << error << std::endl;
-                engine_->throwException(error.c_str());
-                return engine_->newUndefined();
-            }
-            if (!maybeTranspileTypeScript(resolved, source, error)) {
-                std::cerr << "[Modules] Failed to transpile TypeScript: " << error << std::endl;
-                engine_->throwException(error.c_str());
-                return engine_->newUndefined();
-            }
-            std::string cjs = transpileEsmToCjs(source);
-            ResolvedModule cjsModule = resolved;
-            cjsModule.format = ModuleFormat::CJS;
-            loadedPaths_.insert(resolved.resolved.path);
-            return executeCjsModule(cjsModule, cjs, false);
-        }
         std::string message = "Cannot require ES module: " + resolved.resolved.path;
         std::cerr << "[Modules] " << message << std::endl;
         engine_->throwException(message.c_str());
@@ -393,163 +319,6 @@ std::string ModuleSystem::escapeJsString(const std::string& input) const {
         }
     }
     return out;
-}
-
-std::string ModuleSystem::transpileEsmToCjs(const std::string& source) const {
-    std::istringstream input(source);
-    std::ostringstream output;
-    std::vector<std::string> deferredExports;
-    bool usesExports = false;
-
-    std::string line;
-    while (std::getline(input, line)) {
-        std::string trimmed = trimLeft(line);
-
-        std::smatch match;
-        std::regex importDefault(R"(^import\s+([A-Za-z_$][\w$]*)\s+from\s+['"]([^'"]+)['"]\s*;?\s*$)");
-        std::regex importAll(R"(^import\s+\*\s+as\s+([A-Za-z_$][\w$]*)\s+from\s+['"]([^'"]+)['"]\s*;?\s*$)");
-        std::regex importNamed(R"(^import\s+\{([^}]+)\}\s+from\s+['"]([^'"]+)['"]\s*;?\s*$)");
-        std::regex importMixed(R"(^import\s+([A-Za-z_$][\w$]*)\s*,\s*\{([^}]+)\}\s+from\s+['"]([^'"]+)['"]\s*;?\s*$)");
-        std::regex importMixedAll(R"(^import\s+([A-Za-z_$][\w$]*)\s*,\s*\*\s+as\s+([A-Za-z_$][\w$]*)\s+from\s+['"]([^'"]+)['"]\s*;?\s*$)");
-        std::regex importSideEffect(R"(^import\s+['"]([^'"]+)['"]\s*;?\s*$)");
-
-        if (std::regex_match(trimmed, match, importMixed)) {
-            std::string defaultName = match[1];
-            std::string namedList = trim(match[2]);
-            std::string spec = match[3];
-            output << "const __mod = require(\"" << spec << "\");\n";
-            output << "const " << defaultName << " = (__mod && __mod.__esModule) ? __mod.default : __mod;\n";
-            output << "const { " << namedList << " } = __mod;\n";
-            continue;
-        }
-        if (std::regex_match(trimmed, match, importMixedAll)) {
-            std::string defaultName = match[1];
-            std::string nsName = match[2];
-            std::string spec = match[3];
-            output << "const __mod = require(\"" << spec << "\");\n";
-            output << "const " << defaultName << " = (__mod && __mod.__esModule) ? __mod.default : __mod;\n";
-            output << "const " << nsName << " = __mod;\n";
-            continue;
-        }
-        if (std::regex_match(trimmed, match, importDefault)) {
-            std::string defaultName = match[1];
-            std::string spec = match[2];
-            output << "const __mod = require(\"" << spec << "\");\n";
-            output << "const " << defaultName << " = (__mod && __mod.__esModule) ? __mod.default : __mod;\n";
-            continue;
-        }
-        if (std::regex_match(trimmed, match, importAll)) {
-            std::string nsName = match[1];
-            std::string spec = match[2];
-            output << "const " << nsName << " = require(\"" << spec << "\");\n";
-            continue;
-        }
-        if (std::regex_match(trimmed, match, importNamed)) {
-            std::string namedList = trim(match[1]);
-            std::string spec = match[2];
-            output << "const { " << namedList << " } = require(\"" << spec << "\");\n";
-            continue;
-        }
-        if (std::regex_match(trimmed, match, importSideEffect)) {
-            std::string spec = match[1];
-            output << "require(\"" << spec << "\");\n";
-            continue;
-        }
-
-        std::regex exportDefaultFunc(R"(^export\s+default\s+function\s+([A-Za-z_$][\w$]*)\s*\()");
-        std::regex exportDefaultClass(R"(^export\s+default\s+class\s+([A-Za-z_$][\w$]*)\s*)");
-        std::regex exportDefault(R"(^export\s+default\s+(.+);?\s*$)");
-        std::regex exportNamedDecl(R"(^export\s+(const|let|var|function|class)\s+([A-Za-z_$][\w$]*)\s*)");
-        std::regex exportNamedList(R"(^export\s+\{([^}]+)\}\s*;?\s*$)");
-        std::regex exportNamedFrom(R"(^export\s+\{([^}]+)\}\s+from\s+['"]([^'"]+)['"]\s*;?\s*$)");
-        std::regex exportAllFrom(R"(^export\s+\*\s+from\s+['"]([^'"]+)['"]\s*;?\s*$)");
-
-        if (std::regex_search(trimmed, match, exportDefaultFunc)) {
-            usesExports = true;
-            line = std::regex_replace(line, std::regex("^\\s*export\\s+default\\s+"), "");
-            output << line << "\n";
-            deferredExports.push_back("exports.default = " + match[1].str() + ";");
-            continue;
-        }
-        if (std::regex_search(trimmed, match, exportDefaultClass)) {
-            usesExports = true;
-            line = std::regex_replace(line, std::regex("^\\s*export\\s+default\\s+"), "");
-            output << line << "\n";
-            deferredExports.push_back("exports.default = " + match[1].str() + ";");
-            continue;
-        }
-        if (std::regex_match(trimmed, match, exportNamedFrom)) {
-            usesExports = true;
-            std::string list = trim(match[1]);
-            std::string spec = match[2];
-            output << "const __mod = require(\"" << spec << "\");\n";
-            for (const auto& part : splitCommaSeparated(list)) {
-                std::string item = trim(part);
-                size_t asPos = item.find(" as ");
-                if (asPos != std::string::npos) {
-                    std::string left = trim(item.substr(0, asPos));
-                    std::string right = trim(item.substr(asPos + 4));
-                    if (left == "default") {
-                        output << "exports." << right << " = (__mod && __mod.__esModule) ? __mod.default : __mod;\n";
-                    } else {
-                        output << "exports." << right << " = __mod." << left << ";\n";
-                    }
-                } else {
-                    output << "exports." << item << " = __mod." << item << ";\n";
-                }
-            }
-            continue;
-        }
-        if (std::regex_match(trimmed, match, exportAllFrom)) {
-            usesExports = true;
-            std::string spec = match[1];
-            output << "Object.assign(exports, require(\"" << spec << "\"));\n";
-            continue;
-        }
-        if (std::regex_match(trimmed, match, exportNamedList)) {
-            usesExports = true;
-            std::string list = trim(match[1]);
-            for (const auto& part : splitCommaSeparated(list)) {
-                std::string item = trim(part);
-                size_t asPos = item.find(" as ");
-                if (asPos != std::string::npos) {
-                    std::string left = trim(item.substr(0, asPos));
-                    std::string right = trim(item.substr(asPos + 4));
-                    output << "exports." << right << " = " << left << ";\n";
-                } else {
-                    output << "exports." << item << " = " << item << ";\n";
-                }
-            }
-            continue;
-        }
-        if (std::regex_search(trimmed, match, exportNamedDecl)) {
-            usesExports = true;
-            line = std::regex_replace(line, std::regex("^\\s*export\\s+"), "");
-            output << line << "\n";
-            deferredExports.push_back("exports." + match[2].str() + " = " + match[2].str() + ";");
-            continue;
-        }
-        if (std::regex_match(trimmed, match, exportDefault)) {
-            usesExports = true;
-            output << "exports.default = " << match[1] << ";\n";
-            continue;
-        }
-
-        output << line << "\n";
-    }
-
-    for (const auto& assignment : deferredExports) {
-        output << assignment << "\n";
-    }
-
-    if (usesExports) {
-        std::ostringstream finalOut;
-        finalOut << "exports.__esModule = true;\n";
-        finalOut << output.str();
-        return finalOut.str();
-    }
-
-    return output.str();
 }
 
 bool ModuleSystem::maybeTranspileTypeScript(const ResolvedModule& resolved,

@@ -6,8 +6,8 @@ Mystral Native.js is a lightweight runtime that lets you run JavaScript/TypeScri
 
 - **No Browser Required**: Your game code runs against native WebGPU, Canvas, and Audio implementations — no Chromium, no Electron
 - **Familiar APIs**: Use the same WebGPU, Canvas, Audio, and fetch APIs you'd use in a browser
-- **Multiple JS Engines**: Choose V8 for full ES2024+ support or QuickJS for small binaries and mobile targets
-- **Cross-Platform**: Build for macOS, Windows, Linux, iOS, and Android from one codebase
+- **High-performance JavaScript**: V8 provides ES2024+ support and JIT compilation
+- **Cross-Platform**: Build for Apple Silicon macOS, Windows, and Linux from one codebase
 - **Easy Distribution**: Ship a single binary - no dependencies, no installers
 
 ## Quick Example
@@ -31,13 +31,13 @@ render();
 
 ## Supported Platforms
 
-| Platform | Minimum Version | JS Engines | WebGPU Backend |
-|----------|----------------|------------|----------------|
-| macOS (arm64/x64) | macOS 14 Sonoma | V8, QuickJS | Dawn, wgpu-native |
-| Windows | Windows 11 | V8, QuickJS | Dawn, wgpu-native |
-| Linux | Ubuntu 24.04 / glibc 2.39 | V8, QuickJS | Dawn, wgpu-native |
-| iOS | iOS 17 | QuickJS | wgpu-native |
-| Android | Android 13 | V8, QuickJS | wgpu-native |
+| Platform | Minimum Version | JS Engine | WebGPU Backend |
+|----------|----------------|-----------|----------------|
+| macOS (arm64) | macOS 14 Sonoma | V8 | Dawn, wgpu-native |
+| Windows | Windows 11 | V8 | Dawn, wgpu-native |
+| Linux | Ubuntu 24.04 / glibc 2.39 | V8 | Dawn, wgpu-native |
+
+macOS Intel, iOS, and Android are not currently supported by the V8-only runtime.
 
 > **Note:** On Linux, the prebuilt binaries require glibc 2.39 or later (Ubuntu 24.04+). Older distributions may encounter `GLIBC_2.xx not found` errors. You can [build from source](/mystralnative/docs/guides/building) to target older glibc versions.
 

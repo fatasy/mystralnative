@@ -62,16 +62,8 @@ bun run build
 
 ### JavaScript Engine
 
-Choose your JavaScript engine:
-
-```bash
-# V8 (recommended) - full ES2024+, JIT compilation, Chrome-compatible
-cmake -B build -DMYSTRAL_USE_V8=ON -DMYSTRAL_USE_QUICKJS=OFF
-
-# QuickJS - smallest binary, no JIT, good for CI
-cmake -B build -DMYSTRAL_USE_QUICKJS=ON
-
-```
+V8 is the runtime's JavaScript engine and requires C++20. No engine-selection
+CMake option is needed.
 
 ### WebGPU Backend
 
@@ -81,7 +73,7 @@ Choose your WebGPU implementation:
 # Dawn (recommended) - Chrome's implementation, best shader compatibility
 cmake -B build -DMYSTRAL_USE_DAWN=ON -DMYSTRAL_USE_WGPU=OFF
 
-# wgpu-native - Rust implementation, best iOS/Android support
+# wgpu-native - Rust WebGPU implementation
 cmake -B build -DMYSTRAL_USE_WGPU=ON
 ```
 
@@ -90,9 +82,7 @@ cmake -B build -DMYSTRAL_USE_WGPU=ON
 ```bash
 # V8 + Dawn (recommended for desktop development)
 cmake -B build \
-    -DMYSTRAL_USE_V8=ON \
     -DMYSTRAL_USE_DAWN=ON \
-    -DMYSTRAL_USE_QUICKJS=OFF \
     -DMYSTRAL_USE_WGPU=OFF \
     -DCMAKE_BUILD_TYPE=Release
 
@@ -167,7 +157,8 @@ cmake -B build -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
 
 ### V8 build issues
 
-V8 prebuilts require specific compiler versions. If you encounter issues, try QuickJS first.
+V8 prebuilts require compatible compiler and runtime-library versions. Re-download
+the V8 dependency and verify the supported platform/toolchain when linking fails.
 
 ## Next Steps
 

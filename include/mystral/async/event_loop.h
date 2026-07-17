@@ -46,7 +46,7 @@ public:
      *   while (running) {
      *       processInput();
      *       EventLoop::instance().runOnce();
-     *       drainMicrotasks();  // V8/QuickJS promise callbacks
+     *       drainMicrotasks();  // V8 promise callbacks
      *       update();
      *       render();
      *   }

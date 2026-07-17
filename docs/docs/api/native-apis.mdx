@@ -60,7 +60,6 @@ const config = __readFileSync('/home/user/game/config.json');
 **Returns:** `ArrayBuffer` with file contents, or `null` if the file was not found.
 
 **Notes:**
-- On Android, reads from the APK assets directory via SDL
 - For bundled apps, checks the embedded VFS before the filesystem
 - This is used internally by the `fetch` polyfill for `file://` URLs
 

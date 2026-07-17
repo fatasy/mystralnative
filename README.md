@@ -15,7 +15,7 @@
 Think of it as "Electron for games" but without Chromium — just your game code, a JS engine, and native WebGPU rendering.
 
 > [!NOTE]
-> Mystral Native.js is in **early alpha**. The core features work — execute JS against WebGPU, Canvas 2D, Web Audio, and fetch — with runtimes available for **macOS**, **Windows**, and **Linux**. Embedding is available for **iOS** and **Android**, with a future goal of console support.
+> Mystral Native.js is in **early alpha**. The core features work — execute JS against WebGPU, Canvas 2D, Web Audio, and fetch — with V8 runtimes available for **Apple Silicon macOS**, **Windows**, and **Linux**.
 > To see a production build, check out the [Sponza demo on itch.io](https://mystraldev.itch.io/sponza-in-webgpu-mystral-engine).
 
 ## Quick Start
@@ -57,7 +57,6 @@ Download the latest release for your platform from the [releases page](https://g
 | Platform | Download |
 |----------|----------|
 | macOS (Apple Silicon) | `mystral-macOS-arm64-v8-dawn.zip` |
-| macOS (Intel) | `mystral-macOS-x64-quickjs-dawn.zip` |
 | Windows | `mystral-windows-x64-v8-dawn.zip` |
 | Linux | `mystral-linux-x64-v8-dawn.zip` |
 
@@ -82,9 +81,7 @@ bun run deps:download
 
 # Configure with V8 + Dawn (recommended)
 cmake -B build \
-  -DMYSTRAL_USE_V8=ON \
   -DMYSTRAL_USE_DAWN=ON \
-  -DMYSTRAL_USE_QUICKJS=OFF \
   -DMYSTRAL_USE_WGPU=OFF
 
 # Build
@@ -278,8 +275,8 @@ Compile Options:
         │                │           │        │
         ▼                ▼           ▼        ▼
    ┌─────────┐    ┌───────────┐  ┌─────┐  ┌──────┐  ┌───────┐
-   │ V8/     │    │   Dawn/   │  │SDL3 │  │libcurl│  │ libuv │
-   │ QuickJS │    │ wgpu-native│  │     │  │      │  │       │
+   │   V8    │    │   Dawn/   │  │SDL3 │  │libcurl│  │ libuv │
+   │         │    │ wgpu-native│  │     │  │      │  │       │
    └─────────┘    └───────────┘  └─────┘  └──────┘  └───────┘
 ```
 
@@ -293,8 +290,8 @@ Compile Options:
 | fetch (file/http/https) | ✅ Working |
 | URL / URLSearchParams | ✅ Working |
 | Worker (native thread) | ✅ Working |
-| WorkerPool / transferable ArrayBuffer | ✅ V8 and QuickJS |
-| SharedBuffer / SharedTable / SharedQueue | ✅ V8 and QuickJS |
+| WorkerPool / transferable ArrayBuffer | ✅ Working |
+| SharedBuffer / SharedTable / SharedQueue | ✅ Working |
 | Gamepad | ✅ Working |
 | requestAnimationFrame | ✅ Working |
 | setTimeout/setInterval | ✅ Working |
@@ -304,38 +301,27 @@ Compile Options:
 
 ## Platform Support
 
-| Platform | JS Engine Options | WebGPU Backend |
-|----------|-------------------|----------------|
-| macOS (arm64) | V8, QuickJS | Dawn, wgpu-native |
-| macOS (x64) | V8, QuickJS | Dawn, wgpu-native |
-| Windows | V8, QuickJS | Dawn, wgpu-native |
-| Linux | V8, QuickJS | Dawn, wgpu-native |
-| iOS | QuickJS | wgpu-native |
-| Android | V8, QuickJS | wgpu-native |
+| Platform | JS Engine | WebGPU Backend |
+|----------|-----------|----------------|
+| macOS (arm64) | V8 | Dawn, wgpu-native |
+| Windows | V8 | Dawn, wgpu-native |
+| Linux | V8 | Dawn, wgpu-native |
+
+macOS Intel, iOS, and Android are not currently supported by the V8-only runtime.
 
 ## Build Options
 
 **Recommended for development (full shader compatibility):**
 ```bash
 cmake -B build \
-  -DMYSTRAL_USE_V8=ON \
   -DMYSTRAL_USE_DAWN=ON \
-  -DMYSTRAL_USE_QUICKJS=OFF \
   -DMYSTRAL_USE_WGPU=OFF
-```
-
-**Alternative configurations:**
-
-Choose your JS engine:
-```bash
-cmake -B build -DMYSTRAL_USE_V8=ON       # Recommended — Full V8 with JIT
-cmake -B build -DMYSTRAL_USE_QUICKJS=ON  # Smallest binary, good for CI
 ```
 
 Choose your WebGPU backend:
 ```bash
 cmake -B build -DMYSTRAL_USE_DAWN=ON     # Recommended — Chrome's implementation
-cmake -B build -DMYSTRAL_USE_WGPU=ON     # Rust implementation, best iOS/Android support
+cmake -B build -DMYSTRAL_USE_WGPU=ON     # Rust WebGPU implementation
 ```
 
 ## Embedding in Your App
@@ -358,7 +344,7 @@ int main() {
 }
 ```
 
-See the [embedding guide](https://mystralengine.github.io/mystralnative/docs/api/embedding) for iOS, Android, and CMake integration details.
+See the [embedding guide](https://mystralengine.github.io/mystralnative/docs/api/embedding) for CMake integration details.
 
 ## Dependencies
 
@@ -368,7 +354,7 @@ All dependencies are downloaded automatically as prebuilt binaries:
 |------------|---------|
 | Dawn / wgpu-native | WebGPU implementation |
 | SDL3 | Windowing, input, audio |
-| V8 / QuickJS | JavaScript engine |
+| V8 | JavaScript engine |
 | Skia | Canvas 2D rendering |
 | libcurl | HTTP requests |
 | libuv | Async I/O, timers, file watching |

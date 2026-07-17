@@ -1428,6 +1428,22 @@ static std::string makeBenchmarkJson(
         << ",\"outputQueuePeakBytes\":" << report.workerOutputQueuePeakBytes
         << ",\"sharedMemoryStartBytes\":" << report.sharedMemoryStartBytes
         << ",\"sharedMemoryEndBytes\":" << report.sharedMemoryEndBytes
+        << "},\"jobs\":{"
+        << "\"workerCount\":" << report.jobWorkerCount
+        << ",\"submitted\":" << report.jobsSubmitted
+        << ",\"completed\":" << report.jobsCompleted
+        << ",\"cancelled\":" << report.jobsCancelled
+        << ",\"failed\":" << report.jobsFailed
+        << ",\"rejected\":" << report.jobsRejected
+        << ",\"queueEnd\":" << report.jobQueueEnd
+        << ",\"queuePeak\":" << report.jobQueuePeak
+        << ",\"inFlightEnd\":" << report.jobInFlightEnd
+        << ",\"inFlightPeak\":" << report.jobInFlightPeak
+        << ",\"queueWait\":";
+    appendProfileStatisticsJson(out, report.jobQueueWait);
+    out << ",\"execution\":";
+    appendProfileStatisticsJson(out, report.jobExecution);
+    out
         << "},\"memory\":{\"start\":";
     appendMemorySnapshotJson(out, report.memoryStart);
     out << ",\"end\":";
@@ -1475,6 +1491,8 @@ static void printBenchmarkSummary(
     printPhase("callbacks", report.callbacks);
     printPhase("animationFrame", report.animationFrame);
     printPhase("cleanup", report.cleanup);
+    printPhase("jobQueueWait", report.jobQueueWait);
+    printPhase("jobExecution", report.jobExecution);
 
     std::cout << "\nBudget misses: >8.33ms=" << report.framesOver8_33Ms
               << " >16.67ms=" << report.framesOver16_67Ms
@@ -1488,6 +1506,14 @@ static void printBenchmarkSummary(
               << " queuePeak=" << report.workerInputQueuePeakBytes
               << "/" << report.workerOutputQueuePeakBytes << " bytes"
               << " shared=" << report.sharedMemoryEndBytes << " bytes\n"
+              << "Jobs: workers=" << report.jobWorkerCount
+              << " submitted=" << report.jobsSubmitted
+              << " completed=" << report.jobsCompleted
+              << " cancelled=" << report.jobsCancelled
+              << " failed=" << report.jobsFailed
+              << " rejected=" << report.jobsRejected
+              << " queue=" << report.jobQueueEnd << "/" << report.jobQueuePeak
+              << " inFlight=" << report.jobInFlightEnd << "/" << report.jobInFlightPeak << "\n"
               << "Heap delta: " << std::showpos << std::setprecision(3) << heapDeltaMiB
               << std::noshowpos << " MiB\n";
 }

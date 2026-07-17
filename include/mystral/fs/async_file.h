@@ -1,11 +1,10 @@
 #pragma once
 
 /**
- * Async File I/O using libuv thread pool
+ * Async file I/O using the native job system.
  *
- * This provides non-blocking file reading that integrates with the libuv
- * event loop. File reads happen on a thread pool and callbacks are invoked
- * when the data is ready, without blocking the main thread.
+ * File reads happen on native worker threads and callbacks are invoked on the
+ * main thread when job-system completions are drained.
  *
  * Usage:
  *   fs::readFileAsync("./assets/model.glb", [](std::vector<uint8_t> data, std::string error) {
@@ -14,15 +13,16 @@
  *       }
  *   });
  *
- * The callback runs on the main thread during EventLoop::runOnce().
+ * The callback runs on the main thread during JobSystem::processCompletions().
  */
 
+#include "mystral/async/job_system.h"
+
 #include <functional>
-#include <string>
-#include <vector>
 #include <memory>
-#include <queue>
-#include <mutex>
+#include <string>
+#include <utility>
+#include <vector>
 
 namespace mystral {
 namespace fs {
@@ -35,10 +35,7 @@ namespace fs {
 using AsyncFileCallback = std::function<void(std::vector<uint8_t> data, std::string error)>;
 
 /**
- * Async File Reader using libuv thread pool
- *
- * This is a singleton that manages async file read operations.
- * File reads happen on libuv's thread pool to avoid blocking the main thread.
+ * Singleton facade for file reads submitted to the native job system.
  */
 class AsyncFileReader {
 public:
@@ -49,7 +46,7 @@ public:
 
     /**
      * Initialize the async file reader.
-     * Must be called after EventLoop::init().
+     * Must be called after JobSystem::start().
      */
     void init();
 
@@ -67,11 +64,15 @@ public:
      * Read a file asynchronously.
      * The callback is invoked on the main thread when complete.
      */
-    void readFile(const std::string& path, AsyncFileCallback callback);
+    void readFile(
+        const std::string& path,
+        AsyncFileCallback callback,
+        uint64_t generation = 0,
+        async::JobPriority priority = async::JobPriority::Streaming);
 
     /**
      * Process completed file reads, invoking their callbacks.
-     * Call this from the main loop after EventLoop::runOnce().
+     * Call this from the main loop.
      * Returns true if any callbacks were invoked.
      */
     bool processCompletedReads();
@@ -98,8 +99,16 @@ inline AsyncFileReader& getAsyncFileReader() {
 /**
  * Convenience function to read a file asynchronously.
  */
-inline void readFileAsync(const std::string& path, AsyncFileCallback callback) {
-    AsyncFileReader::instance().readFile(path, std::move(callback));
+inline void readFileAsync(
+    const std::string& path,
+    AsyncFileCallback callback,
+    uint64_t generation = 0,
+    async::JobPriority priority = async::JobPriority::Streaming) {
+    AsyncFileReader::instance().readFile(
+        path,
+        std::move(callback),
+        generation,
+        priority);
 }
 
 } // namespace fs

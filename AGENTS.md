@@ -13,7 +13,7 @@ Instructions for AI agents working on MystralNative.
 | `include/mystral/gltf/gltf_loader.h` | DEPRECATED |
 | `third_party/cgltf/` | DEPRECATED |
 
-**Use the JavaScript loaders instead** - they run on the JS engine (V8/QuickJS) within MystralNative and provide the same functionality as the web engine.
+**Use the JavaScript loaders instead** - they run on V8 within MystralNative and provide the same functionality as the web engine.
 
 ## Quick Reference
 
@@ -38,7 +38,7 @@ scene.addChild(model);
 
 ```bash
 # V8 + Dawn (recommended)
-cmake -B build -DMYSTRAL_USE_V8=ON -DMYSTRAL_USE_DAWN=ON -DMYSTRAL_USE_QUICKJS=OFF -DMYSTRAL_USE_WGPU=OFF
+cmake -B build -DMYSTRAL_USE_DAWN=ON -DMYSTRAL_USE_WGPU=OFF
 cmake --build build --parallel
 ```
 

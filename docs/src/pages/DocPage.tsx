@@ -29,6 +29,7 @@ const sidebarItems = [
       { label: 'Input Events', path: 'guides/input-events' },
       { label: 'WebTransport', path: 'guides/webtransport' },
       { label: 'Workers & Shared Memory', path: 'guides/workers-shared-memory' },
+      { label: 'Performance & Memory', path: 'guides/performance' },
       { label: 'Building from Source', path: 'guides/building' },
       { label: 'Configuration', path: 'guides/configuration' },
     ],
@@ -48,8 +49,6 @@ const sidebarItems = [
       { label: 'macOS', path: 'platforms/macos' },
       { label: 'Windows', path: 'platforms/windows' },
       { label: 'Linux', path: 'platforms/linux' },
-      { label: 'iOS', path: 'platforms/ios' },
-      { label: 'Android', path: 'platforms/android' },
     ],
   },
 ];

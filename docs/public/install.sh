@@ -105,16 +105,12 @@ select_build() {
     # Dawn is recommended for mystral-helmet and full Mystral Engine demos
     WEBGPU_BACKEND="dawn"
 
-    # Select JS engine based on platform. Intel macOS uses the portable QuickJS build.
+    # V8 prebuilts are currently published for Apple Silicon only.
     if [ "$PLATFORM" = "macOS-x64" ]; then
-        JS_ENGINE="quickjs"
-        warn "Intel Mac detected. Using QuickJS engine (V8 not available for x64)."
-        warn "Note: Requires macOS 14+ (Sonoma) due to Metal API requirements."
-    else
-        JS_ENGINE="v8"
+        error "Intel macOS is not supported by the V8-only runtime."
     fi
 
-    BUILD_NAME="mystral-${PLATFORM}-${JS_ENGINE}-${WEBGPU_BACKEND}"
+    BUILD_NAME="mystral-${PLATFORM}-v8-${WEBGPU_BACKEND}"
     DOWNLOAD_URL="https://github.com/$REPO/releases/download/$VERSION/${BUILD_NAME}.zip"
 
     info "Selected build: $BUILD_NAME"

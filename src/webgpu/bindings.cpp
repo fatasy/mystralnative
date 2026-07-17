@@ -19,6 +19,7 @@
  */
 
 #include "mystral/js/engine.h"
+#include <array>
 #include <cstdlib>
 #include <iostream>
 #include <vector>
@@ -290,6 +291,86 @@ static uint64_t g_commandEncodersCreated = 0;
 static uint64_t g_renderPassesCreated = 0;
 static uint64_t g_computePassesCreated = 0;
 static uint64_t g_commandBuffersCreated = 0;
+
+enum class ProfiledBridgeOp : size_t {
+    CreateCommandEncoder,
+    BeginRenderPass,
+    BeginComputePass,
+    FinishCommandEncoder,
+    QueueSubmit,
+    QueueWriteBuffer,
+    QueueWriteTexture,
+    RenderSetPipeline,
+    RenderSetBindGroup,
+    RenderSetVertexBuffer,
+    RenderSetIndexBuffer,
+    RenderDraw,
+    RenderDrawIndexed,
+    RenderDrawIndirect,
+    RenderDrawIndexedIndirect,
+    RenderExecuteBundles,
+    RenderEnd,
+    ComputeSetPipeline,
+    ComputeSetBindGroup,
+    ComputeDispatchWorkgroups,
+    ComputeEnd,
+    Count,
+};
+
+struct ProfiledBridgeMetric {
+    uint64_t calls = 0;
+    uint64_t totalNanoseconds = 0;
+    uint64_t bytes = 0;
+};
+
+static constexpr std::array<const char*, static_cast<size_t>(ProfiledBridgeOp::Count)>
+    kProfiledBridgeOpNames = {
+        "createCommandEncoder",
+        "beginRenderPass",
+        "beginComputePass",
+        "finishCommandEncoder",
+        "queueSubmit",
+        "queueWriteBuffer",
+        "queueWriteTexture",
+        "renderSetPipeline",
+        "renderSetBindGroup",
+        "renderSetVertexBuffer",
+        "renderSetIndexBuffer",
+        "renderDraw",
+        "renderDrawIndexed",
+        "renderDrawIndirect",
+        "renderDrawIndexedIndirect",
+        "renderExecuteBundles",
+        "renderEnd",
+        "computeSetPipeline",
+        "computeSetBindGroup",
+        "computeDispatchWorkgroups",
+        "computeEnd",
+    };
+static std::array<ProfiledBridgeMetric, static_cast<size_t>(ProfiledBridgeOp::Count)>
+    g_profiledBridgeMetrics;
+
+class ScopedBridgeMeasurement {
+public:
+    explicit ScopedBridgeMeasurement(ProfiledBridgeOp operation)
+        : metric_(g_profiledBridgeMetrics[static_cast<size_t>(operation)]),
+          startedAt_(std::chrono::steady_clock::now()) {}
+
+    ~ScopedBridgeMeasurement() {
+        const auto elapsed = std::chrono::steady_clock::now() - startedAt_;
+        metric_.calls++;
+        metric_.totalNanoseconds += static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count());
+    }
+
+private:
+    ProfiledBridgeMetric& metric_;
+    std::chrono::steady_clock::time_point startedAt_;
+};
+
+static void recordBridgeBytes(ProfiledBridgeOp operation, uint64_t bytes) {
+    g_profiledBridgeMetrics[static_cast<size_t>(operation)].bytes += bytes;
+}
 
 struct TransientMethodCache {
     js::JSValueHandle encoderBeginRenderPass;
@@ -885,16 +966,27 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
 
     // Add createElement to existing document
     // NOTE: runtime.cpp sets up a createElement with canvas support (toDataURL) for @loaders.gl WebP detection
-    // We ALWAYS override it here to add proper Canvas 2D support for offscreen canvases
+    // Preserve the runtime's text controls; this override adds Canvas 2D support.
+    engine->setGlobalProperty("__mystralCreateElement",
+        engine->getProperty(existingDocument, "createElement"));
     engine->setProperty(existingDocument, "createElement",
         engine->newFunction("createElement", [](void* ctx, const std::vector<js::JSValueHandle>& args) {
-            auto element = g_engine->newObject();
-
             // Get tag name if provided
             std::string tagName = "";
             if (!args.empty()) {
                 tagName = g_engine->toString(args[0]);
             }
+
+            if (tagName == "input" || tagName == "INPUT" ||
+                tagName == "textarea" || tagName == "TEXTAREA") {
+                auto fallback = g_engine->getGlobalProperty("__mystralCreateElement");
+                auto document = g_engine->getGlobalProperty("document");
+                if (g_engine->isFunction(fallback)) {
+                    return g_engine->call(fallback, document, args);
+                }
+            }
+
+            auto element = g_engine->newObject();
 
             // Add basic DOM element properties
             g_engine->setProperty(element, "style", g_engine->newObject());
@@ -1242,6 +1334,7 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
                     // queue.submit(commandBuffers)
                     g_engine->setProperty(queue, "submit",
                         g_engine->newFunction("submit", [](void* ctx, const std::vector<js::JSValueHandle>& args) {
+                            ScopedBridgeMeasurement measurement(ProfiledBridgeOp::QueueSubmit);
                             if (args.empty()) {
                                 return g_engine->newUndefined();
                             }
@@ -1401,6 +1494,7 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
                     // resolved against the view's underlying ArrayBuffer.
                     g_engine->setProperty(queue, "writeBuffer",
                         g_engine->newFunction("writeBuffer", [](void* ctx, const std::vector<js::JSValueHandle>& args) {
+                            ScopedBridgeMeasurement measurement(ProfiledBridgeOp::QueueWriteBuffer);
                             if (args.size() < 3) {
                                 g_engine->throwException("writeBuffer requires buffer, offset, and data");
                                 return g_engine->newUndefined();
@@ -1454,6 +1548,7 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
                             if (buffer && g_queue) {
                                 wgpuQueueWriteBuffer(g_queue, buffer, offset,
                                     (uint8_t*)basePtr + viewByteOffset + dataOffsetBytes, writeSize);
+                                recordBridgeBytes(ProfiledBridgeOp::QueueWriteBuffer, writeSize);
                             }
 
                             return g_engine->newUndefined();
@@ -1463,6 +1558,7 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
                     // queue.writeTexture(destination, data, dataLayout, size)
                     g_engine->setProperty(queue, "writeTexture",
                         g_engine->newFunction("writeTexture", [](void* ctx, const std::vector<js::JSValueHandle>& args) {
+                            ScopedBridgeMeasurement measurement(ProfiledBridgeOp::QueueWriteTexture);
                             if (args.size() < 4) {
                                 g_engine->throwException("writeTexture requires destination, data, dataLayout, and size");
                                 return g_engine->newUndefined();
@@ -1558,6 +1654,7 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
 
                             // Write texture
                             wgpuQueueWriteTexture(g_queue, &destCopy, (uint8_t*)dataPtr + layoutOffset, dataSize - layoutOffset, &layout, &copySize);
+                            recordBridgeBytes(ProfiledBridgeOp::QueueWriteTexture, dataSize - layoutOffset);
 
                             if (g_verboseLogging) std::cout << "[WebGPU] writeTexture: " << width << "x" << height << " (" << dataSize << " bytes)" << std::endl;
 
@@ -2676,6 +2773,7 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
                     // device.createCommandEncoder(descriptor?)
                     g_engine->setProperty(device, "createCommandEncoder",
                         g_engine->newFunction("createCommandEncoder", [](void* ctx, const std::vector<js::JSValueHandle>& args) {
+                            ScopedBridgeMeasurement measurement(ProfiledBridgeOp::CreateCommandEncoder);
                             WGPUCommandEncoderDescriptor desc = {};
                             WGPUCommandEncoder encoder = wgpuDeviceCreateCommandEncoder(g_device, &desc);
                             g_liveCommandEncoders.insert(encoder);
@@ -2696,6 +2794,7 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
                             g_engine->setProperty(jsEncoder, "beginRenderPass",
                                 sharedMethod(g_transientMethods.encoderBeginRenderPass, "beginRenderPass",
                                     [](void* ctx, js::JSValueHandle receiver, const std::vector<js::JSValueHandle>& args) {
+                                    ScopedBridgeMeasurement measurement(ProfiledBridgeOp::BeginRenderPass);
                                     if (args.empty()) {
                                         g_engine->throwException("beginRenderPass requires a descriptor");
                                         return g_engine->newUndefined();
@@ -2869,6 +2968,7 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
                                     g_engine->setProperty(jsRenderPass, "setPipeline",
                                         sharedMethod(g_transientMethods.renderSetPipeline, "setPipeline",
                                             [](void* ctx, js::JSValueHandle receiver, const std::vector<js::JSValueHandle>& args) {
+                                            ScopedBridgeMeasurement measurement(ProfiledBridgeOp::RenderSetPipeline);
                                             if (args.empty()) return g_engine->newUndefined();
 
                                             WGPURenderPassEncoder capturedRenderPassForCommands =
@@ -2887,6 +2987,7 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
                                     g_engine->setProperty(jsRenderPass, "setBindGroup",
                                         sharedMethod(g_transientMethods.renderSetBindGroup, "setBindGroup",
                                             [](void* ctx, js::JSValueHandle receiver, const std::vector<js::JSValueHandle>& args) {
+                                            ScopedBridgeMeasurement measurement(ProfiledBridgeOp::RenderSetBindGroup);
                                             if (args.size() < 2) {
                                                 g_engine->throwException("setBindGroup requires index and bindGroup");
                                                 return g_engine->newUndefined();
@@ -2911,6 +3012,7 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
                                     g_engine->setProperty(jsRenderPass, "draw",
                                         sharedMethod(g_transientMethods.renderDraw, "draw",
                                             [](void* ctx, js::JSValueHandle receiver, const std::vector<js::JSValueHandle>& args) {
+                                            ScopedBridgeMeasurement measurement(ProfiledBridgeOp::RenderDraw);
                                             if (args.empty()) return g_engine->newUndefined();
 
                                             uint32_t vertexCount = (uint32_t)g_engine->toNumber(args[0]);
@@ -2933,6 +3035,7 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
                                     g_engine->setProperty(jsRenderPass, "setVertexBuffer",
                                         sharedMethod(g_transientMethods.renderSetVertexBuffer, "setVertexBuffer",
                                             [](void* ctx, js::JSValueHandle receiver, const std::vector<js::JSValueHandle>& args) {
+                                            ScopedBridgeMeasurement measurement(ProfiledBridgeOp::RenderSetVertexBuffer);
                                             if (args.size() < 2) return g_engine->newUndefined();
 
                                             uint32_t slot = (uint32_t)g_engine->toNumber(args[0]);
@@ -2955,6 +3058,7 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
                                     g_engine->setProperty(jsRenderPass, "setIndexBuffer",
                                         sharedMethod(g_transientMethods.renderSetIndexBuffer, "setIndexBuffer",
                                             [](void* ctx, js::JSValueHandle receiver, const std::vector<js::JSValueHandle>& args) {
+                                            ScopedBridgeMeasurement measurement(ProfiledBridgeOp::RenderSetIndexBuffer);
                                             if (args.size() < 2) return g_engine->newUndefined();
 
                                             WGPUBuffer buffer = (WGPUBuffer)g_engine->getPrivateData(args[0]);
@@ -2981,6 +3085,7 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
                                     g_engine->setProperty(jsRenderPass, "drawIndexed",
                                         sharedMethod(g_transientMethods.renderDrawIndexed, "drawIndexed",
                                             [](void* ctx, js::JSValueHandle receiver, const std::vector<js::JSValueHandle>& args) {
+                                            ScopedBridgeMeasurement measurement(ProfiledBridgeOp::RenderDrawIndexed);
                                             if (args.empty()) return g_engine->newUndefined();
 
                                             uint32_t indexCount = (uint32_t)g_engine->toNumber(args[0]);
@@ -3004,6 +3109,7 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
                                     g_engine->setProperty(jsRenderPass, "drawIndirect",
                                         sharedMethod(g_transientMethods.renderDrawIndirect, "drawIndirect",
                                             [](void* ctx, js::JSValueHandle receiver, const std::vector<js::JSValueHandle>& args) {
+                                            ScopedBridgeMeasurement measurement(ProfiledBridgeOp::RenderDrawIndirect);
                                             if (args.size() < 2) return g_engine->newUndefined();
 
                                             WGPUBuffer indirectBuffer = (WGPUBuffer)g_engine->getPrivateData(args[0]);
@@ -3024,6 +3130,7 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
                                     g_engine->setProperty(jsRenderPass, "drawIndexedIndirect",
                                         sharedMethod(g_transientMethods.renderDrawIndexedIndirect, "drawIndexedIndirect",
                                             [](void* ctx, js::JSValueHandle receiver, const std::vector<js::JSValueHandle>& args) {
+                                            ScopedBridgeMeasurement measurement(ProfiledBridgeOp::RenderDrawIndexedIndirect);
                                             if (args.size() < 2) return g_engine->newUndefined();
 
                                             WGPUBuffer indirectBuffer = (WGPUBuffer)g_engine->getPrivateData(args[0]);
@@ -3138,6 +3245,7 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
                                     g_engine->setProperty(jsRenderPass, "executeBundles",
                                         sharedMethod(g_transientMethods.renderExecuteBundles, "executeBundles",
                                             [](void* ctx, js::JSValueHandle receiver, const std::vector<js::JSValueHandle>& args) {
+                                            ScopedBridgeMeasurement measurement(ProfiledBridgeOp::RenderExecuteBundles);
                                             WGPURenderPassEncoder capturedRenderPassForBundles =
                                                 (WGPURenderPassEncoder)g_engine->getPrivateData(receiver);
                                             if (args.empty() || !capturedRenderPassForBundles) return g_engine->newUndefined();
@@ -3167,6 +3275,7 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
                                     g_engine->setProperty(jsRenderPass, "end",
                                         sharedMethod(g_transientMethods.renderEnd, "end",
                                             [](void* ctx, js::JSValueHandle receiver, const std::vector<js::JSValueHandle>& args) {
+                                            ScopedBridgeMeasurement measurement(ProfiledBridgeOp::RenderEnd);
                                             WGPURenderPassEncoder pass =
                                                 (WGPURenderPassEncoder)g_engine->getPrivateData(receiver);
                                             closeRenderPass(pass);
@@ -3184,6 +3293,7 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
                             g_engine->setProperty(jsEncoder, "beginComputePass",
                                 sharedMethod(g_transientMethods.encoderBeginComputePass, "beginComputePass",
                                     [](void* ctx, js::JSValueHandle receiver, const std::vector<js::JSValueHandle>& args) {
+                                    ScopedBridgeMeasurement measurement(ProfiledBridgeOp::BeginComputePass);
                                     WGPUCommandEncoder encoder =
                                         (WGPUCommandEncoder)g_engine->getPrivateData(receiver);
                                     if (!encoder) {
@@ -3210,6 +3320,7 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
                                     g_engine->setProperty(jsComputePass, "setPipeline",
                                         sharedMethod(g_transientMethods.computeSetPipeline, "setPipeline",
                                             [](void* ctx, js::JSValueHandle receiver, const std::vector<js::JSValueHandle>& args) {
+                                            ScopedBridgeMeasurement measurement(ProfiledBridgeOp::ComputeSetPipeline);
                                             if (args.empty()) return g_engine->newUndefined();
                                             WGPUComputePassEncoder pass =
                                                 (WGPUComputePassEncoder)g_engine->getPrivateData(receiver);
@@ -3225,6 +3336,7 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
                                     g_engine->setProperty(jsComputePass, "setBindGroup",
                                         sharedMethod(g_transientMethods.computeSetBindGroup, "setBindGroup",
                                             [](void* ctx, js::JSValueHandle receiver, const std::vector<js::JSValueHandle>& args) {
+                                            ScopedBridgeMeasurement measurement(ProfiledBridgeOp::ComputeSetBindGroup);
                                             if (args.size() < 2) return g_engine->newUndefined();
                                             uint32_t index = (uint32_t)g_engine->toNumber(args[0]);
                                             WGPUComputePassEncoder pass =
@@ -3241,6 +3353,7 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
                                     g_engine->setProperty(jsComputePass, "dispatchWorkgroups",
                                         sharedMethod(g_transientMethods.computeDispatchWorkgroups, "dispatchWorkgroups",
                                             [](void* ctx, js::JSValueHandle receiver, const std::vector<js::JSValueHandle>& args) {
+                                            ScopedBridgeMeasurement measurement(ProfiledBridgeOp::ComputeDispatchWorkgroups);
                                             if (args.empty()) return g_engine->newUndefined();
                                             uint32_t countX = (uint32_t)g_engine->toNumber(args[0]);
                                             uint32_t countY = args.size() > 1 ? (uint32_t)g_engine->toNumber(args[1]) : 1;
@@ -3258,6 +3371,7 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
                                     g_engine->setProperty(jsComputePass, "end",
                                         sharedMethod(g_transientMethods.computeEnd, "end",
                                             [](void* ctx, js::JSValueHandle receiver, const std::vector<js::JSValueHandle>& args) {
+                                            ScopedBridgeMeasurement measurement(ProfiledBridgeOp::ComputeEnd);
                                             WGPUComputePassEncoder pass =
                                                 (WGPUComputePassEncoder)g_engine->getPrivateData(receiver);
                                             closeComputePass(pass);
@@ -3512,6 +3626,7 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
                             g_engine->setProperty(jsEncoder, "finish",
                                 sharedMethod(g_transientMethods.encoderFinish, "finish",
                                     [](void* ctx, js::JSValueHandle receiver, const std::vector<js::JSValueHandle>& args) {
+                                    ScopedBridgeMeasurement measurement(ProfiledBridgeOp::FinishCommandEncoder);
                                     WGPUCommandEncoder encoderToFinish =
                                         (WGPUCommandEncoder)g_engine->getPrivateData(receiver);
                                     if (!encoderToFinish ||
@@ -5173,6 +5288,18 @@ globalThis.OffscreenCanvas = OffscreenCanvas;
             set("activeComputePipelines", g_computePipelineRegistry.size());
             set("activeOffscreenCanvases", g_offscreenCanvases.size());
             set("activeCanvas2DContexts", canvas::canvas2DContextCount());
+
+            auto bridge = g_engine->newObject();
+            for (size_t index = 0; index < g_profiledBridgeMetrics.size(); index++) {
+                const auto& metric = g_profiledBridgeMetrics[index];
+                auto operation = g_engine->newObject();
+                g_engine->setProperty(operation, "calls", g_engine->newNumber((double)metric.calls));
+                g_engine->setProperty(operation, "totalNanoseconds",
+                    g_engine->newNumber((double)metric.totalNanoseconds));
+                g_engine->setProperty(operation, "bytes", g_engine->newNumber((double)metric.bytes));
+                g_engine->setProperty(bridge, kProfiledBridgeOpNames[index], operation);
+            }
+            g_engine->setProperty(result, "profiledBridge", bridge);
             return result;
         })
     );

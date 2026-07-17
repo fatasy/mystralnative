@@ -56,7 +56,7 @@ describe("Triangle Rendering", () => {
     expect(stdout).toContain("Pipeline created");
     expect(stdout).toContain("Render loop started");
 
-    // Should not have WebGPU errors (ignore QuickJS GC assertion)
+    // Should not have WebGPU errors
     expect(stderr).not.toContain("WebGPU error");
   }, 30000);
 
