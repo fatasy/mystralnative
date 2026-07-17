@@ -499,21 +499,6 @@ jobs:
         shell: bash
         run: ./build/Release/mystral.exe --version || echo "Build complete"
 
-      - name: Stage DXC runtime
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force artifacts | Out-Null
-          $sdkRoot = Join-Path ${env:ProgramFiles(x86)} "Windows Kits\10\bin"
-          $dxcompiler = Get-ChildItem $sdkRoot -Recurse -Filter dxcompiler.dll |
-            Where-Object { $_.DirectoryName -like '*\x64' } |
-            Sort-Object FullName -Descending |
-            Select-Object -First 1
-          if (-not $dxcompiler) {
-            throw "Windows SDK DXC runtime was not found under $sdkRoot"
-          }
-          Copy-Item $dxcompiler.FullName artifacts\dxcompiler.dll
-          Copy-Item (Join-Path $dxcompiler.DirectoryName 'dxil.dll') artifacts\dxil.dll
-
       - name: Package artifacts
         shell: bash
         run: |
