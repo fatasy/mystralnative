@@ -25,15 +25,21 @@
     "bundle": "node scripts/bundle.mjs",
     "prebundle": "bun scripts/prebundle.ts",
     "bundle:examples": "bun scripts/bundle-examples.ts",
+    "mcp": "bun tools/mystral-mcp-server.ts",
     "package:macos": "node scripts/package-macos.mjs",
     "package:windows": "node scripts/package-windows.mjs",
     "package:linux": "node scripts/package-linux.mjs",
     "test": "bun test tests/ci",
     "test:gpu": "bun test tests/gpu",
+    "test:mcp": "bun test tests/mcp",
     "test:all": "bun test tests"
   },
   "devDependencies": {
     "@anthropic-ai/sdk": "^0.24.0",
     "@types/bun": "^1.1.0"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1",
+    "zod": "^3.25.0"
   }
 }

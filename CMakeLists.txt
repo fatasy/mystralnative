@@ -887,6 +887,7 @@ endif()
 set(MYSTRAL_SOURCES
     src/runtime.cpp
     src/js/engine_factory.cpp
+    src/js/agent_module.cpp
     src/js/module_resolver.cpp
     src/js/module_system.cpp
     src/js/ts_transpiler.cpp

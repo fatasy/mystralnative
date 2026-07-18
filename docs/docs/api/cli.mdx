@@ -131,6 +131,8 @@ bun tools/mystral-debug-client.ts logs --port 9222
 bun tools/mystral-debug-client.ts agent-list --port 9222
 bun tools/mystral-debug-client.ts agent-inspect player --port 9222
 bun tools/mystral-debug-client.ts agent-act player.move '{"x":4,"y":2}' --port 9222
+bun tools/mystral-debug-client.ts metrics --port 9222
+bun tools/mystral-debug-client.ts profile 120 30000 --port 9222
 bun tools/mystral-debug-client.ts quit --port 9222
 ```
 
@@ -176,6 +178,8 @@ an immediate acknowledgement.
 | `agent.list` | Discover exposed entities, actions, descriptions, and input schemas |
 | `agent.inspect` | Read a live JSON-safe snapshot by stable entity ID |
 | `agent.act` | Run an explicitly exposed game action with JSON input |
+| `metrics.snapshot` | Read current runtime and cumulative WebGPU counters |
+| `profile.start` / `profile.stop` | Measure an exact live frame window |
 | `pause` / `resume` | Pause or resume game-frame execution while debug I/O remains available |
 | `stepFrames` | Execute a bounded number of frames and remain paused |
 | `waitForFrame` | Wait asynchronously for an absolute or relative frame with a timeout |
@@ -185,6 +189,32 @@ an immediate acknowledgement.
 The server only listens on `127.0.0.1`. Protocol messages are JSON objects sent
 over WebSocket and use numeric request IDs, allowing multiple clients to reuse
 the same request IDs safely.
+
+### MCP Server
+
+The same protocol is available directly to MCP clients through a local `stdio`
+server. Start the game first, then configure the client to run:
+
+```bash
+bun tools/mystral-mcp-server.ts --port 9222
+```
+
+Or use `bun run mcp -- --port 9222`. The safe default tool set exposes status,
+semantic discovery, bounded scene inspection, camera state and explicitly enabled
+camera actions, game actions, live frame profiling, screenshots, and logs.
+
+Two capabilities require explicit process flags:
+
+```bash
+# Adds pause/resume/step/key press/quit
+bun tools/mystral-mcp-server.ts --port 9222 --allow-control
+
+# Also exposes arbitrary JavaScript evaluation inside the game
+bun tools/mystral-mcp-server.ts --port 9222 --unsafe-evaluate
+```
+
+`MYSTRAL_DEBUG_PORT` can provide the port when `--port` is omitted. The MCP server
+writes only protocol messages to stdout; diagnostics go to stderr.
 
 ## mystral compile
 

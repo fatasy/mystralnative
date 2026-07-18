@@ -1,10 +1,5 @@
 import { Buffer } from "node:buffer";
-
-type ProtocolResponse = {
-  id: number;
-  result?: unknown;
-  error?: { message?: string };
-};
+import { MystralDebugClient } from "./lib/mystral-debug-client";
 
 const args = Bun.argv.slice(2);
 let port = 9222;
@@ -36,61 +31,10 @@ Commands:
   agent-list
   agent-inspect <id> [inputJson]
   agent-act <id> [inputJson]
+  metrics
+  profile [frames] [timeoutMs]
   raw <method> [paramsJson]`);
   process.exit(1);
-}
-
-const socket = new WebSocket(`ws://127.0.0.1:${port}`);
-let nextId = 1;
-const pending = new Map<
-  number,
-  { resolve: (value: unknown) => void; reject: (error: Error) => void }
->();
-
-socket.addEventListener("message", (event) => {
-  const message = JSON.parse(String(event.data)) as ProtocolResponse & { event?: string };
-  if (message.event || typeof message.id !== "number") return;
-  const request = pending.get(message.id);
-  if (!request) return;
-  pending.delete(message.id);
-  if (message.error) {
-    request.reject(new Error(message.error.message || "Debug protocol error"));
-  } else {
-    request.resolve(message.result);
-  }
-});
-
-const opened = new Promise<void>((resolve, reject) => {
-  const timer = setTimeout(() => reject(new Error(`Timed out connecting to debug port ${port}`)), 5000);
-  socket.addEventListener("open", () => {
-    clearTimeout(timer);
-    resolve();
-  });
-  socket.addEventListener("error", () => {
-    clearTimeout(timer);
-    reject(new Error(`Could not connect to ws://127.0.0.1:${port}`));
-  });
-});
-
-function request(method: string, params: Record<string, unknown> = {}): Promise<any> {
-  const id = nextId++;
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
-      pending.delete(id);
-      reject(new Error(`${method} timed out`));
-    }, Number(params.timeoutMs || 10000) + 1000);
-    pending.set(id, {
-      resolve: (value) => {
-        clearTimeout(timer);
-        resolve(value);
-      },
-      reject: (error) => {
-        clearTimeout(timer);
-        reject(error);
-      },
-    });
-    socket.send(JSON.stringify({ id, method, params }));
-  });
 }
 
 function numberArg(value: string | undefined, name: string): number {
@@ -107,7 +51,9 @@ function agentParams(values: string[]): Record<string, unknown> {
   return params;
 }
 
-await opened;
+const client = MystralDebugClient.forPort(port);
+await client.connect();
+const request = client.request.bind(client);
 
 try {
   let result: any;
@@ -181,6 +127,22 @@ try {
     case "agent-act":
       result = await request("agent.act", agentParams(args));
       break;
+    case "metrics":
+      result = await request("metrics.snapshot");
+      break;
+    case "profile": {
+      const frames = numberArg(args[0] || "120", "frames");
+      const timeoutMs = numberArg(args[1] || "30000", "timeoutMs");
+      const started = await request("profile.start", { frames });
+      try {
+        await request("waitForFrame", { frame: started.targetFrame, timeoutMs });
+        result = await request("profile.stop");
+      } catch (error) {
+        try { await request("profile.stop"); } catch {}
+        throw error;
+      }
+      break;
+    }
     case "raw":
       if (!args[0]) throw new Error("raw requires a method");
       result = await request(args[0], args[1] ? JSON.parse(args.slice(1).join(" ")) : {});
@@ -191,5 +153,5 @@ try {
 
   console.log(JSON.stringify(result, null, 2));
 } finally {
-  socket.close();
+  client.close();
 }

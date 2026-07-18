@@ -136,6 +136,23 @@ mystral run benchmarks/runtime-core.js --no-sdl \
 
 The report includes frame-phase percentiles, frame-budget misses, V8 heap snapshots, Worker activity, and native job-system metrics. Keep the script, warmup, measured frame count, build type, and machine unchanged when comparing commits.
 
+### Live MCP Frame Sampling
+
+When a game is running with `--debug-port`, the MCP tool
+`mystral_performance_sample` profiles an exact number of live frames. It returns
+the frame profile, runtime/WebGPU snapshots before and after the window, recursive
+numeric deltas, and the optional `performance.live` semantic snapshot.
+
+```bash
+mystral run game.js --headless --debug-port 9222
+bun tools/mystral-mcp-server.ts --port 9222
+```
+
+This is the preferred path for an agent comparing a specific scene or camera
+state: inspect the semantic scene, request a fixed frame sample, make one explicit
+change, then sample the same number of frames again. Cumulative WebGPU totals are
+included for context; use the returned deltas for the measured window.
+
 ### Native Job-System Streaming Benchmark
 
 Local asset reads made through `fetch()` run on the native priority job system and complete on the main thread. Use the included workload to measure that path:

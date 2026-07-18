@@ -1943,6 +1943,21 @@ private:
         );
 
         jsEngine_->setGlobalProperty("performance", performance);
+
+        jsEngine_->setGlobalProperty("__mystralRuntimeStats",
+            jsEngine_->newFunction("__mystralRuntimeStats", [this](void*, const std::vector<js::JSValueHandle>&) {
+                const auto memory = jsEngine_->getMemoryStats();
+                auto result = jsEngine_->newObject();
+                jsEngine_->setProperty(result, "frame", jsEngine_->newNumber(static_cast<double>(frameCount_)));
+                jsEngine_->setProperty(result, "paused", jsEngine_->newBoolean(paused_));
+                jsEngine_->setProperty(result, "heapUsedBytes", jsEngine_->newNumber(static_cast<double>(memory.heapUsedBytes)));
+                jsEngine_->setProperty(result, "heapTotalBytes", jsEngine_->newNumber(static_cast<double>(memory.heapTotalBytes)));
+                jsEngine_->setProperty(result, "heapLimitBytes", jsEngine_->newNumber(static_cast<double>(memory.heapLimitBytes)));
+                jsEngine_->setProperty(result, "nativeFunctions", jsEngine_->newNumber(static_cast<double>(memory.nativeFunctions)));
+                jsEngine_->setProperty(result, "frameHandles", jsEngine_->newNumber(static_cast<double>(memory.frameHandles)));
+                return result;
+            })
+        );
     }
 
     void setupProcess() {

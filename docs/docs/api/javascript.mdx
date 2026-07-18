@@ -26,6 +26,47 @@ Mystral Native.js implements standard Web APIs for graphics, audio, networking, 
 | TypeScript | Full | Via SWC transpilation |
 | GLTF/GLB Loading | Full | Including Draco mesh compression |
 
+## Semantic Agent Adapters
+
+The built-in `mystral/agent` module exposes bounded, JSON-safe views of a live
+game to the debug protocol and MCP server. The generic adapters work with any
+engine; `exposeThree()` supplies scene, camera, and performance adapters for
+Three.js-compatible objects without adding a Three.js dependency to the runtime.
+
+```javascript
+import { exposeThree } from "mystral/agent";
+
+const agentIntegration = exposeThree({
+  scene,
+  camera,
+  renderer,
+  allowCameraMutations: true,
+  allowSceneMutations: false,
+  gameMetrics: () => ({ enemies: enemies.length, score })
+});
+```
+
+For IDs that remain stable across runs, set `object.userData.agentId` on important
+scene objects. Three.js UUIDs and generated IDs are accepted as fallbacks but are
+reported with `stability: "session"`.
+
+The default semantic entities are:
+
+| Entity | Contents |
+|--------|----------|
+| `scene.main` | Paginated scene nodes, bounded by `depth` (0-8) and `limit` (1-500) |
+| `scene.node` | One scene node selected by stable ID |
+| `camera.active` | Active camera transform and projection settings |
+| `performance.live` | Runtime heap/frame data, WebGPU counters, renderer data, and game metrics |
+
+Scene mutation is only registered when `allowSceneMutations` is true. Camera
+transform, look-at, and entity-focus actions are only registered when
+`allowCameraMutations` is true. Keep both disabled for read-only agent sessions.
+
+For a custom renderer, compose `exposeScene()`, `exposeCamera()`, and
+`exposePerformance()` with synchronous snapshot/action functions. Each adapter
+returns a `dispose()` function that removes its registrations.
+
 ## WebGPU
 
 Full WebGPU API implementation via Dawn or wgpu-native.

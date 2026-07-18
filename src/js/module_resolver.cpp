@@ -1,5 +1,6 @@
 #include "mystral/js/module_resolver.h"
 
+#include "mystral/js/agent_module.h"
 #include "mystral/vfs/embedded_bundle.h"
 #include <algorithm>
 #include <cctype>
@@ -77,6 +78,11 @@ bool ModuleResolver::resolve(const std::string& specifier,
         out.format = ModuleFormat::ESM;
         return true;
     }
+    if (normalized == "mystral/agent" || normalized == "mystral:agent") {
+        out.resolved = {"mystral:agent", true};
+        out.format = ModuleFormat::ESM;
+        return true;
+    }
 
     if (normalized[0] == '#') {
         return resolveImports(normalized, referrer, mode, out, error);
@@ -116,6 +122,11 @@ bool ModuleResolver::resolveResolvedPath(const std::string& resolvedPath,
     }
     if (normalized == "mystral:worker-pool") {
         out.resolved = {"mystral:worker-pool", true};
+        out.format = ModuleFormat::ESM;
+        return true;
+    }
+    if (normalized == "mystral:agent") {
+        out.resolved = {"mystral:agent", true};
         out.format = ModuleFormat::ESM;
         return true;
     }
@@ -590,6 +601,10 @@ bool ModuleResolver::readFile(const ResolvedPath& path, std::string& out, std::s
             "export const transferResult = api.transferResult;\n"
             "export const deterministicPartitions = api.deterministicPartitions;\n"
             "export default api;\n";
+        return true;
+    }
+    if (path.path == "mystral:agent") {
+        out = getAgentModuleSource();
         return true;
     }
     if (path.isBundle) {

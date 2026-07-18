@@ -1609,6 +1609,8 @@ int runScript(const CLIOptions& opts) {
     std::vector<PendingFrameWait> pendingFrameWaits;
     uint64_t nextLogSequence = 1;
     int quitDelayPolls = -1;
+    bool debugProfilerActive = false;
+    uint64_t debugProfileExpectedFrames = 0;
     constexpr size_t maxDebugLogs = 1000;
 
     auto runtime = mystral::Runtime::create(config);
@@ -2022,7 +2024,7 @@ int runScript(const CLIOptions& opts) {
                             std::string(mystral::getVersion()) +
                             "\",\"agentBridgeVersion\":1,\"methods\":[\"screenshot\",\"keyboard\",\"mouse\",\"gamepad\","
                             "\"getFrameCount\",\"evaluate\",\"getLogs\",\"waitForFrame\",\"pause\",\"resume\",\"stepFrames\",\"quit\","
-                            "\"agent.list\",\"agent.inspect\",\"agent.act\"]}";
+                            "\"agent.list\",\"agent.inspect\",\"agent.act\",\"profile.start\",\"profile.stop\",\"metrics.snapshot\"]}";
                     }
 
                     // Handle getFrameCount
@@ -2054,6 +2056,47 @@ int runScript(const CLIOptions& opts) {
                         uint64_t targetFrame = runtime->getFrameCount() + static_cast<uint64_t>(count);
                         runtime->stepFrames(static_cast<uint32_t>(count));
                         return "{\"targetFrame\":" + std::to_string(targetFrame) + ",\"paused\":true}";
+                    }
+
+                    if (method == "profile.start") {
+                        if (debugProfilerActive) {
+                            return fail("A runtime profile is already active");
+                        }
+                        const double framesValue = extractJsonNumber(params, "frames", 120);
+                        if (framesValue < 1 || framesValue > 3600 ||
+                            framesValue != static_cast<uint64_t>(framesValue)) {
+                            return fail("frames must be an integer between 1 and 3600");
+                        }
+                        debugProfileExpectedFrames = static_cast<uint64_t>(framesValue);
+                        runtime->startProfiler(debugProfileExpectedFrames);
+                        debugProfilerActive = true;
+                        uint64_t startFrame = runtime->getFrameCount();
+                        return "{\"startFrame\":" + std::to_string(startFrame) +
+                            ",\"targetFrame\":" + std::to_string(startFrame + debugProfileExpectedFrames) + "}";
+                    }
+
+                    if (method == "profile.stop") {
+                        if (!debugProfilerActive) {
+                            return fail("No runtime profile is active");
+                        }
+                        const mystral::RuntimeProfileReport report = runtime->stopProfiler();
+                        debugProfilerActive = false;
+                        return makeBenchmarkJson(
+                            report,
+                            static_cast<int>(debugProfileExpectedFrames),
+                            0,
+                            opts.scriptPath,
+                            "null");
+                    }
+
+                    if (method == "metrics.snapshot") {
+                        mystral::EvaluationResult evaluation = runtime->evaluateExpression(
+                            "({runtime:globalThis.__mystralRuntimeStats?.() ?? null,"
+                            "webgpu:globalThis.__mystralWebGpuStats?.() ?? null})");
+                        if (!evaluation.success) {
+                            return fail(evaluation.error);
+                        }
+                        return evaluation.valueJson;
                     }
 
                     // Handle screenshot
