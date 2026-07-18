@@ -895,6 +895,9 @@ set(MYSTRAL_SOURCES
     src/workers/worker_registry.cpp
     src/webgpu/bindings.cpp
     src/webgpu/context.cpp
+    src/webgpu/context_device_helpers.cpp
+    src/webgpu/context_surface.cpp
+    src/webgpu/context_capture.cpp
     src/canvas/canvas.cpp
     src/canvas/canvas2d.cpp
     src/canvas/canvas2d_bindings.cpp
@@ -927,6 +930,8 @@ if(MYSTRAL_USE_RAYTRACING)
     list(APPEND MYSTRAL_SOURCES
         src/raytracing/rt_common.cpp
         src/raytracing/bindings.cpp
+        src/raytracing/bindings_geometry.cpp
+        src/raytracing/bindings_scene.cpp
     )
 
     # Add Vulkan RT backend if Vulkan is available

@@ -19,7 +19,9 @@
  */
 
 #include "mystral/js/engine.h"
+#include <algorithm>
 #include <array>
+#include <cstring>
 #include <cstdlib>
 #include <iostream>
 #include <vector>
@@ -298,6 +300,7 @@ enum class ProfiledBridgeOp : size_t {
     BeginComputePass,
     FinishCommandEncoder,
     QueueSubmit,
+    NativeQueueSubmit,
     QueueWriteBuffer,
     QueueWriteBufferBatch,
     QueueWriteTexture,
@@ -331,6 +334,7 @@ static constexpr std::array<const char*, static_cast<size_t>(ProfiledBridgeOp::C
         "beginComputePass",
         "finishCommandEncoder",
         "queueSubmit",
+        "nativeQueueSubmit",
         "queueWriteBuffer",
         "queueWriteBufferBatch",
         "queueWriteTexture",
@@ -372,6 +376,240 @@ private:
 
 static void recordBridgeBytes(ProfiledBridgeOp operation, uint64_t bytes) {
     g_profiledBridgeMetrics[static_cast<size_t>(operation)].bytes += bytes;
+}
+
+// Three.js finishes many independent command buffers per animation frame. The
+// browser WebGPU API preserves queue.writeBuffer ordering between those submits,
+// so deferring only the command buffers would make earlier passes observe later
+// uniform data. Keep an ordered stream of upload batches and command buffers,
+// convert buffer writes to staging-buffer copies, then submit the whole stream
+// once at the end of the native frame.
+struct DeferredBufferCopy {
+    WGPUBuffer destination = nullptr;
+    uint64_t destinationOffset = 0;
+    uint64_t sourceOffset = 0;
+    uint64_t size = 0;
+};
+
+struct DeferredQueueWork {
+    enum class Kind {
+        BufferCopies,
+        CommandBuffers,
+    };
+
+    Kind kind = Kind::CommandBuffers;
+    std::vector<DeferredBufferCopy> bufferCopies;
+    std::vector<WGPUCommandBuffer> commandBuffers;
+};
+
+static bool g_dawnFrameActive = false;
+static std::vector<DeferredQueueWork> g_deferredQueueWork;
+static std::vector<uint8_t> g_deferredUploadBytes;
+static std::unordered_set<WGPUBuffer> g_deferredUploadBuffers;
+static uint64_t g_nativeQueueSubmits = 0;
+static uint64_t g_nativeCommandBuffersSubmitted = 0;
+static uint64_t g_nativeQueueSubmitNanoseconds = 0;
+static uint64_t g_deferredUploadCommandBuffers = 0;
+static uint64_t g_forcedFrameFlushes = 0;
+static uint64_t g_maxCommandBuffersPerNativeSubmit = 0;
+
+static uint64_t alignToCopyOffset(uint64_t value) {
+    return (value + 3u) & ~uint64_t(3u);
+}
+
+static void recordNativeSubmit(const std::vector<WGPUCommandBuffer>& commandBuffers) {
+    if (!g_queue || commandBuffers.empty()) return;
+    const auto startedAt = std::chrono::steady_clock::now();
+    wgpuQueueSubmit(g_queue, commandBuffers.size(), commandBuffers.data());
+    const auto elapsed = std::chrono::steady_clock::now() - startedAt;
+    g_nativeQueueSubmits++;
+    g_nativeCommandBuffersSubmitted += commandBuffers.size();
+    g_maxCommandBuffersPerNativeSubmit = std::max<uint64_t>(
+        g_maxCommandBuffersPerNativeSubmit, commandBuffers.size());
+    g_nativeQueueSubmitNanoseconds += static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count());
+    auto& metric = g_profiledBridgeMetrics[static_cast<size_t>(ProfiledBridgeOp::NativeQueueSubmit)];
+    metric.calls++;
+    metric.totalNanoseconds += static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count());
+}
+
+static void releaseDeferredCommandBuffers() {
+    for (auto& work : g_deferredQueueWork) {
+        for (auto commandBuffer : work.commandBuffers) {
+            if (commandBuffer) wgpuCommandBufferRelease(commandBuffer);
+        }
+    }
+}
+
+static void clearDeferredQueueWork() {
+    for (auto buffer : g_deferredUploadBuffers) {
+        wgpuBufferRelease(buffer);
+    }
+    g_deferredUploadBuffers.clear();
+    g_deferredQueueWork.clear();
+    g_deferredUploadBytes.clear();
+}
+
+static void fallbackFlushDeferredQueueWork() {
+    // Allocation failure must not change queue ordering. Fall back to the old
+    // write/submit sequence for this flush rather than submitting corrupt data.
+    for (auto& work : g_deferredQueueWork) {
+        if (work.kind == DeferredQueueWork::Kind::BufferCopies) {
+            for (const auto& copy : work.bufferCopies) {
+                wgpuQueueWriteBuffer(g_queue, copy.destination, copy.destinationOffset,
+                    g_deferredUploadBytes.data() + copy.sourceOffset, copy.size);
+            }
+            continue;
+        }
+
+        recordNativeSubmit(work.commandBuffers);
+        for (auto commandBuffer : work.commandBuffers) {
+            if (commandBuffer) wgpuCommandBufferRelease(commandBuffer);
+        }
+    }
+    clearDeferredQueueWork();
+}
+
+static void flushDeferredQueueWork() {
+    if (g_deferredQueueWork.empty()) return;
+    if (!g_queue || !g_device) {
+        releaseDeferredCommandBuffers();
+        clearDeferredQueueWork();
+        return;
+    }
+
+    WGPUBuffer stagingBuffer = nullptr;
+    if (!g_deferredUploadBytes.empty()) {
+        WGPUBufferDescriptor stagingDescriptor = {};
+        stagingDescriptor.size = alignToCopyOffset(g_deferredUploadBytes.size());
+        stagingDescriptor.usage = WGPUBufferUsage_MapWrite | WGPUBufferUsage_CopySrc;
+        stagingDescriptor.mappedAtCreation = true;
+        stagingBuffer = wgpuDeviceCreateBuffer(g_device, &stagingDescriptor);
+
+        void* mapped = stagingBuffer
+            ? wgpuBufferGetMappedRange(stagingBuffer, 0, stagingDescriptor.size)
+            : nullptr;
+        if (!mapped) {
+            if (stagingBuffer) wgpuBufferRelease(stagingBuffer);
+            fallbackFlushDeferredQueueWork();
+            return;
+        }
+
+        std::memcpy(mapped, g_deferredUploadBytes.data(), g_deferredUploadBytes.size());
+        wgpuBufferUnmap(stagingBuffer);
+    }
+
+    std::vector<WGPUCommandBuffer> submissionBuffers;
+    std::vector<WGPUCommandBuffer> uploadCommandBuffers;
+    bool encodingFailed = false;
+
+    for (const auto& work : g_deferredQueueWork) {
+        if (work.kind == DeferredQueueWork::Kind::CommandBuffers) {
+            submissionBuffers.insert(submissionBuffers.end(),
+                work.commandBuffers.begin(), work.commandBuffers.end());
+            continue;
+        }
+
+        WGPUCommandEncoderDescriptor encoderDescriptor = {};
+        WGPUCommandEncoder encoder = wgpuDeviceCreateCommandEncoder(g_device, &encoderDescriptor);
+        if (!encoder) {
+            encodingFailed = true;
+            break;
+        }
+
+        for (const auto& copy : work.bufferCopies) {
+            wgpuCommandEncoderCopyBufferToBuffer(encoder,
+                stagingBuffer, copy.sourceOffset,
+                copy.destination, copy.destinationOffset,
+                copy.size);
+        }
+
+        WGPUCommandBufferDescriptor commandBufferDescriptor = {};
+        WGPUCommandBuffer commandBuffer = wgpuCommandEncoderFinish(encoder, &commandBufferDescriptor);
+        wgpuCommandEncoderRelease(encoder);
+        if (!commandBuffer) {
+            encodingFailed = true;
+            break;
+        }
+
+        uploadCommandBuffers.push_back(commandBuffer);
+        submissionBuffers.push_back(commandBuffer);
+        g_deferredUploadCommandBuffers++;
+    }
+
+    if (encodingFailed) {
+        for (auto commandBuffer : uploadCommandBuffers) {
+            wgpuCommandBufferRelease(commandBuffer);
+        }
+        if (stagingBuffer) wgpuBufferRelease(stagingBuffer);
+        fallbackFlushDeferredQueueWork();
+        return;
+    }
+
+    recordNativeSubmit(submissionBuffers);
+    releaseDeferredCommandBuffers();
+    for (auto commandBuffer : uploadCommandBuffers) {
+        wgpuCommandBufferRelease(commandBuffer);
+    }
+    if (stagingBuffer) wgpuBufferRelease(stagingBuffer);
+    clearDeferredQueueWork();
+}
+
+static void deferCommandBuffers(std::vector<WGPUCommandBuffer>&& commandBuffers) {
+    if (commandBuffers.empty()) return;
+    if (!g_dawnFrameActive) {
+        recordNativeSubmit(commandBuffers);
+        for (auto commandBuffer : commandBuffers) {
+            wgpuCommandBufferRelease(commandBuffer);
+        }
+        return;
+    }
+
+    if (!g_deferredQueueWork.empty() &&
+        g_deferredQueueWork.back().kind == DeferredQueueWork::Kind::CommandBuffers) {
+        auto& destination = g_deferredQueueWork.back().commandBuffers;
+        destination.insert(destination.end(), commandBuffers.begin(), commandBuffers.end());
+        return;
+    }
+
+    DeferredQueueWork work;
+    work.kind = DeferredQueueWork::Kind::CommandBuffers;
+    work.commandBuffers = std::move(commandBuffers);
+    g_deferredQueueWork.push_back(std::move(work));
+}
+
+static void writeOrDeferQueueBuffer(WGPUBuffer buffer, uint64_t offset,
+                                    const void* data, size_t size) {
+    if (!buffer || !g_queue || !data || size == 0) return;
+
+    // Valid WebGPU writeBuffer calls are 4-byte aligned. Preserve invalid-call
+    // behavior through the native API instead of encoding an invalid copy.
+    if (!g_dawnFrameActive || (offset & 3u) != 0 || (size & 3u) != 0) {
+        if (g_dawnFrameActive && !g_deferredQueueWork.empty()) {
+            g_forcedFrameFlushes++;
+            flushDeferredQueueWork();
+        }
+        wgpuQueueWriteBuffer(g_queue, buffer, offset, data, size);
+        return;
+    }
+
+    const uint64_t sourceOffset = alignToCopyOffset(g_deferredUploadBytes.size());
+    g_deferredUploadBytes.resize(static_cast<size_t>(sourceOffset + size));
+    std::memcpy(g_deferredUploadBytes.data() + sourceOffset, data, size);
+    if (g_deferredUploadBuffers.insert(buffer).second) {
+        wgpuBufferAddRef(buffer);
+    }
+
+    if (g_deferredQueueWork.empty() ||
+        g_deferredQueueWork.back().kind != DeferredQueueWork::Kind::BufferCopies) {
+        DeferredQueueWork work;
+        work.kind = DeferredQueueWork::Kind::BufferCopies;
+        g_deferredQueueWork.push_back(std::move(work));
+    }
+
+    g_deferredQueueWork.back().bufferCopies.push_back(
+        {buffer, offset, sourceOffset, static_cast<uint64_t>(size)});
 }
 
 static bool writeQueueBuffer(js::JSValueHandle bufferHandle,
@@ -436,7 +674,7 @@ static bool writeQueueBuffer(js::JSValueHandle bufferHandle,
     }
 
     if (buffer && g_queue) {
-        wgpuQueueWriteBuffer(g_queue, buffer, offset,
+        writeOrDeferQueueBuffer(buffer, offset,
             (uint8_t*)basePtr + viewByteOffset + dataOffsetBytes, writeSize);
         recordBridgeBytes(operation, writeSize);
     }
@@ -573,6 +811,29 @@ static void releaseTexture(uint64_t id, bool destroy) {
         wgpuTextureRelease(it->second.texture);
     }
     g_textureRegistry.erase(it);
+}
+
+static void presentSurfaceIfReady() {
+    if (!g_surface || !g_currentTexture || !g_surfaceRenderPassEnded) return;
+
+    if (g_verboseLogging) std::cout << "[WebGPU] Presenting surface" << std::endl;
+    wgpuSurfacePresent(g_surface);
+
+    g_surfaceRenderEncoder = nullptr;
+    g_surfaceRenderPassEnded = false;
+    g_screenshotCapturedThisFrame = false;
+
+    if (g_currentTextureView) {
+        wgpuTextureViewRelease(g_currentTextureView);
+        g_currentTextureView = nullptr;
+    }
+
+    if (g_currentTextureId != 0) {
+        releaseTexture(g_currentTextureId, false);
+        g_currentTextureId = 0;
+    }
+    g_currentTexture = nullptr;
+    g_currentViewSourceTexture = nullptr;
 }
 
 static void releaseRenderPipeline(uint64_t id) {
@@ -1416,6 +1677,7 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
                             // Get array length
                             auto lengthProp = g_engine->getProperty(cmdBuffersArray, "length");
                             int length = (int)g_engine->toNumber(lengthProp);
+                            g_engine->releaseValue(lengthProp);
 
                             // Collect command buffers
                             std::vector<WGPUCommandBuffer> cmdBuffers;
@@ -1425,26 +1687,28 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
                                 if (cmdBuffer) {
                                     cmdBuffers.push_back(cmdBuffer);
                                 }
+                                g_engine->releaseValue(cmdBufferHandle);
                             }
 
-                            // Submit user command buffers first
+                            // Preserve each logical submit boundary in the ordered work stream.
+                            // beginDawnFrame/endDawnFrame collapse that stream into one native
+                            // wgpuQueueSubmit while buffer uploads remain correctly interleaved.
                             static int submitCount = 0;
                             submitCount++;
                             if (!cmdBuffers.empty() && g_queue) {
-                                wgpuQueueSubmit(g_queue, cmdBuffers.size(), cmdBuffers.data());
-                                // Release command buffers after submission (they're consumed by submit)
-                                for (auto cmdBuf : cmdBuffers) {
-                                    wgpuCommandBufferRelease(cmdBuf);
-                                }
-                                // Tick to flush GPU work
+                                const size_t commandBufferCount = cmdBuffers.size();
+                                const bool submittedImmediately = !g_dawnFrameActive;
+                                deferCommandBuffers(std::move(cmdBuffers));
+                                if (submittedImmediately) {
 #if defined(MYSTRAL_WEBGPU_DAWN)
-                                wgpuDeviceTick(g_device);
+                                    wgpuDeviceTick(g_device);
 #elif defined(MYSTRAL_WEBGPU_WGPU)
-                                wgpuDevicePoll(g_device, false, nullptr);
+                                    wgpuDevicePoll(g_device, false, nullptr);
 #endif
-                                if (g_verboseLogging) std::cout << "[WebGPU] Submit #" << submitCount << ": " << cmdBuffers.size() << " command buffers, g_currentTexture=" << (void*)g_currentTexture << std::endl;
+                                }
+                                if (g_verboseLogging) std::cout << "[WebGPU] Logical submit #" << submitCount << ": " << commandBufferCount << " command buffers, g_currentTexture=" << (void*)g_currentTexture << std::endl;
                             } else {
-                                if (g_verboseLogging) std::cout << "[WebGPU] Submit #" << submitCount << ": EMPTY (length=" << length << "), g_currentTexture=" << (void*)g_currentTexture << std::endl;
+                                if (g_verboseLogging) std::cout << "[WebGPU] Logical submit #" << submitCount << ": EMPTY (length=" << length << "), g_currentTexture=" << (void*)g_currentTexture << std::endl;
                             }
 
                             // Copy texture to screenshot buffer ONLY when about to present
@@ -1500,21 +1764,24 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
 
                                 WGPUCommandBufferDescriptor cmdDesc = {};
                                 WGPUCommandBuffer copyCmd = wgpuCommandEncoderFinish(copyEncoder, &cmdDesc);
-                                wgpuQueueSubmit(g_queue, 1, &copyCmd);
-
-                                wgpuCommandBufferRelease(copyCmd);
                                 wgpuCommandEncoderRelease(copyEncoder);
+                                if (copyCmd) {
+                                    std::vector<WGPUCommandBuffer> screenshotCommands = {copyCmd};
+                                    deferCommandBuffers(std::move(screenshotCommands));
+                                }
 
-                                // Wait for GPU work to complete before present
-                                // This ensures the screenshot copy finishes before the texture is released
-                                for (int syncIter = 0; syncIter < 100; syncIter++) {
+                                // Outside the animation-frame scope, retain the previous eager
+                                // completion behavior. Normal frames flush this copy in endDawnFrame.
+                                if (!g_dawnFrameActive) {
+                                    for (int syncIter = 0; syncIter < 100; syncIter++) {
 #if defined(MYSTRAL_WEBGPU_DAWN)
-                                    wgpuDeviceTick(g_device);
+                                        wgpuDeviceTick(g_device);
 #elif defined(MYSTRAL_WEBGPU_WGPU)
-                                    wgpuDevicePoll(g_device, false, nullptr);
+                                        wgpuDevicePoll(g_device, false, nullptr);
 #endif
-                                    if (g_instance) {
-                                        wgpuInstanceProcessEvents(g_instance);
+                                        if (g_instance) {
+                                            wgpuInstanceProcessEvents(g_instance);
+                                        }
                                     }
                                 }
 
@@ -1522,33 +1789,7 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
                                 g_screenshotCapturedThisFrame = true;
                             }
 
-                            // Present the surface only if:
-                            // 1. We have a current texture
-                            // 2. The surface render pass has been ended (commands submitted)
-                            // This prevents presenting before the render commands are in this submit
-                            if (g_surface && g_currentTexture && g_surfaceRenderPassEnded) {
-                                if (g_verboseLogging) std::cout << "[WebGPU] Presenting surface" << std::endl;
-                                wgpuSurfacePresent(g_surface);
-
-                                // Reset surface render tracking for next frame
-                                g_surfaceRenderEncoder = nullptr;
-                                g_surfaceRenderPassEnded = false;
-                                g_screenshotCapturedThisFrame = false;
-
-                                // Release the texture view if we created one
-                                if (g_currentTextureView) {
-                                    wgpuTextureViewRelease(g_currentTextureView);
-                                    g_currentTextureView = nullptr;
-                                }
-
-                                // Null out the textures since they're now invalid after present
-                                if (g_currentTextureId != 0) {
-                                    releaseTexture(g_currentTextureId, false);
-                                    g_currentTextureId = 0;
-                                }
-                                g_currentTexture = nullptr;
-                                g_currentViewSourceTexture = nullptr;
-                            }
+                            if (!g_dawnFrameActive) presentSurfaceIfReady();
 
                             return g_engine->newUndefined();
                         })
@@ -1722,7 +1963,12 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
 
                             WGPUExtent3D copySize = {width, height, depthOrArrayLayers};
 
-                            // Write texture
+                            // Queue texture writes remain native queue operations. Flush earlier
+                            // deferred work so their ordering relative to command buffers is exact.
+                            if (g_dawnFrameActive && !g_deferredQueueWork.empty()) {
+                                g_forcedFrameFlushes++;
+                                flushDeferredQueueWork();
+                            }
                             wgpuQueueWriteTexture(g_queue, &destCopy, (uint8_t*)dataPtr + layoutOffset, dataSize - layoutOffset, &layout, &copySize);
                             recordBridgeBytes(ProfiledBridgeOp::QueueWriteTexture, dataSize - layoutOffset);
 
@@ -1963,6 +2209,10 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
 
                             WGPUExtent3D copySize = {width, height, depthOrArrayLayers};
 
+                            if (g_dawnFrameActive && !g_deferredQueueWork.empty()) {
+                                g_forcedFrameFlushes++;
+                                flushDeferredQueueWork();
+                            }
                             wgpuQueueWriteTexture(g_queue, &destCopy, uploadDataPtr, dataSize, &layout, &copySize);
 
                             if (g_verboseLogging) std::cout << "[WebGPU] copyExternalImageToTexture: " << width << "x" << height << (flipY ? " (flipY)" : "") << std::endl;
@@ -1974,6 +2224,10 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
                     // queue.onSubmittedWorkDone() - returns Promise that resolves when GPU work is done
                     g_engine->setProperty(queue, "onSubmittedWorkDone",
                         g_engine->newFunction("onSubmittedWorkDone", [](void* ctx, const std::vector<js::JSValueHandle>& args) {
+                            if (g_dawnFrameActive && !g_deferredQueueWork.empty()) {
+                                g_forcedFrameFlushes++;
+                                flushDeferredQueueWork();
+                            }
                             // For now, return a Promise that resolves immediately
                             // Dawn's wgpuQueueOnSubmittedWorkDone is callback-based, which is complex to integrate
                             // Since we're running single-threaded and submit() is synchronous, work is already done
@@ -2079,6 +2333,15 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
                                     // Debug: Log buffer info
                                     bool hasMapRead = (bufferInfo.usage & WGPUBufferUsage_MapRead) != 0;
                                     (void)hasMapRead;  // Used for debug logging when enabled
+
+                                    // mapAsync is an execution boundary: submitting a command
+                                    // buffer that references a buffer after mapping has started is
+                                    // invalid. Readbacks therefore become an intentional extra
+                                    // native submit instead of waiting for endDawnFrame.
+                                    if (g_dawnFrameActive && !g_deferredQueueWork.empty()) {
+                                        g_forcedFrameFlushes++;
+                                        flushDeferredQueueWork();
+                                    }
 
                                     // Ensure all pending GPU work is processed before attempting to map
                                     // This is critical for buffers that were just used in a copy operation
@@ -2218,6 +2481,10 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
                             // Capture bufferId in closure to identify the correct buffer
                             g_engine->setProperty(jsBuffer, "destroy",
                                 g_engine->newFunction("destroy", [bufferId](void* ctx, const std::vector<js::JSValueHandle>& args) {
+                                    if (g_dawnFrameActive && !g_deferredQueueWork.empty()) {
+                                        g_forcedFrameFlushes++;
+                                        flushDeferredQueueWork();
+                                    }
                                     releaseBuffer(bufferId, true);
                                     return g_engine->newUndefined();
                                 })
@@ -3998,6 +4265,10 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
                             // texture.destroy()
                             g_engine->setProperty(jsTexture, "destroy",
                                 g_engine->newFunction("destroy", [textureId](void* ctx, const std::vector<js::JSValueHandle>& args) {
+                                    if (g_dawnFrameActive && !g_deferredQueueWork.empty()) {
+                                        g_forcedFrameFlushes++;
+                                        flushDeferredQueueWork();
+                                    }
                                     releaseTexture(textureId, true);
                                     return g_engine->newUndefined();
                                 })
@@ -5349,6 +5620,12 @@ globalThis.OffscreenCanvas = OffscreenCanvas;
             set("renderPassesCreated", g_renderPassesCreated);
             set("computePassesCreated", g_computePassesCreated);
             set("commandBuffersCreated", g_commandBuffersCreated);
+            set("nativeQueueSubmits", g_nativeQueueSubmits);
+            set("nativeCommandBuffersSubmitted", g_nativeCommandBuffersSubmitted);
+            set("nativeQueueSubmitNanoseconds", g_nativeQueueSubmitNanoseconds);
+            set("deferredUploadCommandBuffers", g_deferredUploadCommandBuffers);
+            set("forcedFrameFlushes", g_forcedFrameFlushes);
+            set("maxCommandBuffersPerNativeSubmit", g_maxCommandBuffersPerNativeSubmit);
             set("activeCommandEncoders", g_liveCommandEncoders.size());
             set("activeRenderPasses", g_liveRenderPasses.size());
             set("activeComputePasses", g_liveComputePasses.size());
@@ -5445,12 +5722,19 @@ void setOffscreenTexture(void* texture, void* textureView) {
 }
 
 void beginDawnFrame() {
-    // No-op: Dawn resource cleanup is handled by V8 weak callbacks
-    // via Engine::registerRelease() — resources are released when
-    // their JS wrapper objects are garbage collected.
+    // A stale stream means the previous frame exited unusually. Submit it
+    // before opening the new frame so queue ordering is never crossed.
+    if (!g_deferredQueueWork.empty()) {
+        g_forcedFrameFlushes++;
+        flushDeferredQueueWork();
+    }
+    g_dawnFrameActive = true;
 }
 
 void releaseReloadResources() {
+    if (!g_deferredQueueWork.empty()) flushDeferredQueueWork();
+    g_dawnFrameActive = false;
+
     // A full bundle reload has no live application session. Release the
     // registry-owned resources now instead of waiting for library-level JS
     // caches to become collectible. Weak callbacks use the same registries,
@@ -5838,6 +6122,12 @@ void invokeVideoCaptureCallback(WGPUTexture texture, uint32_t width, uint32_t he
 void endDawnFrame() {
     // Composite Canvas 2D content to WebGPU if the main canvas uses 2D context
     compositeCanvas2DToWebGPU();
+
+    // Preserve all Three.js pass boundaries inside the command-buffer array,
+    // but cross the actual Dawn queue only once for the normal WebGPU frame.
+    flushDeferredQueueWork();
+    g_dawnFrameActive = false;
+    presentSurfaceIfReady();
 
     // Tick the WebGPU device to process completed GPU work and free internal
     // resources (staging buffers, command encoder state, etc.). Without this,
