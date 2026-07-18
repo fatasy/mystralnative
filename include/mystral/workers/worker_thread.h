@@ -43,7 +43,8 @@ enum class WorkerPostStatus {
 
 struct WorkerQueueLimits {
     size_t maxMessages = 1024;
-    size_t maxBytes = 16 * 1024 * 1024;
+    size_t maxMessageBytes = 16 * 1024 * 1024;
+    size_t maxQueuedBytes = 64 * 1024 * 1024;
 };
 
 struct WorkerThreadStats {
@@ -53,12 +54,18 @@ struct WorkerThreadStats {
     uint64_t busyNanoseconds = 0;
     uint64_t rejectedInputMessages = 0;
     uint64_t rejectedOutputMessages = 0;
+    uint64_t rejectedInputTooLarge = 0;
+    uint64_t rejectedInputQueueFull = 0;
+    uint64_t rejectedOutputTooLarge = 0;
+    uint64_t rejectedOutputQueueFull = 0;
     size_t queuedInputMessages = 0;
     size_t queuedInputBytes = 0;
     size_t queuedOutputMessages = 0;
     size_t queuedOutputBytes = 0;
     size_t peakQueuedInputBytes = 0;
     size_t peakQueuedOutputBytes = 0;
+    size_t largestInputMessageBytes = 0;
+    size_t largestOutputMessageBytes = 0;
 };
 
 struct WorkerMessage {
@@ -153,6 +160,12 @@ private:
     std::atomic<uint64_t> busyNanoseconds_{0};
     std::atomic<uint64_t> rejectedInputMessages_{0};
     std::atomic<uint64_t> rejectedOutputMessages_{0};
+    std::atomic<uint64_t> rejectedInputTooLarge_{0};
+    std::atomic<uint64_t> rejectedInputQueueFull_{0};
+    std::atomic<uint64_t> rejectedOutputTooLarge_{0};
+    std::atomic<uint64_t> rejectedOutputQueueFull_{0};
+    std::atomic<size_t> largestInputMessageBytes_{0};
+    std::atomic<size_t> largestOutputMessageBytes_{0};
 };
 
 }  // namespace mystral::workers

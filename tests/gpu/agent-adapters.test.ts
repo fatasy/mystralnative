@@ -74,9 +74,17 @@ describe("Semantic agent adapters", () => {
       expect(performance.snapshot.runtime.heapLimitBytes).toBeGreaterThan(0);
 
       const started: any = await client.request("profile.start", { frames: 10 });
-      await client.request("waitForFrame", { frame: started.targetFrame, timeoutMs: 10_000 });
+      // A fixed-size profile must stop collecting at its own bound even if the
+      // controller sends profile.stop a couple of frames late.
+      await client.request("waitForFrame", { frame: started.targetFrame + 2, timeoutMs: 10_000 });
       const profile: any = await client.request("profile.stop");
       expect(profile.sampledFrames).toBe(10);
+      expect(profile.workers.activeStart).toBe(0);
+      expect(profile.workers.activeEnd).toBe(0);
+
+      const metrics: any = await client.request("metrics.snapshot");
+      expect(metrics.value.runtime.workersActive).toBe(0);
+      expect(metrics.value.runtime.sharedMemoryBytes).toBe(0);
 
       await client.request("quit");
     } finally {

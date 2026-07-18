@@ -6,10 +6,12 @@ This document is the implementation guide and architectural contract for Mystral
 
 MystralNative runs the game entry point in one JavaScript engine instance (the **main isolate**). Every `Worker` runs on a real OS thread with its own JavaScript engine instance and its own heap. JavaScript objects, closures, module state, and garbage-collected heaps are never shared between those instances.
 
-Cross-thread communication has two paths:
+Cross-thread communication has three paths:
 
-1. `postMessage` copies JSON-compatible control data through native queues.
-2. A `postMessage` transfer list moves plain `ArrayBuffer` ownership and detaches the sender.
+1. `postMessage` clones a versioned structured subset, including binary views,
+   through bounded native queues.
+2. A `postMessage` transfer list moves plain `ArrayBuffer` ownership and detaches
+   the sender.
 3. `SharedBuffer`, `SharedTable`, and `SharedQueue` expose explicitly shared, typed memory without copying the backing bytes.
 
 ```text
@@ -79,23 +81,62 @@ An internal ready event only marks the main-side `Worker` as ready. It is not em
 
 A Blob or Blob URL is treated as a classic script. A path/URL is treated as a module and is loaded by MystralNative's module resolver. Module imports resolve relative to their referrer. Source paths begin at the runtime root/current working directory.
 
-Do not assume full browser URL or Worker semantics. In particular, `postMessage` is currently JSON-compatible plus explicit `ArrayBuffer` transfers, not the browser structured-clone algorithm.
+Do not assume full browser URL or Worker semantics. `postMessage` implements a
+versioned structured subset for JSON-compatible values, `ArrayBuffer`, TypedArray,
+`DataView`, and shared handles. It is not the complete browser structured-clone
+algorithm.
 
 ## Message contract
 
-Ordinary messages use `JSON.stringify` in the sender and `JSON.parse` in the receiver. They are copied through native queues and therefore must be JSON-compatible.
+Ordinary control values keep JSON semantics. Binary values are encoded as small
+typed metadata records while their backing buffers travel as native attachments;
+TypedArray elements are not expanded into JSON properties.
 
-Each direction is bounded by default to 1,024 queued user messages and 16 MiB per Worker. Input `postMessage()` returns a deterministic native status that the public facade maps to `RangeError` for a full queue or oversized message. Worker-side output uses the same limits and throws inside the Worker when saturated. Messages are never silently added beyond the configured bounds; internal ready/exit lifecycle signals are reserved so saturation cannot hide shutdown.
+Each direction is bounded by default to 1,024 queued user messages, 16 MiB per
+message, and 64 MiB accumulated in the queue. Input `postMessage()` returns a
+deterministic native status that the public facade maps to `RangeError` for a
+full queue or oversized message. Worker-side output uses the same limits and
+throws inside the Worker when saturated. Messages are never silently added
+beyond the configured bounds; internal ready/exit lifecycle signals are reserved
+so saturation cannot hide shutdown.
 
-Supported examples include numbers, strings, booleans, `null`, arrays, plain objects, shared handles, and plain `ArrayBuffer` values listed in the second `postMessage` argument. Functions, cyclic graphs, symbols, prototypes, `undefined` as a complete payload, typed-array views as transfer-list entries, and arbitrary class instances are not supported.
+Limits can be selected per Worker. Values are positive safe integers and one
+message cannot be configured larger than the accumulated queue budget:
+
+```js
+const worker = new Worker('./simulation.worker.mjs', {
+    type: 'module',
+    maxMessages: 64,
+    maxMessageBytes: 256 * 1024 * 1024,
+    maxQueuedBytes: 384 * 1024 * 1024,
+});
+```
+
+Supported examples include numbers, strings, booleans, `null`, arrays, plain
+objects, shared handles, `ArrayBuffer`, every TypedArray constructor available in
+the engine, and `DataView`. Functions, cyclic graphs, symbols, prototypes, and
+`undefined` as a complete payload are not preserved. Transfer-list entries must
+still be plain `ArrayBuffer` objects, not views.
 
 ```js
 const bytes = new ArrayBuffer(1024);
-worker.postMessage({ bytes }, [bytes]);
+const ids = new Uint32Array(bytes, 128, 16);
+const header = new DataView(bytes, 0, 32);
+worker.postMessage({ ids, header }, [bytes]);
 // bytes.byteLength === 0
 ```
 
-The serialized payload contains an indexed transfer marker and the native queue owns the backing bytes until the receiver constructs its local `ArrayBuffer`. Queue byte accounting includes both JSON and transferred bytes. V8 detaches and moves its backing store without copying. Duplicate entries, non-`ArrayBuffer` entries, and buffers already transferred through the public API fail explicitly.
+The receiver reconstructs the view constructor, byte offset, length, and backing
+aliasing. If the backing is in the transfer list, V8 detaches and moves it without
+copying. If it is absent, the sender clones that backing once and keeps the
+original usable; multiple views of the same backing share one clone. Queue byte
+accounting includes both metadata and attached bytes. Duplicate entries,
+non-`ArrayBuffer` entries, and buffers already transferred through the public API
+fail explicitly.
+
+Raw `SharedArrayBuffer` values and views are rejected. Use a `SharedBuffer`,
+`SharedTable`, or `SharedQueue` handle when the same storage must stay accessible
+from multiple isolates.
 
 Shared-memory handles are JSON objects whose underlying buffer marker is:
 
@@ -231,6 +272,30 @@ The virtual `mystral/worker-pool` module exports `WorkerPool`, `exposeWorkerTask
 - A task error rejects the round and terminates the pool.
 - `pool.resizeTable(definition, table, options)` delegates to explicit table migration and rejects while the pool is busy. It cannot guard unrelated Workers, so the global safe-point rule still applies.
 
+`WorkerPool` is currently a **main-isolate API**. Constructing it inside a Worker
+throws `WorkerPool can only be created on the main runtime thread`; Worker
+isolates do not own a nested `WorkerRegistry`. A game that keeps its authoritative
+simulation inside a Worker must therefore stay single-writer there, or place a
+pool on the main isolate and design an explicit authority boundary. Do not move
+authoritative state merely to bypass this restriction.
+
+The intended future topology for a simulation-owned pool is:
+
+```text
+main/render isolate -- commands/projections --> simulation Worker (Game owner)
+                                               | safe point + deterministic round
+                                               v
+                                      WorkerPool child isolates
+                                               |
+                                      SharedTable / optional SPSC queues
+```
+
+Supporting that topology requires a runtime change, not an application
+workaround: child registry ownership, cascade interruption/join, shared-handle
+lifetime, parent/child profiler attribution, and failure propagation must all be
+implemented and tested. Until a measured phase amortizes scheduling and barrier
+cost, the simpler single-writer simulation is the supported choice.
+
 Worker modules install one task handler:
 
 ```js
@@ -249,12 +314,18 @@ Keep the store as the domain API and invariant owner. Replace its private typed-
 
 For a store with fields such as `templateIndices: Uint16Array`, `settlementIds: Uint32Array`, `householdRefs: Uint32Array`, and `birthDays: Int32Array`, the direct schema mapping is `u16`, `u32`, `u32`, and `i32`. Other hot simulation fields can be added when they have a clear owner.
 
-Recommended division of responsibility:
+Recommended division of responsibility for a main-owned simulation:
 
 - Main thread owns entity creation, deletion, packed-reference allocation, render state, and WebGPU resources.
 - Workers read stable identity/liveness metadata and update explicitly assigned row ranges or components.
 - Each mutable region has one writer during a simulation phase.
 - Workers report completion or compact commands through `SharedQueue`/`postMessage`; the main thread applies structural changes at a safe point.
+
+If the game instead owns authoritative state in a simulation Worker, keep entity
+creation, deletion, packed-reference allocation, and structural changes in that
+Worker. The render main isolate still owns WebGPU resources and consumes only
+projections. A pool inside the simulation Worker is the future topology described
+above, not a capability of the current release.
 
 If entity references encode index, generation, or namespace bits, continue validating them through the allocator/store contract. Sharing the underlying arrays must not bypass stale-reference checks.
 
@@ -268,7 +339,8 @@ These rules are part of the implementation contract:
 4. Never resize, release, or replace a region while Workers may still attach to or use it.
 5. Keep rendering and WebGPU ownership on the main thread until a separate, verified graphics-thread contract exists.
 6. Treat `SharedQueue` as SPSC.
-7. Treat messages as JSON-compatible plus explicit plain-`ArrayBuffer` transfers, not structured clone.
+7. Treat messages as the documented structured subset, not complete browser
+   structured clone; transfer lists still contain only plain `ArrayBuffer` values.
 8. Version schemas when their binary layout changes.
 9. Terminate/join Workers before destroying their engine or shared registries.
 
@@ -276,7 +348,18 @@ Shared memory removes serialization and copying cost for bulk state, but introdu
 
 ## Profiling and fixed benchmarks
 
-The runtime profiler records Worker count, processed messages, processed timer callbacks, rejected messages, cumulative Worker busy time, input/output queue bytes at sample end, lifetime queue high-water bytes, and shared-memory bytes at start/end. Use those measurements together with frame/tick time; Worker utilization by itself does not prove a faster game loop. Any rejected message means a producer reached backpressure and must reduce traffic, batch work, or use a shared queue.
+The runtime profiler records Workers created during the sample, active Worker
+count at sample start/end, processed messages, processed timer
+callbacks, rejected messages in four counters (`inputQueueFull`,
+`inputMessagesTooLarge`, `outputQueueFull`, and `outputMessagesTooLarge`), largest
+observed message, cumulative Worker busy time, input/output queue bytes at sample
+end, lifetime queue high-water bytes, and shared-memory bytes at start/end. The
+end-of-sample queue values show remaining backlog; the lifetime high-water values
+show the worst retained queue even when it drained before sampling ended. Use those
+measurements together with frame/tick time; Worker utilization by itself does not
+prove a faster game loop. Any rejected message means a producer reached
+backpressure and must raise an intentional limit, reduce traffic, batch work, or
+use a shared queue.
 
 The fixed shared-memory benchmark uses 200,000 rows, four Workers, ten warmup samples, and fifty measured samples. It initializes baseline and parallel tables identically, assigns exclusive row partitions, and validates checksum equality before reporting median, p95, and p99.
 
@@ -291,6 +374,13 @@ mystral run benchmarks/worker-transfer.mjs --no-sdl
 ```
 
 The machine-readable report is the line prefixed with `[WorkerTransferBenchmark]`. Redirect or filter that line to retain the JSON result in automation. Heap snapshots are observational and do not force garbage collection. Do not change the fixed inputs of either benchmark when comparing runtime changes. Create an additional benchmark if a different workload is needed.
+
+The configurable-limit benchmark verifies 16 MiB, 32 MiB, and 64 MiB typed-view
+round trips under an explicit 80 MiB per-message / 96 MiB queued budget:
+
+```bash
+mystral run benchmarks/worker-message-limits.mjs --no-sdl
+```
 
 ## Validation commands
 

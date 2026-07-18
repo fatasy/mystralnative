@@ -646,6 +646,7 @@ public:
 
         // Store script path for reloading
         scriptPath_ = path;
+        updateDocumentScriptLocation(path);
 
         // Watch the containing directory so atomic bundle replacement does
         // not detach the watch from the old inode/file handle.
@@ -850,6 +851,7 @@ public:
         }
 
         // Reload the script
+        updateDocumentScriptLocation(scriptPath_);
         bool success = moduleSystem_->loadEntry(scriptPath_);
 
         if (success) {
@@ -862,6 +864,34 @@ public:
     }
 
 private:
+    void updateDocumentScriptLocation(const std::string& path) {
+        if (!jsEngine_ || path.empty()) return;
+
+        std::string scriptUrl;
+        if (path.find("://") != std::string::npos) {
+            scriptUrl = path;
+        } else {
+            std::error_code pathError;
+            auto absolutePath = std::filesystem::absolute(path, pathError).lexically_normal();
+            if (pathError) return;
+            const auto genericPath = absolutePath.generic_string();
+#ifdef _WIN32
+            scriptUrl = "file:///" + genericPath;
+#else
+            scriptUrl = "file://" + genericPath;
+#endif
+        }
+
+        auto document = jsEngine_->getGlobalProperty("document");
+        if (jsEngine_->isUndefined(document) || jsEngine_->isNull(document)) return;
+        jsEngine_->setProperty(document, "baseURI", jsEngine_->newString(scriptUrl.c_str()));
+
+        auto currentScript = jsEngine_->newObject();
+        jsEngine_->setProperty(currentScript, "tagName", jsEngine_->newString("SCRIPT"));
+        jsEngine_->setProperty(currentScript, "src", jsEngine_->newString(scriptUrl.c_str()));
+        jsEngine_->setProperty(document, "currentScript", currentScript);
+    }
+
     void logHotReloadStats(const char* phase) {
         const auto memory = jsEngine_->getMemoryStats();
         std::cout << "[HotReload] " << phase
@@ -1074,10 +1104,16 @@ public:
 
     bool pollEvents() override {
         using ProfileClock = std::chrono::steady_clock;
+        // Debug commands run during this function, so profiling may start or
+        // stop halfway through a frame. Sample only a complete profiling frame,
+        // and cap fixed-size profiles even if the client sends profile.stop late.
+        const bool profilingFrame = profilerActive_ &&
+            (profilerExpectedFrames_ == 0 ||
+                profilerSamples_.size() < profilerExpectedFrames_);
         ProfileClock::time_point profileFrameStart;
         ProfileClock::time_point profilePhaseStart;
         FrameProfileSample profileSample;
-        if (profilerActive_) {
+        if (profilingFrame) {
             profileFrameStart = ProfileClock::now();
             profilePhaseStart = profileFrameStart;
         }
@@ -1094,7 +1130,7 @@ public:
         // This handles async HTTP requests, file I/O, and libuv-based timers
         async::EventLoop::instance().runOnce();
 
-        if (profilerActive_) {
+        if (profilingFrame && profilerActive_) {
             auto now = ProfileClock::now();
             profileSample.eventsMs = millisecondsBetween(profilePhaseStart, now);
             profilePhaseStart = now;
@@ -1128,7 +1164,7 @@ public:
             reloadScript();
         }
 
-        if (profilerActive_) {
+        if (profilingFrame && profilerActive_) {
             auto now = ProfileClock::now();
             profileSample.asyncWorkMs = millisecondsBetween(profilePhaseStart, now);
             profilePhaseStart = now;
@@ -1149,7 +1185,7 @@ public:
         // Process microtask queue for promises
         processMicrotasks();
 
-        if (profilerActive_) {
+        if (profilingFrame && profilerActive_) {
             auto now = ProfileClock::now();
             profileSample.callbacksMs = millisecondsBetween(profilePhaseStart, now);
             profilePhaseStart = now;
@@ -1163,7 +1199,7 @@ public:
         // Execute requestAnimationFrame callbacks (renders a frame)
         executeAnimationFrameCallbacks();
 
-        if (profilerActive_) {
+        if (profilingFrame && profilerActive_) {
             auto now = ProfileClock::now();
             profileSample.animationFrameMs = millisecondsBetween(profilePhaseStart, now);
             profilePhaseStart = now;
@@ -1173,7 +1209,7 @@ public:
         jsEngine_->clearFrameHandles();
         webgpu::endDawnFrame();
 
-        if (profilerActive_) {
+        if (profilingFrame && profilerActive_) {
             auto now = ProfileClock::now();
             profileSample.cleanupMs = millisecondsBetween(profilePhaseStart, now);
             profileSample.frameMs = millisecondsBetween(profileFrameStart, now);
@@ -1213,6 +1249,7 @@ public:
 
     void startProfiler(uint64_t expectedFrames) override {
         profilerSamples_.clear();
+        profilerExpectedFrames_ = expectedFrames;
         profilerSamples_.reserve(expectedFrames > 0
             ? static_cast<size_t>(expectedFrames)
             : 1024);
@@ -1243,6 +1280,8 @@ public:
         const auto workerEnd = workerRegistry_
             ? workerRegistry_->stats()
             : workers::WorkerRegistryStats{};
+        report.workersActiveStart = profilerWorkerStart_.activeWorkers;
+        report.workersActiveEnd = workerEnd.activeWorkers;
         report.workersCreated = workerEnd.createdWorkers >= profilerWorkerStart_.createdWorkers
             ? workerEnd.createdWorkers - profilerWorkerStart_.createdWorkers
             : 0;
@@ -1260,6 +1299,17 @@ public:
         report.workerMessagesRejected = rejectedAtEnd >= rejectedAtStart
             ? rejectedAtEnd - rejectedAtStart
             : 0;
+        const auto counterDelta = [](uint64_t start, uint64_t end) {
+            return end >= start ? end - start : 0;
+        };
+        report.workerInputMessagesTooLarge = counterDelta(
+            profilerWorkerStart_.rejectedInputTooLarge, workerEnd.rejectedInputTooLarge);
+        report.workerInputQueueFull = counterDelta(
+            profilerWorkerStart_.rejectedInputQueueFull, workerEnd.rejectedInputQueueFull);
+        report.workerOutputMessagesTooLarge = counterDelta(
+            profilerWorkerStart_.rejectedOutputTooLarge, workerEnd.rejectedOutputTooLarge);
+        report.workerOutputQueueFull = counterDelta(
+            profilerWorkerStart_.rejectedOutputQueueFull, workerEnd.rejectedOutputQueueFull);
         const uint64_t workerBusyNanoseconds =
             workerEnd.busyNanoseconds >= profilerWorkerStart_.busyNanoseconds
                 ? workerEnd.busyNanoseconds - profilerWorkerStart_.busyNanoseconds
@@ -1269,18 +1319,17 @@ public:
         report.workerOutputQueueEndBytes = workerEnd.queuedOutputBytes;
         report.workerInputQueuePeakBytes = workerEnd.peakQueuedInputBytes;
         report.workerOutputQueuePeakBytes = workerEnd.peakQueuedOutputBytes;
+        report.workerLargestInputMessageBytes = workerEnd.largestInputMessageBytes;
+        report.workerLargestOutputMessageBytes = workerEnd.largestOutputMessageBytes;
         report.sharedMemoryStartBytes = profilerSharedMemoryStartBytes_;
         report.sharedMemoryEndBytes = sharedBuffers_ ? sharedBuffers_->allocatedBytes() : 0;
 
         const auto jobEnd = async::getJobSystem().stats();
-        const auto delta = [](uint64_t start, uint64_t end) {
-            return end >= start ? end - start : 0;
-        };
-        report.jobsSubmitted = delta(profilerJobStart_.submitted, jobEnd.submitted);
-        report.jobsCompleted = delta(profilerJobStart_.completed, jobEnd.completed);
-        report.jobsCancelled = delta(profilerJobStart_.cancelled, jobEnd.cancelled);
-        report.jobsFailed = delta(profilerJobStart_.failed, jobEnd.failed);
-        report.jobsRejected = delta(profilerJobStart_.rejected, jobEnd.rejected);
+        report.jobsSubmitted = counterDelta(profilerJobStart_.submitted, jobEnd.submitted);
+        report.jobsCompleted = counterDelta(profilerJobStart_.completed, jobEnd.completed);
+        report.jobsCancelled = counterDelta(profilerJobStart_.cancelled, jobEnd.cancelled);
+        report.jobsFailed = counterDelta(profilerJobStart_.failed, jobEnd.failed);
+        report.jobsRejected = counterDelta(profilerJobStart_.rejected, jobEnd.rejected);
         report.jobQueueEnd = jobEnd.queued;
         report.jobQueuePeak = jobEnd.queueHighWater;
         report.jobInFlightEnd = jobEnd.inFlight;
@@ -1955,6 +2004,12 @@ private:
                 jsEngine_->setProperty(result, "heapLimitBytes", jsEngine_->newNumber(static_cast<double>(memory.heapLimitBytes)));
                 jsEngine_->setProperty(result, "nativeFunctions", jsEngine_->newNumber(static_cast<double>(memory.nativeFunctions)));
                 jsEngine_->setProperty(result, "frameHandles", jsEngine_->newNumber(static_cast<double>(memory.frameHandles)));
+                const auto workerStats = workerRegistry_
+                    ? workerRegistry_->stats()
+                    : workers::WorkerRegistryStats{};
+                jsEngine_->setProperty(result, "workersActive", jsEngine_->newNumber(static_cast<double>(workerStats.activeWorkers)));
+                jsEngine_->setProperty(result, "workersCreated", jsEngine_->newNumber(static_cast<double>(workerStats.createdWorkers)));
+                jsEngine_->setProperty(result, "sharedMemoryBytes", jsEngine_->newNumber(static_cast<double>(sharedBuffers_ ? sharedBuffers_->allocatedBytes() : 0)));
                 return result;
             })
         );
@@ -3199,7 +3254,34 @@ globalThis.Response = Response;
                         jsEngine_->throwException("Worker script source is empty");
                         return jsEngine_->newNumber(-1);
                     }
-                    return jsEngine_->newNumber(workerRegistry_->createWorker(kind, source, name));
+                    workers::WorkerQueueLimits queueLimits;
+                    const auto readLimit = [this, &args](
+                        size_t index, size_t& target, const char* option) {
+                        if (args.size() <= index || jsEngine_->isUndefined(args[index])) return true;
+                        constexpr double maxSafeInteger = 9'007'199'254'740'991.0;
+                        const double value = jsEngine_->toNumber(args[index]);
+                        if (!std::isfinite(value) || value < 1.0 || value > maxSafeInteger ||
+                            std::floor(value) != value) {
+                            const std::string message =
+                                std::string("Worker ") + option + " must be a positive safe integer";
+                            jsEngine_->throwException(message.c_str());
+                            return false;
+                        }
+                        target = static_cast<size_t>(value);
+                        return true;
+                    };
+                    if (!readLimit(3, queueLimits.maxMessages, "maxMessages") ||
+                        !readLimit(4, queueLimits.maxMessageBytes, "maxMessageBytes") ||
+                        !readLimit(5, queueLimits.maxQueuedBytes, "maxQueuedBytes")) {
+                        return jsEngine_->newNumber(-1);
+                    }
+                    if (queueLimits.maxMessageBytes > queueLimits.maxQueuedBytes) {
+                        jsEngine_->throwException(
+                            "Worker maxMessageBytes cannot exceed maxQueuedBytes");
+                        return jsEngine_->newNumber(-1);
+                    }
+                    return jsEngine_->newNumber(
+                        workerRegistry_->createWorker(kind, source, name, queueLimits));
                 }));
 
         jsEngine_->setGlobalProperty("__mystralWorkerPostMessage",
@@ -3426,7 +3508,29 @@ if (typeof Worker === 'undefined') {
             }
 
             if (!code) throw new TypeError('Worker requires a script URL or Blob');
-            this._id = __mystralWorkerCreate(kind, code, options && options.name ? String(options.name) : '');
+            const limit = name => {
+                const value = options && options[name];
+                if (value === undefined) return undefined;
+                if (!Number.isSafeInteger(value) || value <= 0) {
+                    throw new RangeError('Worker ' + name + ' must be a positive safe integer');
+                }
+                return value;
+            };
+            const maxMessages = limit('maxMessages');
+            const maxMessageBytes = limit('maxMessageBytes');
+            const maxQueuedBytes = limit('maxQueuedBytes');
+            if (maxMessageBytes !== undefined && maxQueuedBytes !== undefined &&
+                maxMessageBytes > maxQueuedBytes) {
+                throw new RangeError('Worker maxMessageBytes cannot exceed maxQueuedBytes');
+            }
+            this._id = __mystralWorkerCreate(
+                kind,
+                code,
+                options && options.name ? String(options.name) : '',
+                maxMessages,
+                maxMessageBytes,
+                maxQueuedBytes,
+            );
             if (this._id < 0) throw new Error('Failed to create Worker');
             nativeWorkers.set(this._id, this);
         }
@@ -4192,6 +4296,7 @@ globalThis.__mystralNativeDecodeDracoAsync = function(buffer, attrs) {
     uint32_t stepFramesRemaining_ = 0;
     uint64_t frameCount_ = 0;
     bool profilerActive_ = false;
+    uint64_t profilerExpectedFrames_ = 0;
     std::chrono::steady_clock::time_point profilerStartedAt_;
     RuntimeMemorySnapshot profilerMemoryStart_;
     workers::WorkerRegistryStats profilerWorkerStart_;

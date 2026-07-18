@@ -29,6 +29,41 @@ bool waitForWorkerMessage(
     return false;
 }
 
+mystral::js::JSValueHandle decodeWorkerMessage(
+    mystral::js::Engine* engine,
+    const mystral::workers::WorkerMessage& message) {
+    auto transfers = engine->newArray(message.transfers.size());
+    for (uint32_t index = 0; index < message.transfers.size(); index++) {
+        auto buffer = engine->newTransferredArrayBuffer(message.transfers[index]);
+        engine->setPropertyIndex(transfers, index, buffer);
+        engine->releaseValue(buffer);
+    }
+    auto parser = engine->getGlobalProperty("__mystralParseMessage");
+    auto payload = engine->newString(message.payload.c_str());
+    auto thisArg = engine->newUndefined();
+    auto result = engine->call(parser, thisArg, {payload, transfers});
+    engine->releaseValue(thisArg);
+    engine->releaseValue(payload);
+    engine->releaseValue(parser);
+    engine->releaseValue(transfers);
+    return result;
+}
+
+std::string decodedMessageJson(
+    mystral::js::Engine* engine,
+    const mystral::workers::WorkerMessage& message) {
+    auto decoded = decodeWorkerMessage(engine, message);
+    auto serializer = engine->getGlobalProperty("__mystralSerializeMessage");
+    auto thisArg = engine->newUndefined();
+    auto serialized = engine->call(serializer, thisArg, {decoded});
+    const std::string result = engine->toString(serialized);
+    engine->releaseValue(serialized);
+    engine->releaseValue(thisArg);
+    engine->releaseValue(serializer);
+    engine->releaseValue(decoded);
+    return result;
+}
+
 }  // namespace
 
 int main() {
@@ -225,23 +260,83 @@ int main() {
         return 5;
     }
 
-    const uint8_t sourceBytes[] = {4, 5, 6, 7};
-    auto sourceBuffer = mainEngine->newArrayBuffer(sourceBytes, sizeof(sourceBytes));
-    js::TransferredArrayBuffer outboundTransfer;
-    if (!mainEngine->transferArrayBuffer(sourceBuffer, outboundTransfer)) {
-        std::cerr << "Main isolate could not detach a transferable ArrayBuffer" << std::endl;
-        worker.terminate();
-        return 19;
+    if (!mainEngine->evalScript(R"JS(
+(() => {
+    const transferred = new ArrayBuffer(16);
+    new Uint8Array(transferred).set([1, 2, 3, 4, 5, 6, 7, 8]);
+    const cloned = new ArrayBuffer(64);
+    const names = [
+        'Int8Array', 'Uint8Array', 'Uint8ClampedArray',
+        'Int16Array', 'Uint16Array', 'Int32Array', 'Uint32Array',
+        'Float16Array', 'Float32Array', 'Float64Array',
+        'BigInt64Array', 'BigUint64Array',
+    ].filter(name => typeof globalThis[name] === 'function');
+    globalThis.__wireTransferred = transferred;
+    globalThis.__wireCloned = cloned;
+    globalThis.__wireTypedArrayNames = names;
+    let duplicateRejected = false;
+    let circularRejected = false;
+    let rawSharedRejected = false;
+    let invalidBoundsRejected = false;
+    try { __mystralPrepareMessage({}, [transferred, transferred]); } catch (_) { duplicateRejected = true; }
+    const circular = {};
+    circular.self = circular;
+    try { __mystralPrepareMessage(circular); } catch (_) { circularRejected = true; }
+    const shared = __mystralShared.SharedBuffer.allocate(8);
+    try { __mystralPrepareMessage({ raw: new Uint8Array(shared.buffer) }); } catch (_) { rawSharedRejected = true; }
+    shared.release();
+    try {
+        __mystralParseMessage(
+            JSON.stringify({ $mystralWire: 1, value: ['view', 'Uint32Array', 0, 2, 1] }),
+            [new ArrayBuffer(4)],
+        );
+    } catch (_) { invalidBoundsRejected = true; }
+    if (!duplicateRejected || !circularRejected || !rawSharedRejected || !invalidBoundsRejected) {
+        throw new Error('Structured wire validation contract failed');
     }
-    size_t detachedSize = 999;
-    mainEngine->getArrayBufferData(sourceBuffer, &detachedSize);
-    if (detachedSize != 0 ||
-        worker.postMessage(
-            R"JSON({"binary":{"$mystralTransferredBuffer":0}})JSON",
-            {outboundTransfer}) != workers::WorkerPostStatus::Posted) {
-        std::cerr << "Transfer sender was not detached or message was rejected" << std::endl;
+    globalThis.__wirePrepared = __mystralPrepareMessage({
+        kind: 'wire-views',
+        bytes: new Uint8Array(transferred, 4, 4),
+        words: new Uint16Array(transferred, 4, 2),
+        window: new DataView(transferred, 5, 2),
+        clonedViews: names.map(name => new globalThis[name](cloned, 0, 1)),
+        marker: { $mystralTransferredBuffer: 0, note: 'user-data' },
+        envelopeLookalike: { $mystralWire: 1, value: ['arraybuffer', 0] },
+    }, [transferred]);
+})()
+)JS", "worker-wire-prepare.js")) {
+        std::cerr << "Main isolate could not prepare structured binary views" << std::endl;
         worker.terminate();
-        return 20;
+        return 31;
+    }
+
+    auto prepared = mainEngine->getGlobalProperty("__wirePrepared");
+    const std::string binaryPayload = mainEngine->toString(
+        mainEngine->getProperty(prepared, "payload"));
+    auto preparedTransfers = mainEngine->getProperty(prepared, "transfers");
+    const auto preparedTransferCount = static_cast<uint32_t>(mainEngine->toNumber(
+        mainEngine->getProperty(preparedTransfers, "length")));
+    std::vector<js::TransferredArrayBuffer> outboundTransfers;
+    outboundTransfers.reserve(preparedTransferCount);
+    for (uint32_t index = 0; index < preparedTransferCount; index++) {
+        js::TransferredArrayBuffer transfer;
+        if (!mainEngine->transferArrayBuffer(
+                mainEngine->getPropertyIndex(preparedTransfers, index), transfer)) {
+            std::cerr << "Prepared binary attachment could not be transferred" << std::endl;
+            worker.terminate();
+            return 32;
+        }
+        outboundTransfers.push_back(std::move(transfer));
+    }
+    const auto senderState = mainEngine->evalScriptWithResult(
+        "__wireTransferred.byteLength === 0 && __wireCloned.byteLength === 64",
+        "worker-wire-sender-state.js");
+    if (!mainEngine->toBoolean(senderState) ||
+        worker.postMessage(binaryPayload, std::move(outboundTransfers)) !=
+            workers::WorkerPostStatus::Posted) {
+        std::cerr << "Transfer detached the wrong backing or the message was rejected" << std::endl;
+        worker.terminate();
+        return 33;
     }
 
     bool binaryReceived = false;
@@ -251,29 +346,61 @@ int main() {
             if (message.type == workers::WorkerMessage::Type::Error) {
                 std::cerr << message.payload << std::endl;
                 worker.terminate();
-                return 21;
+                return 34;
             }
-            if (message.type != workers::WorkerMessage::Type::Message || message.transfers.size() != 1) {
+            if (message.type != workers::WorkerMessage::Type::Message || message.transfers.size() != 2) {
                 continue;
             }
-            auto returnedBuffer = mainEngine->newTransferredArrayBuffer(message.transfers[0]);
-            size_t returnedSize = 0;
-            auto* returnedBytes = static_cast<uint8_t*>(
-                mainEngine->getArrayBufferData(returnedBuffer, &returnedSize));
-            binaryReceived = returnedBytes && returnedSize == sizeof(sourceBytes) &&
-                returnedBytes[0] == 5 && returnedBytes[1] == 5;
+            auto returnedTransfers = mainEngine->newArray(message.transfers.size());
+            for (uint32_t index = 0; index < message.transfers.size(); index++) {
+                auto returnedBuffer = mainEngine->newTransferredArrayBuffer(message.transfers[index]);
+                mainEngine->setPropertyIndex(returnedTransfers, index, returnedBuffer);
+                mainEngine->releaseValue(returnedBuffer);
+            }
+            auto parser = mainEngine->getGlobalProperty("__mystralParseMessage");
+            auto serialized = mainEngine->newString(message.payload.c_str());
+            auto thisArg = mainEngine->newUndefined();
+            auto roundTrip = mainEngine->call(parser, thisArg, {serialized, returnedTransfers});
+            mainEngine->setGlobalProperty("__wireRoundTrip", roundTrip);
+            const auto validRoundTrip = mainEngine->evalScriptWithResult(R"JS(
+(() => {
+    const value = __wireRoundTrip;
+    const names = __wireTypedArrayNames;
+    return value.kind === 'wire-views-result' &&
+        value.bytes instanceof Uint8Array && value.bytes.byteOffset === 4 && value.bytes.length === 4 &&
+        value.bytes[0] === 6 && value.words.buffer === value.bytes.buffer &&
+        value.window instanceof DataView && value.window.buffer === value.bytes.buffer &&
+        value.marker.$mystralTransferredBuffer === 0 && value.marker.note === 'user-data' &&
+        value.envelopeLookalike.$mystralWire === 1 &&
+        value.envelopeLookalike.value[0] === 'arraybuffer' &&
+        value.clonedViews.length === names.length &&
+        value.clonedViews.every((view, index) =>
+            view.constructor.name === names[index] &&
+            view.buffer === value.clonedViews[0].buffer) &&
+        new Uint8Array(value.clonedViews[0].buffer)[0] === 91 &&
+        __wireCloned.byteLength === 64 && new Uint8Array(__wireCloned)[0] === 0;
+})()
+)JS", "worker-wire-round-trip.js");
+            binaryReceived = mainEngine->toBoolean(validRoundTrip);
+            mainEngine->releaseValue(validRoundTrip);
+            mainEngine->releaseValue(roundTrip);
+            mainEngine->releaseValue(thisArg);
+            mainEngine->releaseValue(serialized);
+            mainEngine->releaseValue(parser);
+            mainEngine->releaseValue(returnedTransfers);
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     worker.terminate();
     if (!binaryReceived) {
-        std::cerr << "Transferred ArrayBuffer did not round-trip through the Worker" << std::endl;
-        return 22;
+        std::cerr << "Structured binary views did not round-trip through the Worker" << std::endl;
+        return 35;
     }
 
     workers::WorkerQueueLimits tightLimits;
-    tightLimits.maxMessages = 2;
-    tightLimits.maxBytes = 64;
+    tightLimits.maxMessages = 3;
+    tightLimits.maxMessageBytes = 128;
+    tightLimits.maxQueuedBytes = 200;
     workers::WorkerThread blockedWorker(
         2,
         engineType,
@@ -300,10 +427,10 @@ int main() {
         blockedWorker.terminate();
         return 9;
     }
-    if (blockedWorker.postMessage("{\"id\":1}") != workers::WorkerPostStatus::Posted ||
-        blockedWorker.postMessage("{\"id\":2}") != workers::WorkerPostStatus::Posted ||
-        blockedWorker.postMessage("{\"id\":3}") != workers::WorkerPostStatus::QueueFull ||
-        blockedWorker.postMessage(std::string(65, 'x')) != workers::WorkerPostStatus::MessageTooLarge) {
+    if (blockedWorker.postMessage(std::string(100, 'x')) != workers::WorkerPostStatus::Posted ||
+        blockedWorker.postMessage(std::string(100, 'x')) != workers::WorkerPostStatus::Posted ||
+        blockedWorker.postMessage(std::string(100, 'x')) != workers::WorkerPostStatus::QueueFull ||
+        blockedWorker.postMessage(std::string(129, 'x')) != workers::WorkerPostStatus::MessageTooLarge) {
         std::cerr << "Worker input backpressure contract failed" << std::endl;
         blockedWorker.terminate();
         return 10;
@@ -318,14 +445,78 @@ int main() {
         return 11;
     }
     const auto blockedStats = blockedWorker.stats();
-    if (blockedStats.rejectedInputMessages != 2 || blockedStats.peakQueuedInputBytes == 0) {
+    if (blockedStats.rejectedInputMessages != 2 ||
+        blockedStats.rejectedInputQueueFull != 1 ||
+        blockedStats.rejectedInputTooLarge != 1 ||
+        blockedStats.peakQueuedInputBytes == 0 ||
+        blockedStats.largestInputMessageBytes != 129) {
         std::cerr << "Worker input backpressure metrics were not recorded" << std::endl;
         return 12;
     }
 
+    constexpr size_t largeMessageBytes = 20 * 1024 * 1024;
+    std::string largePayload(largeMessageBytes, 'x');
+    largePayload.front() = '"';
+    largePayload.back() = '"';
+    workers::WorkerThread defaultLimitWorker(
+        8,
+        engineType,
+        workers::WorkerSourceKind::Script,
+        "self.onmessage = ({data}) => postMessage({length:data.length});",
+        std::filesystem::current_path().string(),
+        "worker-default-limit-smoke.js",
+        sharedBuffers);
+    defaultLimitWorker.start();
+    if (!waitForWorkerMessage(defaultLimitWorker, [](const workers::WorkerMessage& message) {
+            return message.type == workers::WorkerMessage::Type::Ready;
+        }) || defaultLimitWorker.postMessage(largePayload) != workers::WorkerPostStatus::MessageTooLarge ||
+        defaultLimitWorker.stats().rejectedInputTooLarge != 1) {
+        std::cerr << "Default per-message limit was not enforced" << std::endl;
+        defaultLimitWorker.terminate();
+        return 36;
+    }
+    defaultLimitWorker.terminate();
+
+    workers::WorkerQueueLimits largeLimits;
+    largeLimits.maxMessages = 4;
+    largeLimits.maxMessageBytes = 24 * 1024 * 1024;
+    largeLimits.maxQueuedBytes = 32 * 1024 * 1024;
+    workers::WorkerThread largeWorker(
+        9,
+        engineType,
+        workers::WorkerSourceKind::Script,
+        "self.onmessage = ({data}) => postMessage({length:data.length});",
+        std::filesystem::current_path().string(),
+        "worker-large-message-smoke.js",
+        sharedBuffers,
+        largeLimits);
+    largeWorker.start();
+    if (!waitForWorkerMessage(largeWorker, [](const workers::WorkerMessage& message) {
+            return message.type == workers::WorkerMessage::Type::Ready;
+        }) || largeWorker.postMessage(std::move(largePayload)) != workers::WorkerPostStatus::Posted) {
+        std::cerr << "Configured Worker rejected a message above the default limit" << std::endl;
+        largeWorker.terminate();
+        return 37;
+    }
+    const bool largeMessageReceived = waitForWorkerMessage(
+        largeWorker,
+        [mainEngine = mainEngine.get()](const workers::WorkerMessage& message) {
+            if (message.type != workers::WorkerMessage::Type::Message) return false;
+            return decodedMessageJson(mainEngine, message).find("\"length\":20971518") !=
+                std::string::npos;
+        });
+    const auto largeStats = largeWorker.stats();
+    largeWorker.terminate();
+    if (!largeMessageReceived || largeStats.largestInputMessageBytes != largeMessageBytes ||
+        largeStats.rejectedInputMessages != 0) {
+        std::cerr << "Configured large-message round-trip or metrics failed" << std::endl;
+        return 38;
+    }
+
     workers::WorkerQueueLimits outputLimits;
     outputLimits.maxMessages = 2;
-    outputLimits.maxBytes = 1024;
+    outputLimits.maxMessageBytes = 1024;
+    outputLimits.maxQueuedBytes = 1024;
     workers::WorkerThread outputWorker(
         3,
         engineType,
@@ -350,7 +541,9 @@ int main() {
     }
     const auto outputStats = outputWorker.stats();
     outputWorker.terminate();
-    if (outputStats.rejectedOutputMessages == 0 || outputStats.peakQueuedOutputBytes == 0) {
+    if (outputStats.rejectedOutputMessages == 0 || outputStats.rejectedOutputQueueFull == 0 ||
+        outputStats.rejectedOutputTooLarge != 0 || outputStats.peakQueuedOutputBytes == 0 ||
+        outputStats.largestOutputMessageBytes == 0) {
         std::cerr << "Worker output backpressure contract failed" << std::endl;
         return 14;
     }
@@ -437,15 +630,21 @@ const interval = setInterval(() => {
     const auto timerDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
     while (!timerMessageReceived && std::chrono::steady_clock::now() < timerDeadline) {
         for (const auto& message : timerWorker.drainMessages()) {
-            if (message.type == workers::WorkerMessage::Type::Error ||
-                message.payload.find("cancelledTimerRan") != std::string::npos) {
+            if (message.type == workers::WorkerMessage::Type::Error) {
                 std::cerr << "Worker timer failed: " << message.payload << std::endl;
                 timerWorker.terminate();
                 return 25;
             }
+            if (message.type != workers::WorkerMessage::Type::Message) continue;
+            const std::string decoded = decodedMessageJson(mainEngine.get(), message);
+            if (decoded.find("cancelledTimerRan") != std::string::npos) {
+                std::cerr << "Worker timer failed: " << decoded << std::endl;
+                timerWorker.terminate();
+                return 25;
+            }
             timerMessageReceived = message.type == workers::WorkerMessage::Type::Message &&
-                message.payload.find("\"ticks\":2") != std::string::npos &&
-                message.payload.find("\"microtaskRan\":true") != std::string::npos;
+                decoded.find("\"ticks\":2") != std::string::npos &&
+                decoded.find("\"microtaskRan\":true") != std::string::npos;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
@@ -476,13 +675,14 @@ const interval = setInterval(() => {
     }
     const bool poolTaskReceived = waitForWorkerMessage(
         poolTaskWorker,
-        [](const workers::WorkerMessage& message) {
-            return message.type == workers::WorkerMessage::Type::Message &&
-                message.payload.find("\"round\":9") != std::string::npos &&
-                message.payload.find("\"workerIndex\":2") != std::string::npos &&
-                message.payload.find("\"begin\":5") != std::string::npos &&
-                message.payload.find("\"end\":8") != std::string::npos &&
-                message.payload.find("\"tag\":\"native\"") != std::string::npos;
+        [mainEngine = mainEngine.get()](const workers::WorkerMessage& message) {
+            if (message.type != workers::WorkerMessage::Type::Message) return false;
+            const std::string decoded = decodedMessageJson(mainEngine, message);
+            return decoded.find("\"round\":9") != std::string::npos &&
+                decoded.find("\"workerIndex\":2") != std::string::npos &&
+                decoded.find("\"begin\":5") != std::string::npos &&
+                decoded.find("\"end\":8") != std::string::npos &&
+                decoded.find("\"tag\":\"native\"") != std::string::npos;
         });
     if (!poolTaskReceived) {
         std::cerr << "WorkerPool task helper did not complete its partition" << std::endl;
@@ -490,13 +690,33 @@ const interval = setInterval(() => {
         return 28;
     }
 
-    const uint8_t poolBinarySource[] = {9, 8};
-    auto poolBinaryBuffer = mainEngine->newArrayBuffer(poolBinarySource, sizeof(poolBinarySource));
+    if (!mainEngine->evalScript(R"JS(
+(() => {
+    const binary = new Uint8Array([9, 8]).buffer;
+    globalThis.__poolBinaryPrepared = __mystralPrepareMessage({
+        $mystralWorkerPoolTask: 1,
+        round: 10,
+        workerIndex: 2,
+        workerCount: 4,
+        begin: 8,
+        end: 10,
+        data: { tag: 'binary', binary },
+    }, [binary]);
+})()
+)JS", "worker-pool-binary-prepare.js")) {
+        std::cerr << "WorkerPool transferable result task was rejected" << std::endl;
+        poolTaskWorker.terminate();
+        return 29;
+    }
+    auto poolPrepared = mainEngine->getGlobalProperty("__poolBinaryPrepared");
+    const std::string poolPayload = mainEngine->toString(
+        mainEngine->getProperty(poolPrepared, "payload"));
+    auto poolPreparedTransfers = mainEngine->getProperty(poolPrepared, "transfers");
     js::TransferredArrayBuffer poolBinaryTransfer;
-    if (!mainEngine->transferArrayBuffer(poolBinaryBuffer, poolBinaryTransfer) ||
-        poolTaskWorker.postMessage(
-            R"JSON({"$mystralWorkerPoolTask":1,"round":10,"workerIndex":2,"workerCount":4,"begin":8,"end":10,"data":{"tag":"binary","binary":{"$mystralTransferredBuffer":0}}})JSON",
-            {poolBinaryTransfer}) != workers::WorkerPostStatus::Posted) {
+    if (!mainEngine->transferArrayBuffer(
+            mainEngine->getPropertyIndex(poolPreparedTransfers, 0), poolBinaryTransfer) ||
+        poolTaskWorker.postMessage(poolPayload, {poolBinaryTransfer}) !=
+            workers::WorkerPostStatus::Posted) {
         std::cerr << "WorkerPool transferable result task was rejected" << std::endl;
         poolTaskWorker.terminate();
         return 29;
@@ -505,17 +725,18 @@ const interval = setInterval(() => {
     const auto poolBinaryDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
     while (!poolBinaryReceived && std::chrono::steady_clock::now() < poolBinaryDeadline) {
         for (const auto& message : poolTaskWorker.drainMessages()) {
-            if (message.type != workers::WorkerMessage::Type::Message ||
-                message.payload.find("\"round\":10") == std::string::npos ||
-                message.transfers.size() != 1) {
-                continue;
-            }
-            auto returnedBuffer = mainEngine->newTransferredArrayBuffer(message.transfers[0]);
+            if (message.type != workers::WorkerMessage::Type::Message || message.transfers.size() != 1) continue;
+            auto decoded = decodeWorkerMessage(mainEngine.get(), message);
+            auto value = mainEngine->getProperty(decoded, "value");
+            auto returnedBuffer = mainEngine->getProperty(value, "binary");
             size_t returnedSize = 0;
             auto* returnedBytes = static_cast<uint8_t*>(
                 mainEngine->getArrayBufferData(returnedBuffer, &returnedSize));
-            poolBinaryReceived = returnedBytes && returnedSize == sizeof(poolBinarySource) &&
+            poolBinaryReceived = returnedBytes && returnedSize == 2 &&
                 returnedBytes[0] == 10 && returnedBytes[1] == 8;
+            mainEngine->releaseValue(returnedBuffer);
+            mainEngine->releaseValue(value);
+            mainEngine->releaseValue(decoded);
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }

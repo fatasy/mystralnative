@@ -18,12 +18,18 @@ struct WorkerRegistryStats {
     uint64_t busyNanoseconds = 0;
     uint64_t rejectedInputMessages = 0;
     uint64_t rejectedOutputMessages = 0;
+    uint64_t rejectedInputTooLarge = 0;
+    uint64_t rejectedInputQueueFull = 0;
+    uint64_t rejectedOutputTooLarge = 0;
+    uint64_t rejectedOutputQueueFull = 0;
     uint64_t queuedInputMessages = 0;
     uint64_t queuedInputBytes = 0;
     uint64_t queuedOutputMessages = 0;
     uint64_t queuedOutputBytes = 0;
     uint64_t peakQueuedInputBytes = 0;
     uint64_t peakQueuedOutputBytes = 0;
+    uint64_t largestInputMessageBytes = 0;
+    uint64_t largestOutputMessageBytes = 0;
 };
 
 class WorkerRegistry {
@@ -37,7 +43,8 @@ public:
 
     int createWorker(WorkerSourceKind sourceKind,
                      const std::string& source,
-                     const std::string& name = {});
+                     const std::string& name = {},
+                     WorkerQueueLimits queueLimits = {});
     WorkerPostStatus postToWorker(
         int id,
         std::string payload,
@@ -63,8 +70,14 @@ private:
     uint64_t completedBusyNanoseconds_ = 0;
     uint64_t completedRejectedInputMessages_ = 0;
     uint64_t completedRejectedOutputMessages_ = 0;
+    uint64_t completedRejectedInputTooLarge_ = 0;
+    uint64_t completedRejectedInputQueueFull_ = 0;
+    uint64_t completedRejectedOutputTooLarge_ = 0;
+    uint64_t completedRejectedOutputQueueFull_ = 0;
     uint64_t peakQueuedInputBytes_ = 0;
     uint64_t peakQueuedOutputBytes_ = 0;
+    uint64_t largestInputMessageBytes_ = 0;
+    uint64_t largestOutputMessageBytes_ = 0;
     mutable std::mutex mutex_;
 };
 

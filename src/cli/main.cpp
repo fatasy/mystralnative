@@ -1418,14 +1418,22 @@ static std::string makeBenchmarkJson(
         << ",\"33.33ms\":" << report.framesOver33_33Ms
         << "},\"workers\":{"
         << "\"created\":" << report.workersCreated
+        << ",\"activeStart\":" << report.workersActiveStart
+        << ",\"activeEnd\":" << report.workersActiveEnd
         << ",\"messagesProcessed\":" << report.workerMessagesProcessed
         << ",\"timerCallbacks\":" << report.workerTimerCallbacks
         << ",\"messagesRejected\":" << report.workerMessagesRejected
+        << ",\"inputMessagesTooLarge\":" << report.workerInputMessagesTooLarge
+        << ",\"inputQueueFull\":" << report.workerInputQueueFull
+        << ",\"outputMessagesTooLarge\":" << report.workerOutputMessagesTooLarge
+        << ",\"outputQueueFull\":" << report.workerOutputQueueFull
         << ",\"busyTimeMs\":" << report.workerBusyTimeMs
         << ",\"inputQueueEndBytes\":" << report.workerInputQueueEndBytes
         << ",\"outputQueueEndBytes\":" << report.workerOutputQueueEndBytes
         << ",\"inputQueuePeakBytes\":" << report.workerInputQueuePeakBytes
         << ",\"outputQueuePeakBytes\":" << report.workerOutputQueuePeakBytes
+        << ",\"largestInputMessageBytes\":" << report.workerLargestInputMessageBytes
+        << ",\"largestOutputMessageBytes\":" << report.workerLargestOutputMessageBytes
         << ",\"sharedMemoryStartBytes\":" << report.sharedMemoryStartBytes
         << ",\"sharedMemoryEndBytes\":" << report.sharedMemoryEndBytes
         << "},\"jobs\":{"
@@ -1502,9 +1510,15 @@ static void printBenchmarkSummary(
               << " messages=" << report.workerMessagesProcessed
               << " timers=" << report.workerTimerCallbacks
               << " rejected=" << report.workerMessagesRejected
+              << " (in-large=" << report.workerInputMessagesTooLarge
+              << " in-full=" << report.workerInputQueueFull
+              << " out-large=" << report.workerOutputMessagesTooLarge
+              << " out-full=" << report.workerOutputQueueFull << ")"
               << " busy=" << std::setprecision(3) << report.workerBusyTimeMs << " ms"
               << " queuePeak=" << report.workerInputQueuePeakBytes
               << "/" << report.workerOutputQueuePeakBytes << " bytes"
+              << " messageMax=" << report.workerLargestInputMessageBytes
+              << "/" << report.workerLargestOutputMessageBytes << " bytes"
               << " shared=" << report.sharedMemoryEndBytes << " bytes\n"
               << "Jobs: workers=" << report.jobWorkerCount
               << " submitted=" << report.jobsSubmitted
@@ -2072,7 +2086,11 @@ int runScript(const CLIOptions& opts) {
                         debugProfilerActive = true;
                         uint64_t startFrame = runtime->getFrameCount();
                         return "{\"startFrame\":" + std::to_string(startFrame) +
-                            ",\"targetFrame\":" + std::to_string(startFrame + debugProfileExpectedFrames) + "}";
+                            // profile.start is handled inside the current frame,
+                            // which is intentionally excluded by Runtime. Wait
+                            // one extra frame to collect exactly N full frames.
+                            ",\"targetFrame\":" + std::to_string(
+                                startFrame + debugProfileExpectedFrames + 1) + "}";
                     }
 
                     if (method == "profile.stop") {

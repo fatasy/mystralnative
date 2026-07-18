@@ -372,13 +372,16 @@ URL.revokeObjectURL(blobUrl);
 
 Each Worker runs on its own OS thread with an independent JavaScript engine and
 heap. Module workers can load JavaScript or TypeScript through the runtime module
-resolver. JSON-compatible control data uses `postMessage`; shared game state is
-passed by handle without copying its backing memory.
+resolver. JSON-compatible control data and typed binary views use `postMessage`;
+shared game state is passed by handle without copying its backing memory.
 
 ```javascript
 const worker = new Worker('./workers/simulation.ts', {
     type: 'module',
     name: 'simulation',
+    maxMessages: 64,
+    maxMessageBytes: 256 * 1024 * 1024,
+    maxQueuedBytes: 384 * 1024 * 1024,
 });
 
 worker.onmessage = (e) => console.log("Result:", e.data);
@@ -391,24 +394,43 @@ event-driven and sleeps until a message or timer is due. Worker globals include
 real `setTimeout`, `clearTimeout`, `setInterval`, `clearInterval`, and
 `queueMicrotask`. Timers use a monotonic native clock and do not busy-poll.
 
-Plain `ArrayBuffer` values can be transferred with ownership semantics. The
-sender is detached when `postMessage` accepts the transfer list:
+`ArrayBuffer`, TypedArray, and `DataView` values preserve their binary type,
+offset, length, and shared-backing relationships. A plain backing buffer can be
+transferred with ownership semantics; the sender is detached when `postMessage`
+accepts the transfer list:
 
 ```javascript
 const vertices = new ArrayBuffer(4 * 1024 * 1024);
-worker.postMessage({ vertices }, [vertices]);
+const positions = new Float32Array(vertices, 256, 1024);
+worker.postMessage({ positions }, [vertices]);
 console.log(vertices.byteLength); // 0
 ```
 
-The receiving isolate gets a normal `ArrayBuffer` at the same property. V8 moves
-the backing store without copying.
-Duplicate entries, non-`ArrayBuffer` entries, and detached buffers are rejected.
+V8 moves a transferred backing store without copying and reconstructs
+`positions` as a `Float32Array` in the receiver. Without a transfer list, the
+runtime clones each distinct backing once and leaves the sender's buffer intact.
+Transfer-list entries remain limited to plain `ArrayBuffer` objects. Duplicate
+entries, non-`ArrayBuffer` entries, detached buffers, and raw shared-buffer views
+are rejected. Use the shared APIs below for storage that remains attached in both
+isolates.
 
-Input and output user-message queues are bounded to 1,024 messages and 16 MiB per Worker.
-`postMessage()` throws `RangeError` when the input queue is full or a serialized
-message plus transferred bytes exceed the byte limit. Worker-side `postMessage()` throws when its
-output queue reaches the same limit. Use `SharedQueue` for sustained high-rate
-game traffic instead of relying on an unbounded message backlog.
+Input and output user-message queues default to 1,024 messages, 16 MiB for one
+message, and 64 MiB accumulated per direction. `maxMessages`,
+`maxMessageBytes`, and `maxQueuedBytes` override those bounds per Worker;
+`maxMessageBytes` cannot exceed `maxQueuedBytes`. Byte accounting includes wire
+metadata and every attached backing, including a zero-copy transfer whose memory
+is still retained by the queue. `postMessage()` throws `RangeError` when the
+input queue is full or a message exceeds its individual limit. Worker-side
+`postMessage()` throws when its output queue reaches the same configured bounds.
+Use `SharedQueue` for sustained high-rate game traffic instead of relying on an
+unbounded message backlog.
+
+The runtime profiler exposes active Worker counts at sample start/end,
+input/output queue bytes at sample end, lifetime queue high-water bytes, largest
+message, and separate queue-full/message-too-large rejection counters for each
+direction. A zero end value does not mean the queue was never pressured; inspect
+the lifetime peak. Any nonzero rejection is backpressure that application code
+must handle rather than a silently dropped message.
 
 `terminate()` interrupts currently executing JavaScript on V8, so a
 Worker stuck in a pure JavaScript loop cannot block normal runtime shutdown or
@@ -419,6 +441,13 @@ hot reload.
 `mystral/worker-pool` keeps a fixed set of Workers alive, divides a numeric range
 into stable contiguous partitions, and resolves each round only after every
 Worker reaches the barrier. Results are always returned in Worker-index order.
+
+The current implementation can construct a pool only in the main runtime
+isolate. Calling `new WorkerPool(...)` from inside a Worker throws. A simulation
+that is itself Worker-owned must remain single-writer until nested pool ownership,
+cascade shutdown, error propagation, and profiler attribution are implemented in
+the runtime; moving game authority to the main isolate solely to bypass this
+limit is not equivalent.
 
 ```javascript
 // simulation-pool.worker.mjs

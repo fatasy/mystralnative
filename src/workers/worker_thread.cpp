@@ -3,6 +3,7 @@
 #include "mystral/js/module_system.h"
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <filesystem>
@@ -19,15 +20,27 @@ namespace {
 thread_local js::Engine* currentWorkerEngine = nullptr;
 thread_local WorkerThread* currentWorker = nullptr;
 
-size_t transferBytes(const std::vector<js::TransferredArrayBuffer>& transfers) {
-    size_t total = 0;
-    for (const auto& transfer : transfers) total += transfer.size;
-    return total;
+struct MessageByteSize {
+    size_t value = 0;
+    bool overflow = false;
+};
+
+MessageByteSize messageBytes(
+    const std::string& payload,
+    const std::vector<js::TransferredArrayBuffer>& transfers) {
+    size_t total = payload.size();
+    for (const auto& transfer : transfers) {
+        if (transfer.size > std::numeric_limits<size_t>::max() - total) {
+            return {std::numeric_limits<size_t>::max(), true};
+        }
+        total += transfer.size;
+    }
+    return {total, false};
 }
 
-size_t messageBytes(const std::string& payload,
-                    const std::vector<js::TransferredArrayBuffer>& transfers) {
-    return payload.size() + transferBytes(transfers);
+void recordMaximum(std::atomic<size_t>& target, size_t value) {
+    size_t current = target.load();
+    while (current < value && !target.compare_exchange_weak(current, value)) {}
 }
 
 bool takeTransferList(js::Engine* engine,
@@ -49,7 +62,15 @@ bool takeTransferList(js::Engine* engine,
 
 std::string readTextFile(const std::string& rootDir, const std::string& requestedPath) {
     std::string normalized = requestedPath;
-    if (normalized.rfind("file://", 0) == 0) normalized.erase(0, 7);
+    if (normalized.rfind("file://", 0) == 0) {
+        normalized.erase(0, 7);
+#ifdef _WIN32
+        if (normalized.size() > 3 && normalized[0] == '/' &&
+            std::isalpha(static_cast<unsigned char>(normalized[1])) && normalized[2] == ':') {
+            normalized.erase(0, 1);
+        }
+#endif
+    }
     std::filesystem::path path(normalized);
     if (!path.is_absolute()) path = std::filesystem::path(rootDir) / path;
     path = std::filesystem::absolute(path).lexically_normal();
@@ -104,11 +125,14 @@ WorkerPostStatus WorkerThread::postMessage(
     if (terminated_.load() || (currentState != WorkerState::Starting && currentState != WorkerState::Running)) {
         return WorkerPostStatus::NotRunning;
     }
-    const size_t byteSize = messageBytes(payload, transfers);
-    if (byteSize > queueLimits_.maxBytes) {
+    const auto measured = messageBytes(payload, transfers);
+    recordMaximum(largestInputMessageBytes_, measured.value);
+    if (measured.overflow || measured.value > queueLimits_.maxMessageBytes) {
         rejectedInputMessages_.fetch_add(1);
+        rejectedInputTooLarge_.fetch_add(1);
         return WorkerPostStatus::MessageTooLarge;
     }
+    const size_t byteSize = measured.value;
     {
         std::lock_guard<std::mutex> lock(inputMutex_);
         const WorkerState lockedState = state_.load();
@@ -117,8 +141,10 @@ WorkerPostStatus WorkerThread::postMessage(
             return WorkerPostStatus::NotRunning;
         }
         if (inputQueue_.size() >= queueLimits_.maxMessages ||
-            byteSize > queueLimits_.maxBytes - inputQueuedBytes_) {
+            inputQueuedBytes_ > queueLimits_.maxQueuedBytes ||
+            byteSize > queueLimits_.maxQueuedBytes - inputQueuedBytes_) {
             rejectedInputMessages_.fetch_add(1);
+            rejectedInputQueueFull_.fetch_add(1);
             return WorkerPostStatus::QueueFull;
         }
         inputQueuedBytes_ += byteSize;
@@ -158,6 +184,12 @@ WorkerThreadStats WorkerThread::stats() const {
     result.busyNanoseconds = busyNanoseconds_.load();
     result.rejectedInputMessages = rejectedInputMessages_.load();
     result.rejectedOutputMessages = rejectedOutputMessages_.load();
+    result.rejectedInputTooLarge = rejectedInputTooLarge_.load();
+    result.rejectedInputQueueFull = rejectedInputQueueFull_.load();
+    result.rejectedOutputTooLarge = rejectedOutputTooLarge_.load();
+    result.rejectedOutputQueueFull = rejectedOutputQueueFull_.load();
+    result.largestInputMessageBytes = largestInputMessageBytes_.load();
+    result.largestOutputMessageBytes = largestOutputMessageBytes_.load();
     {
         std::lock_guard<std::mutex> lock(inputMutex_);
         result.queuedInputMessages = inputQueue_.size();
@@ -178,8 +210,11 @@ std::vector<WorkerMessage> WorkerThread::drainMessages() {
     std::lock_guard<std::mutex> lock(outputMutex_);
     messages.reserve(outputQueue_.size());
     while (!outputQueue_.empty()) {
-        outputQueuedBytes_ -= messageBytes(
+        const auto measured = messageBytes(
             outputQueue_.front().payload, outputQueue_.front().transfers);
+        outputQueuedBytes_ = measured.overflow || measured.value > outputQueuedBytes_
+            ? 0
+            : outputQueuedBytes_ - measured.value;
         messages.push_back(std::move(outputQueue_.front()));
         outputQueue_.pop();
     }
@@ -191,16 +226,20 @@ WorkerPostStatus WorkerThread::enqueueOutput(
     std::string payload,
     std::vector<js::TransferredArrayBuffer> transfers) {
     std::lock_guard<std::mutex> lock(outputMutex_);
-    const size_t byteSize = messageBytes(payload, transfers);
+    const auto measured = messageBytes(payload, transfers);
+    recordMaximum(largestOutputMessageBytes_, measured.value);
+    const size_t byteSize = measured.value;
     if (type != WorkerMessage::Type::Ready && type != WorkerMessage::Type::Exited) {
-        if (byteSize > queueLimits_.maxBytes) {
+        if (measured.overflow || byteSize > queueLimits_.maxMessageBytes) {
             rejectedOutputMessages_.fetch_add(1);
+            rejectedOutputTooLarge_.fetch_add(1);
             return WorkerPostStatus::MessageTooLarge;
         }
         if (outputQueue_.size() >= queueLimits_.maxMessages ||
-            outputQueuedBytes_ > queueLimits_.maxBytes ||
-            byteSize > queueLimits_.maxBytes - outputQueuedBytes_) {
+            outputQueuedBytes_ > queueLimits_.maxQueuedBytes ||
+            byteSize > queueLimits_.maxQueuedBytes - outputQueuedBytes_) {
             rejectedOutputMessages_.fetch_add(1);
+            rejectedOutputQueueFull_.fetch_add(1);
             return WorkerPostStatus::QueueFull;
         }
     }
@@ -556,7 +595,10 @@ void WorkerThread::threadMain() {
             if (terminated_.load()) break;
             if (inputQueue_.empty()) continue;
             pending = std::move(inputQueue_.front());
-            inputQueuedBytes_ -= messageBytes(pending.serialized, pending.transfers);
+            const auto measured = messageBytes(pending.serialized, pending.transfers);
+            inputQueuedBytes_ = measured.overflow || measured.value > inputQueuedBytes_
+                ? 0
+                : inputQueuedBytes_ - measured.value;
             inputQueue_.pop();
         }
         dispatchMessage(engine.get(), pending);

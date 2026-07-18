@@ -19,12 +19,13 @@ WorkerRegistry::~WorkerRegistry() {
 
 int WorkerRegistry::createWorker(WorkerSourceKind sourceKind,
                                  const std::string& source,
-                                 const std::string& name) {
+                                 const std::string& name,
+                                 WorkerQueueLimits queueLimits) {
     std::lock_guard<std::mutex> lock(mutex_);
     const int id = nextId_++;
     createdWorkers_++;
     auto worker = std::make_unique<WorkerThread>(
-        id, engineType_, sourceKind, source, rootDir_, name, sharedBuffers_);
+        id, engineType_, sourceKind, source, rootDir_, name, sharedBuffers_, queueLimits);
     worker->start();
     workers_.emplace(id, std::move(worker));
     return id;
@@ -58,10 +59,18 @@ void WorkerRegistry::terminateWorker(int id) {
         completedBusyNanoseconds_ += stats.busyNanoseconds;
         completedRejectedInputMessages_ += stats.rejectedInputMessages;
         completedRejectedOutputMessages_ += stats.rejectedOutputMessages;
+        completedRejectedInputTooLarge_ += stats.rejectedInputTooLarge;
+        completedRejectedInputQueueFull_ += stats.rejectedInputQueueFull;
+        completedRejectedOutputTooLarge_ += stats.rejectedOutputTooLarge;
+        completedRejectedOutputQueueFull_ += stats.rejectedOutputQueueFull;
         peakQueuedInputBytes_ = std::max(peakQueuedInputBytes_,
             static_cast<uint64_t>(stats.peakQueuedInputBytes));
         peakQueuedOutputBytes_ = std::max(peakQueuedOutputBytes_,
             static_cast<uint64_t>(stats.peakQueuedOutputBytes));
+        largestInputMessageBytes_ = std::max(largestInputMessageBytes_,
+            static_cast<uint64_t>(stats.largestInputMessageBytes));
+        largestOutputMessageBytes_ = std::max(largestOutputMessageBytes_,
+            static_cast<uint64_t>(stats.largestOutputMessageBytes));
     }
 }
 
@@ -102,8 +111,14 @@ void WorkerRegistry::shutdown() {
     uint64_t busyNanoseconds = 0;
     uint64_t rejectedInputMessages = 0;
     uint64_t rejectedOutputMessages = 0;
+    uint64_t rejectedInputTooLarge = 0;
+    uint64_t rejectedInputQueueFull = 0;
+    uint64_t rejectedOutputTooLarge = 0;
+    uint64_t rejectedOutputQueueFull = 0;
     uint64_t peakInputBytes = 0;
     uint64_t peakOutputBytes = 0;
+    uint64_t largestInputMessageBytes = 0;
+    uint64_t largestOutputMessageBytes = 0;
     for (auto& entry : workers) {
         entry.second->terminate();
         const auto stats = entry.second->stats();
@@ -112,10 +127,18 @@ void WorkerRegistry::shutdown() {
         busyNanoseconds += stats.busyNanoseconds;
         rejectedInputMessages += stats.rejectedInputMessages;
         rejectedOutputMessages += stats.rejectedOutputMessages;
+        rejectedInputTooLarge += stats.rejectedInputTooLarge;
+        rejectedInputQueueFull += stats.rejectedInputQueueFull;
+        rejectedOutputTooLarge += stats.rejectedOutputTooLarge;
+        rejectedOutputQueueFull += stats.rejectedOutputQueueFull;
         peakInputBytes = std::max(peakInputBytes,
             static_cast<uint64_t>(stats.peakQueuedInputBytes));
         peakOutputBytes = std::max(peakOutputBytes,
             static_cast<uint64_t>(stats.peakQueuedOutputBytes));
+        largestInputMessageBytes = std::max(largestInputMessageBytes,
+            static_cast<uint64_t>(stats.largestInputMessageBytes));
+        largestOutputMessageBytes = std::max(largestOutputMessageBytes,
+            static_cast<uint64_t>(stats.largestOutputMessageBytes));
     }
     std::lock_guard<std::mutex> lock(mutex_);
     completedMessages_ += messages;
@@ -123,8 +146,14 @@ void WorkerRegistry::shutdown() {
     completedBusyNanoseconds_ += busyNanoseconds;
     completedRejectedInputMessages_ += rejectedInputMessages;
     completedRejectedOutputMessages_ += rejectedOutputMessages;
+    completedRejectedInputTooLarge_ += rejectedInputTooLarge;
+    completedRejectedInputQueueFull_ += rejectedInputQueueFull;
+    completedRejectedOutputTooLarge_ += rejectedOutputTooLarge;
+    completedRejectedOutputQueueFull_ += rejectedOutputQueueFull;
     peakQueuedInputBytes_ = std::max(peakQueuedInputBytes_, peakInputBytes);
     peakQueuedOutputBytes_ = std::max(peakQueuedOutputBytes_, peakOutputBytes);
+    largestInputMessageBytes_ = std::max(largestInputMessageBytes_, largestInputMessageBytes);
+    largestOutputMessageBytes_ = std::max(largestOutputMessageBytes_, largestOutputMessageBytes);
 }
 
 size_t WorkerRegistry::size() const {
@@ -142,8 +171,14 @@ WorkerRegistryStats WorkerRegistry::stats() const {
     result.busyNanoseconds = completedBusyNanoseconds_;
     result.rejectedInputMessages = completedRejectedInputMessages_;
     result.rejectedOutputMessages = completedRejectedOutputMessages_;
+    result.rejectedInputTooLarge = completedRejectedInputTooLarge_;
+    result.rejectedInputQueueFull = completedRejectedInputQueueFull_;
+    result.rejectedOutputTooLarge = completedRejectedOutputTooLarge_;
+    result.rejectedOutputQueueFull = completedRejectedOutputQueueFull_;
     result.peakQueuedInputBytes = peakQueuedInputBytes_;
     result.peakQueuedOutputBytes = peakQueuedOutputBytes_;
+    result.largestInputMessageBytes = largestInputMessageBytes_;
+    result.largestOutputMessageBytes = largestOutputMessageBytes_;
     for (const auto& entry : workers_) {
         const auto stats = entry.second->stats();
         result.processedMessages += stats.processedMessages;
@@ -151,6 +186,10 @@ WorkerRegistryStats WorkerRegistry::stats() const {
         result.busyNanoseconds += stats.busyNanoseconds;
         result.rejectedInputMessages += stats.rejectedInputMessages;
         result.rejectedOutputMessages += stats.rejectedOutputMessages;
+        result.rejectedInputTooLarge += stats.rejectedInputTooLarge;
+        result.rejectedInputQueueFull += stats.rejectedInputQueueFull;
+        result.rejectedOutputTooLarge += stats.rejectedOutputTooLarge;
+        result.rejectedOutputQueueFull += stats.rejectedOutputQueueFull;
         result.queuedInputMessages += stats.queuedInputMessages;
         result.queuedInputBytes += stats.queuedInputBytes;
         result.queuedOutputMessages += stats.queuedOutputMessages;
@@ -159,6 +198,10 @@ WorkerRegistryStats WorkerRegistry::stats() const {
             static_cast<uint64_t>(stats.peakQueuedInputBytes));
         result.peakQueuedOutputBytes = std::max(result.peakQueuedOutputBytes,
             static_cast<uint64_t>(stats.peakQueuedOutputBytes));
+        result.largestInputMessageBytes = std::max(result.largestInputMessageBytes,
+            static_cast<uint64_t>(stats.largestInputMessageBytes));
+        result.largestOutputMessageBytes = std::max(result.largestOutputMessageBytes,
+            static_cast<uint64_t>(stats.largestOutputMessageBytes));
     }
     return result;
 }

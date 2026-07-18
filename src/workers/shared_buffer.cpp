@@ -374,6 +374,19 @@ const char* sharedApiSource() {
         return JSON.stringify(value);
     }
 
+    const WIRE_VERSION = 1;
+    const TYPED_ARRAY_NAMES = [
+        'Int8Array', 'Uint8Array', 'Uint8ClampedArray',
+        'Int16Array', 'Uint16Array', 'Int32Array', 'Uint32Array',
+        'Float16Array', 'Float32Array', 'Float64Array',
+        'BigInt64Array', 'BigUint64Array',
+    ];
+    const TYPED_ARRAY_CTORS = Object.create(null);
+    for (const name of TYPED_ARRAY_NAMES) {
+        const ctor = globalThis[name];
+        if (typeof ctor === 'function') TYPED_ARRAY_CTORS[name] = ctor;
+    }
+
     const transferredBuffers = new WeakSet();
 
     function prepareMessage(value, transferList = []) {
@@ -388,24 +401,151 @@ const char* sharedApiSource() {
             if (transferredBuffers.has(buffer)) throw new TypeError('Worker transfer list contains a detached ArrayBuffer');
             indexes.set(buffer, index);
         }
-        const payload = JSON.stringify(value, (_key, item) => {
-            const index = indexes.get(item);
-            return index === undefined ? item : { $mystralTransferredBuffer: index };
-        });
-        if (typeof payload !== 'string') throw new TypeError('Worker message must be JSON-compatible');
+
+        const attachments = transfers.slice();
+        const stack = new WeakSet();
+
+        function bufferIndex(buffer) {
+            if (!(buffer instanceof ArrayBuffer)) {
+                throw new TypeError('Raw SharedArrayBuffer views are not message values; send a SharedBuffer handle');
+            }
+            const existing = indexes.get(buffer);
+            if (existing !== undefined) return existing;
+            const copy = buffer.slice(0);
+            const index = attachments.length;
+            attachments.push(copy);
+            indexes.set(buffer, index);
+            return index;
+        }
+
+        function encode(item, arrayElement = false) {
+            if (item === null || typeof item === 'string' || typeof item === 'boolean') return item;
+            if (typeof item === 'number') return Number.isFinite(item) ? item : null;
+            if (typeof item === 'undefined' || typeof item === 'function' || typeof item === 'symbol') {
+                if (arrayElement) return null;
+                return undefined;
+            }
+            if (typeof item === 'bigint') {
+                throw new TypeError('Worker message does not support BigInt values');
+            }
+            if (item instanceof ArrayBuffer) {
+                return ['arraybuffer', bufferIndex(item)];
+            }
+            if (ArrayBuffer.isView(item)) {
+                const index = bufferIndex(item.buffer);
+                if (item instanceof DataView) {
+                    return ['view', 'DataView', index, item.byteOffset, item.byteLength];
+                }
+                const name = item.constructor && item.constructor.name;
+                if (!name || TYPED_ARRAY_CTORS[name] !== item.constructor) {
+                    throw new TypeError('Worker message contains an unsupported TypedArray');
+                }
+                return ['view', name, index, item.byteOffset, item.length];
+            }
+            if (typeof SharedArrayBuffer !== 'undefined' && item instanceof SharedArrayBuffer) {
+                throw new TypeError('Raw SharedArrayBuffer is not a message value; send a SharedBuffer handle');
+            }
+
+            const jsonValue = typeof item.toJSON === 'function' ? item.toJSON() : item;
+            if (jsonValue !== item) return encode(jsonValue, arrayElement);
+            if (stack.has(item)) throw new TypeError('Worker message contains a circular value');
+            stack.add(item);
+            let encoded;
+            if (Array.isArray(item)) {
+                const values = new Array(item.length);
+                for (let index = 0; index < item.length; index++) {
+                    values[index] = encode(item[index], true);
+                }
+                encoded = ['array', values];
+            } else {
+                const entries = [];
+                for (const key of Object.keys(item)) {
+                    const child = encode(item[key], false);
+                    if (child !== undefined) entries.push([key, child]);
+                }
+                encoded = ['object', entries];
+            }
+            stack.delete(item);
+            return encoded;
+        }
+
+        const encoded = encode(value, false);
+        if (encoded === undefined) throw new TypeError('Worker message must be JSON-compatible');
+        const payload = JSON.stringify({ $mystralWire: WIRE_VERSION, value: encoded });
         for (const buffer of transfers) transferredBuffers.add(buffer);
-        return { payload, transfers };
+        return { payload, transfers: attachments };
     }
 
     function parseMessage(value, transfers = []) {
-        return JSON.parse(value, (key, item) => {
-            if (item && Number.isInteger(item.$mystralTransferredBuffer)) {
-                const buffer = transfers[item.$mystralTransferredBuffer];
-                if (!(buffer instanceof ArrayBuffer)) throw new TypeError('Invalid transferred ArrayBuffer marker');
-                return buffer;
+        const envelope = JSON.parse(value);
+        if (!envelope || envelope.$mystralWire !== WIRE_VERSION || !('value' in envelope)) {
+            return JSON.parse(value, reviveShared);
+        }
+
+        function transferredBuffer(index) {
+            if (!Number.isInteger(index) || index < 0 || index >= transfers.length) {
+                throw new TypeError('Worker message contains an invalid buffer index');
             }
-            return reviveShared(key, item);
-        });
+            const buffer = transfers[index];
+            if (!(buffer instanceof ArrayBuffer)) {
+                throw new TypeError('Worker message attachment is not an ArrayBuffer');
+            }
+            return buffer;
+        }
+
+        function decode(encoded) {
+            if (encoded === null || typeof encoded === 'string' ||
+                typeof encoded === 'boolean' || typeof encoded === 'number') return encoded;
+            if (!Array.isArray(encoded) || typeof encoded[0] !== 'string') {
+                throw new TypeError('Worker message contains an invalid encoded value');
+            }
+            const tag = encoded[0];
+            if (tag === 'arraybuffer') return transferredBuffer(encoded[1]);
+            if (tag === 'view') {
+                const name = encoded[1];
+                const buffer = transferredBuffer(encoded[2]);
+                const byteOffset = encoded[3];
+                const length = encoded[4];
+                if (!Number.isSafeInteger(byteOffset) || byteOffset < 0 ||
+                    !Number.isSafeInteger(length) || length < 0) {
+                    throw new TypeError('Worker message contains invalid view bounds');
+                }
+                try {
+                    if (name === 'DataView') return new DataView(buffer, byteOffset, length);
+                    const ctor = TYPED_ARRAY_CTORS[name];
+                    if (typeof ctor !== 'function') {
+                        throw new TypeError('Worker message contains an unsupported TypedArray: ' + name);
+                    }
+                    return new ctor(buffer, byteOffset, length);
+                } catch (error) {
+                    if (error instanceof TypeError && String(error.message).startsWith('Worker message')) throw error;
+                    throw new TypeError('Worker message view is outside its backing buffer');
+                }
+            }
+            if (tag === 'array') {
+                if (!Array.isArray(encoded[1])) throw new TypeError('Worker message contains an invalid array');
+                return encoded[1].map(decode);
+            }
+            if (tag === 'object') {
+                if (!Array.isArray(encoded[1])) throw new TypeError('Worker message contains an invalid object');
+                const result = {};
+                for (const entry of encoded[1]) {
+                    if (!Array.isArray(entry) || entry.length !== 2 || typeof entry[0] !== 'string') {
+                        throw new TypeError('Worker message contains an invalid object entry');
+                    }
+                    Object.defineProperty(result, entry[0], {
+                        value: decode(entry[1]),
+                        enumerable: true,
+                        configurable: true,
+                        writable: true,
+                    });
+                }
+                return reviveShared('', result);
+            }
+            throw new TypeError('Worker message contains an unknown value tag');
+        }
+
+        return decode(envelope.value);
     }
 
     function buildLayout(fields, capacity) {

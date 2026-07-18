@@ -41,6 +41,12 @@ std::string ModuleResolver::normalizeSpecifier(const std::string& specifier) con
     std::string normalized = specifier;
     if (startsWith(normalized, "file://")) {
         normalized = normalized.substr(7);
+#ifdef _WIN32
+        if (normalized.size() > 3 && normalized[0] == '/' &&
+            std::isalpha(static_cast<unsigned char>(normalized[1])) && normalized[2] == ':') {
+            normalized.erase(0, 1);
+        }
+#endif
     }
     std::replace(normalized.begin(), normalized.end(), '\\', '/');
     return normalized;
