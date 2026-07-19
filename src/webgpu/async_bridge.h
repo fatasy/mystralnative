@@ -35,7 +35,7 @@ public:
     bool isCurrent(const PendingPromise* pending) const;
 
     void enqueue(std::function<void()> completion);
-    void process();
+    size_t process(size_t maxCount = static_cast<size_t>(-1));
     void invalidateSession();
 
     size_t pendingCount() const { return pendingPromises_.size(); }

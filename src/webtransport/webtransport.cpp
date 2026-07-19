@@ -940,7 +940,7 @@ void streamShutdown(uint32_t id, uint64_t streamId, uint64_t code) {
 // Per-frame driver
 // ---------------------------------------------------------------------------
 
-void processEvents() {
+void processEvents(size_t maxEvents) {
     // Advance each session's state machine and collect events.
     std::vector<uint32_t> toTeardown;
     for (auto& [id, sessPtr] : g_sessions) {
@@ -1023,7 +1023,8 @@ void processEvents() {
     }
 
     // Drain the event queue to JS (on the main thread).
-    while (!g_events.empty()) {
+    size_t dispatched = 0;
+    while (!g_events.empty() && dispatched++ < maxEvents) {
         Event e = std::move(g_events.front());
         g_events.pop();
         dispatchEvent(e);
@@ -1195,7 +1196,7 @@ namespace webtransport {
 
 void init() {}
 void shutdown() {}
-void processEvents() {}
+void processEvents(size_t) {}
 bool hasActiveSessions() { return false; }
 
 bool initBindings(js::Engine* engine) {

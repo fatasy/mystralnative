@@ -3,7 +3,9 @@
 #include "webgpu/binding_internal.h"
 #include "mystral/webgpu_compat.h"
 
+#include <cmath>
 #include <iostream>
+#include <limits>
 #include <string>
 
 namespace mystral::webgpu {
@@ -85,6 +87,9 @@ void releaseBuffer(uint64_t id, bool destroy) {
     if (it == g_bufferRegistry.end()) return;
     if (destroy) wgpuBufferDestroy(it->second.buffer);
     wgpuBufferRelease(it->second.buffer);
+    g_trackedBufferBytes = it->second.size > g_trackedBufferBytes
+        ? 0
+        : g_trackedBufferBytes - it->second.size;
     g_bufferRegistry.erase(it);
 }
 
@@ -99,13 +104,23 @@ void installBufferBindings(js::JSValueHandle device) {    // device.createBuffer
             auto descriptor = args[0];
             double size = g_engine->toNumber(g_engine->getProperty(descriptor, "size"));
             double usage = g_engine->toNumber(g_engine->getProperty(descriptor, "usage"));
+            if (!std::isfinite(size) || size <= 0 || std::floor(size) != size ||
+                size > static_cast<double>((std::numeric_limits<uint64_t>::max)())) {
+                g_engine->throwException("createBuffer size must be a positive integer");
+                return g_engine->newUndefined();
+            }
+            const uint64_t bufferSize = static_cast<uint64_t>(size);
+            if (!canAllocateTrackedGpuBytes(bufferSize)) {
+                g_engine->throwException("GPU memory budget exceeded by createBuffer");
+                return g_engine->newUndefined();
+            }
 
             // Check for mappedAtCreation
             auto mappedAtCreationProp = g_engine->getProperty(descriptor, "mappedAtCreation");
             bool mappedAtCreation = !g_engine->isUndefined(mappedAtCreationProp) && g_engine->toBoolean(mappedAtCreationProp);
 
             WGPUBufferDescriptor bufferDesc = {};
-            bufferDesc.size = (uint64_t)size;
+            bufferDesc.size = bufferSize;
             bufferDesc.usage = (WGPUBufferUsage)(uint32_t)usage;
             bufferDesc.mappedAtCreation = mappedAtCreation;
 
@@ -119,7 +134,9 @@ void installBufferBindings(js::JSValueHandle device) {    // device.createBuffer
             uint64_t bufferId = g_nextBufferId++;
             // mappedAtCreation buffers are mapped for write
             WGPUMapMode initialMapMode = mappedAtCreation ? WGPUMapMode_Write : WGPUMapMode_None;
-            g_bufferRegistry[bufferId] = {buffer, (uint64_t)size, (WGPUBufferUsage)(uint32_t)usage, mappedAtCreation, nullptr, 0, initialMapMode, false};
+            g_bufferRegistry[bufferId] = {buffer, bufferSize, (WGPUBufferUsage)(uint32_t)usage, mappedAtCreation, nullptr, 0, initialMapMode, false};
+            g_trackedBufferBytes += bufferSize;
+            updatePeakTrackedGpuBytes();
 
             auto jsBuffer = g_engine->newObject();
             g_engine->setPrivateData(jsBuffer, buffer);

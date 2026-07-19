@@ -9,7 +9,17 @@ size_t canvas2DContextCount();
 
 namespace mystral::webgpu {
 
-void installDiagnosticsBindings(js::Engine* engine) {    engine->setGlobalProperty("__mystralWebGpuStats",
+void installDiagnosticsBindings(js::Engine* engine) {
+    engine->setGlobalProperty("__mystralSetWebGpuProfiling",
+        engine->newFunction("__mystralSetWebGpuProfiling", [](void*, const std::vector<js::JSValueHandle>& args) {
+            const bool enabled = !args.empty() && g_engine->toBoolean(args[0]);
+            if (args.size() > 1 && g_engine->toBoolean(args[1])) bridge::reset();
+            bridge::setEnabled(enabled);
+            return g_engine->newUndefined();
+        })
+    );
+
+    engine->setGlobalProperty("__mystralWebGpuStats",
         engine->newFunction("__mystralWebGpuStats", [](void* ctx, const std::vector<js::JSValueHandle>& args) {
             auto result = g_engine->newObject();
             auto set = [&](const char* name, uint64_t value) {
@@ -27,6 +37,12 @@ void installDiagnosticsBindings(js::Engine* engine) {    engine->setGlobalProper
             set("deferredUploadCommandBuffers", queueStats.deferredUploadCommandBuffers);
             set("forcedFrameFlushes", queueStats.forcedFrameFlushes);
             set("maxCommandBuffersPerNativeSubmit", queueStats.maxCommandBuffersPerNativeSubmit);
+            set("uploadBufferAllocations", queueStats.uploadBufferAllocations);
+            set("uploadBufferCapacityBytes", queueStats.uploadBufferCapacityBytes);
+            set("peakUploadBytesPerFlush", queueStats.peakUploadBytesPerFlush);
+            set("frameLatencyWaits", queueStats.frameLatencyWaits);
+            set("frameLatencyWaitNanoseconds", queueStats.frameLatencyWaitNanoseconds);
+            set("maxInFlightSubmissions", queueStats.maxInFlightSubmissions);
             set("activeCommandEncoders", g_commandEncoders.liveCommandEncoderCount());
             set("activeRenderPasses", g_commandEncoders.liveRenderPassCount());
             set("activeComputePasses", g_commandEncoders.liveComputePassCount());
@@ -34,10 +50,16 @@ void installDiagnosticsBindings(js::Engine* engine) {    engine->setGlobalProper
             set("activeTextures", g_textureRegistry.size());
             set("activeRenderPipelines", g_renderPipelineRegistry.size());
             set("activeComputePipelines", g_computePipelineRegistry.size());
+            set("trackedBufferBytes", g_trackedBufferBytes);
+            set("estimatedTextureBytes", g_estimatedTextureBytes);
+            set("trackedGpuBytes", g_trackedBufferBytes + g_estimatedTextureBytes);
+            set("peakTrackedGpuBytes", g_peakTrackedGpuBytes);
+            set("maxTrackedGpuMemoryBytes", g_maxTrackedGpuMemoryBytes);
             set("activeOffscreenCanvases", g_offscreenCanvases.size());
             set("activeCanvas2DContexts", canvas::canvas2DContextCount());
             set("pendingAsyncOperations", g_asyncBridge.pendingCount());
             set("queuedAsyncCompletions", g_asyncBridge.queuedCount());
+            set("bridgeProfilingEnabled", bridge::isEnabled() ? 1 : 0);
 
             auto bridge = g_engine->newObject();
             const auto& bridgeMetrics = bridge::metrics();

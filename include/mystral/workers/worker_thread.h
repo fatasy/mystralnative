@@ -124,7 +124,8 @@ public:
         std::string payload,
         std::vector<js::TransferredArrayBuffer> transfers = {});
     void terminate();
-    std::vector<WorkerMessage> drainMessages();
+    std::vector<WorkerMessage> drainMessages(size_t maxCount = static_cast<size_t>(-1));
+    bool hasPendingMessages() const;
 
     bool isFinished() const;
     int id() const { return id_; }

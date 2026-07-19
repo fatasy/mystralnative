@@ -45,8 +45,16 @@ extern std::unordered_map<uint64_t, WGPUComputePipeline>& g_computePipelineRegis
 extern uint64_t& g_nextComputePipelineId;
 extern std::unordered_map<uint64_t, WGPURenderPipeline>& g_renderPipelineRegistry;
 extern uint64_t& g_nextRenderPipelineId;
+extern uint64_t& g_trackedBufferBytes;
+extern uint64_t& g_estimatedTextureBytes;
+extern uint64_t& g_peakTrackedGpuBytes;
+extern uint64_t& g_maxTrackedGpuMemoryBytes;
 
 bool gcReleaseEnabled();
+uint64_t estimateTextureBytes(WGPUTextureFormat format, uint32_t width, uint32_t height,
+                              uint32_t depthOrLayers, uint32_t mipLevels, uint32_t samples);
+bool canAllocateTrackedGpuBytes(uint64_t additionalBytes);
+void updatePeakTrackedGpuBytes();
 bool writeQueueBuffer(
     js::JSValueHandle bufferHandle,
     js::JSValueHandle offsetHandle,

@@ -102,14 +102,24 @@ void storeDawnCacheData(
 
 }  // namespace
 
-void attachDawnCache(WGPUDeviceDescriptor& deviceDesc,
-                     WGPUDawnCacheDeviceDescriptor& cacheDesc) {
+void attachDawnDeviceOptions(WGPUDeviceDescriptor& deviceDesc,
+                             WGPUDawnCacheDeviceDescriptor& cacheDesc,
+                             WGPUDawnTogglesDescriptor& togglesDesc) {
     cacheDesc = WGPU_DAWN_CACHE_DEVICE_DESCRIPTOR_INIT;
     cacheDesc.isolationKey = WGPU_STRING_VIEW("mystralnative-dawn-v1");
     cacheDesc.loadDataFunction = loadDawnCacheData;
     cacheDesc.storeDataFunction = storeDawnCacheData;
     cacheDesc.functionUserdata = &dawnDiskCache();
-    deviceDesc.nextInChain = &cacheDesc.chain;
+
+    // Dawn still gates command-encoder writeTimestamp behind this toggle.
+    // The timestamp-query feature is requested separately and remains the
+    // hardware capability gate exposed to JavaScript.
+    static const char* enabledToggles[] = {"allow_unsafe_apis"};
+    togglesDesc = WGPU_DAWN_TOGGLES_DESCRIPTOR_INIT;
+    togglesDesc.enabledToggleCount = 1;
+    togglesDesc.enabledToggles = enabledToggles;
+    togglesDesc.chain.next = &cacheDesc.chain;
+    deviceDesc.nextInChain = &togglesDesc.chain;
 }
 
 // Dawn callback signatures

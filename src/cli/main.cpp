@@ -34,6 +34,7 @@
 #include <array>
 #include <deque>
 #include <iomanip>
+#include <limits>
 
 // WebP animation encoding (for video recording)
 #ifdef MYSTRAL_HAS_WEBP_MUX
@@ -360,6 +361,10 @@ RUN OPTIONS:
     --headless            Run with hidden window (background mode)
     --no-sdl              Run without SDL (headless GPU, no window system required)
     --watch, -w           Watch mode: reload script on file changes
+    --no-vsync            Prefer mailbox/immediate presentation when supported
+    --present-mode <mode> auto|fifo|fifo-relaxed|immediate|mailbox
+    --max-frame-latency <n> Presentation latency target (default: 2)
+    --gpu-memory-budget-mb <n> Reject tracked GPU allocations above this budget
     --screenshot <file>   Take screenshot after N frames and quit
     --frames <n>          Number of frames before screenshot (default: 60)
     --quiet, -q           Suppress all output except errors
@@ -467,6 +472,10 @@ struct CLIOptions {
     bool showVersion = false;
     bool headless = false;
     bool watch = false;  // Watch mode for hot reloading
+    bool vsync = true;
+    std::string presentMode = "auto";
+    uint32_t maxFrameLatency = 2;
+    uint64_t gpuMemoryBudgetMiB = 0;
 
     // Screenshot mode
     std::string screenshotPath;
@@ -543,6 +552,14 @@ CLIOptions parseArgs(int argc, char* argv[]) {
             opts.noSdl = true;
         } else if (arg == "--watch" || arg == "-w") {
             opts.watch = true;
+        } else if (arg == "--no-vsync") {
+            opts.vsync = false;
+        } else if (arg == "--present-mode" && i + 1 < argc) {
+            opts.presentMode = argv[++i];
+        } else if (arg == "--max-frame-latency" && i + 1 < argc) {
+            opts.maxFrameLatency = static_cast<uint32_t>(std::stoul(argv[++i]));
+        } else if (arg == "--gpu-memory-budget-mb" && i + 1 < argc) {
+            opts.gpuMemoryBudgetMiB = std::stoull(argv[++i]);
         } else if (arg == "--bundle-only") {
             opts.bundleOnly = true;
         } else if ((arg == "--video" || arg == "--record") && i + 1 < argc) {
@@ -1631,6 +1648,22 @@ int runScript(const CLIOptions& opts) {
     config.noSdl = opts.noSdl;
     config.watch = opts.watch;
     config.debug = debugMode;
+    config.vsync = opts.vsync;
+    config.maxFrameLatency = std::max<uint32_t>(1, opts.maxFrameLatency);
+    if (opts.gpuMemoryBudgetMiB > (std::numeric_limits<uint64_t>::max)() / (1024ull * 1024ull)) {
+        std::cerr << "Error: --gpu-memory-budget-mb is too large." << std::endl;
+        return 1;
+    }
+    config.maxTrackedGpuMemoryBytes = opts.gpuMemoryBudgetMiB * 1024ull * 1024ull;
+    if (opts.presentMode == "auto") config.presentMode = mystral::PresentMode::Auto;
+    else if (opts.presentMode == "fifo") config.presentMode = mystral::PresentMode::Fifo;
+    else if (opts.presentMode == "fifo-relaxed") config.presentMode = mystral::PresentMode::FifoRelaxed;
+    else if (opts.presentMode == "immediate") config.presentMode = mystral::PresentMode::Immediate;
+    else if (opts.presentMode == "mailbox") config.presentMode = mystral::PresentMode::Mailbox;
+    else {
+        std::cerr << "Error: invalid --present-mode '" << opts.presentMode << "'." << std::endl;
+        return 1;
+    }
 
     struct DebugLogEntry {
         uint64_t sequence;

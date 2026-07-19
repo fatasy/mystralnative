@@ -144,6 +144,31 @@ void installCommandBindings(js::JSValueHandle device) {    // device.createComma
                     renderPassDesc.colorAttachmentCount = colorAttachmentList.size();
                     renderPassDesc.colorAttachments = colorAttachmentList.data();
 
+                    WGPUPassTimestampWrites timestampWrites = WGPU_PASS_TIMESTAMP_WRITES_INIT;
+                    auto timestampWritesProp = g_engine->getProperty(descriptor, "timestampWrites");
+                    if (g_engine->isObject(timestampWritesProp)) {
+                        timestampWrites.querySet = (WGPUQuerySet)g_engine->getPrivateData(
+                            g_engine->getProperty(timestampWritesProp, "querySet"));
+                        auto beginIndex = g_engine->getProperty(
+                            timestampWritesProp, "beginningOfPassWriteIndex");
+                        auto endIndex = g_engine->getProperty(
+                            timestampWritesProp, "endOfPassWriteIndex");
+                        if (!g_engine->isUndefined(beginIndex)) {
+                            timestampWrites.beginningOfPassWriteIndex =
+                                (uint32_t)g_engine->toNumber(beginIndex);
+                        }
+                        if (!g_engine->isUndefined(endIndex)) {
+                            timestampWrites.endOfPassWriteIndex =
+                                (uint32_t)g_engine->toNumber(endIndex);
+                        }
+                        if (timestampWrites.querySet) renderPassDesc.timestampWrites = &timestampWrites;
+                    }
+                    auto occlusionQuerySet = g_engine->getProperty(descriptor, "occlusionQuerySet");
+                    if (g_engine->isObject(occlusionQuerySet)) {
+                        renderPassDesc.occlusionQuerySet =
+                            (WGPUQuerySet)g_engine->getPrivateData(occlusionQuerySet);
+                    }
+
                     // Parse depth stencil attachment if present
                     WGPURenderPassDepthStencilAttachment depthStencilAttachment = {};
                     auto depthStencilProp = g_engine->getProperty(descriptor, "depthStencilAttachment");
@@ -516,6 +541,41 @@ void installCommandBindings(js::JSValueHandle device) {    // device.createComma
                         })
                     );
 
+                    g_engine->setProperty(jsRenderPass, "writeTimestamp",
+                        sharedMethod(g_transientMethods.renderWriteTimestamp, "writeTimestamp",
+                            [](void*, js::JSValueHandle receiver, const std::vector<js::JSValueHandle>& args) {
+                                WGPURenderPassEncoder pass =
+                                    (WGPURenderPassEncoder)g_engine->getPrivateData(receiver);
+                                if (!pass || args.size() < 2) return g_engine->newUndefined();
+                                WGPUQuerySet querySet =
+                                    (WGPUQuerySet)g_engine->getPrivateData(args[0]);
+                                const uint32_t queryIndex = (uint32_t)g_engine->toNumber(args[1]);
+                                if (querySet) wgpuRenderPassEncoderWriteTimestamp(pass, querySet, queryIndex);
+                                return g_engine->newUndefined();
+                            }));
+
+                    g_engine->setProperty(jsRenderPass, "beginOcclusionQuery",
+                        sharedMethod(g_transientMethods.renderBeginOcclusionQuery,
+                            "beginOcclusionQuery",
+                            [](void*, js::JSValueHandle receiver, const std::vector<js::JSValueHandle>& args) {
+                                WGPURenderPassEncoder pass =
+                                    (WGPURenderPassEncoder)g_engine->getPrivateData(receiver);
+                                if (pass && !args.empty()) {
+                                    wgpuRenderPassEncoderBeginOcclusionQuery(
+                                        pass, (uint32_t)g_engine->toNumber(args[0]));
+                                }
+                                return g_engine->newUndefined();
+                            }));
+                    g_engine->setProperty(jsRenderPass, "endOcclusionQuery",
+                        sharedMethod(g_transientMethods.renderEndOcclusionQuery,
+                            "endOcclusionQuery",
+                            [](void*, js::JSValueHandle receiver, const std::vector<js::JSValueHandle>&) {
+                                WGPURenderPassEncoder pass =
+                                    (WGPURenderPassEncoder)g_engine->getPrivateData(receiver);
+                                if (pass) wgpuRenderPassEncoderEndOcclusionQuery(pass);
+                                return g_engine->newUndefined();
+                            }));
+
                     // renderPass.end()
                     g_engine->setProperty(jsRenderPass, "end",
                         sharedMethod(g_transientMethods.renderEnd, "end",
@@ -547,6 +607,27 @@ void installCommandBindings(js::JSValueHandle device) {    // device.createComma
                     }
 
                     WGPUComputePassDescriptor computePassDesc = {};
+                    WGPUPassTimestampWrites timestampWrites = WGPU_PASS_TIMESTAMP_WRITES_INIT;
+                    if (!args.empty() && g_engine->isObject(args[0])) {
+                        auto timestampWritesProp = g_engine->getProperty(args[0], "timestampWrites");
+                        if (g_engine->isObject(timestampWritesProp)) {
+                            timestampWrites.querySet = (WGPUQuerySet)g_engine->getPrivateData(
+                                g_engine->getProperty(timestampWritesProp, "querySet"));
+                            auto beginIndex = g_engine->getProperty(
+                                timestampWritesProp, "beginningOfPassWriteIndex");
+                            auto endIndex = g_engine->getProperty(
+                                timestampWritesProp, "endOfPassWriteIndex");
+                            if (!g_engine->isUndefined(beginIndex)) {
+                                timestampWrites.beginningOfPassWriteIndex =
+                                    (uint32_t)g_engine->toNumber(beginIndex);
+                            }
+                            if (!g_engine->isUndefined(endIndex)) {
+                                timestampWrites.endOfPassWriteIndex =
+                                    (uint32_t)g_engine->toNumber(endIndex);
+                            }
+                            if (timestampWrites.querySet) computePassDesc.timestampWrites = &timestampWrites;
+                        }
+                    }
                     WGPUComputePassEncoder computePass =
                         wgpuCommandEncoderBeginComputePass(encoder, &computePassDesc);
                     g_commandEncoders.trackComputePass(encoder, computePass);
@@ -616,6 +697,19 @@ void installCommandBindings(js::JSValueHandle device) {    // device.createComma
                             return g_engine->newUndefined();
                         })
                     );
+
+                    g_engine->setProperty(jsComputePass, "writeTimestamp",
+                        sharedMethod(g_transientMethods.computeWriteTimestamp, "writeTimestamp",
+                            [](void*, js::JSValueHandle receiver, const std::vector<js::JSValueHandle>& args) {
+                                WGPUComputePassEncoder pass =
+                                    (WGPUComputePassEncoder)g_engine->getPrivateData(receiver);
+                                if (!pass || args.size() < 2) return g_engine->newUndefined();
+                                WGPUQuerySet querySet =
+                                    (WGPUQuerySet)g_engine->getPrivateData(args[0]);
+                                const uint32_t queryIndex = (uint32_t)g_engine->toNumber(args[1]);
+                                if (querySet) wgpuComputePassEncoderWriteTimestamp(pass, querySet, queryIndex);
+                                return g_engine->newUndefined();
+                            }));
 
                     // computePass.end()
                     g_engine->setProperty(jsComputePass, "end",
@@ -871,6 +965,36 @@ void installCommandBindings(js::JSValueHandle device) {    // device.createComma
                     return g_engine->newUndefined();
                 })
             );
+
+            g_engine->setProperty(jsEncoder, "writeTimestamp",
+                sharedMethod(g_transientMethods.encoderWriteTimestamp, "writeTimestamp",
+                    [](void*, js::JSValueHandle receiver, const std::vector<js::JSValueHandle>& args) {
+                        WGPUCommandEncoder encoder =
+                            (WGPUCommandEncoder)g_engine->getPrivateData(receiver);
+                        if (!encoder || args.size() < 2) return g_engine->newUndefined();
+                        WGPUQuerySet querySet = (WGPUQuerySet)g_engine->getPrivateData(args[0]);
+                        const uint32_t queryIndex = (uint32_t)g_engine->toNumber(args[1]);
+                        if (querySet) wgpuCommandEncoderWriteTimestamp(encoder, querySet, queryIndex);
+                        return g_engine->newUndefined();
+                    }));
+
+            g_engine->setProperty(jsEncoder, "resolveQuerySet",
+                sharedMethod(g_transientMethods.encoderResolveQuerySet, "resolveQuerySet",
+                    [](void*, js::JSValueHandle receiver, const std::vector<js::JSValueHandle>& args) {
+                        WGPUCommandEncoder encoder =
+                            (WGPUCommandEncoder)g_engine->getPrivateData(receiver);
+                        if (!encoder || args.size() < 5) return g_engine->newUndefined();
+                        WGPUQuerySet querySet = (WGPUQuerySet)g_engine->getPrivateData(args[0]);
+                        const uint32_t firstQuery = (uint32_t)g_engine->toNumber(args[1]);
+                        const uint32_t queryCount = (uint32_t)g_engine->toNumber(args[2]);
+                        WGPUBuffer destination = (WGPUBuffer)g_engine->getPrivateData(args[3]);
+                        const uint64_t destinationOffset = (uint64_t)g_engine->toNumber(args[4]);
+                        if (querySet && destination) {
+                            wgpuCommandEncoderResolveQuerySet(encoder, querySet, firstQuery,
+                                queryCount, destination, destinationOffset);
+                        }
+                        return g_engine->newUndefined();
+                    }));
 
             // encoder.finish(descriptor?)
             g_engine->setProperty(jsEncoder, "finish",

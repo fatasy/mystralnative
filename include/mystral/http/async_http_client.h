@@ -19,6 +19,7 @@
  */
 
 #include "mystral/http/http_client.h"  // HttpResponse, HttpOptions
+#include <cstddef>
 #include <functional>
 #include <memory>
 
@@ -108,7 +109,7 @@ public:
      * Call this from the main loop after EventLoop::runOnce().
      * Returns true if any callbacks were invoked.
      */
-    bool processCompletedRequests();
+    bool processCompletedRequests(size_t maxCount = static_cast<size_t>(-1));
 
     // Prevent copying
     AsyncHttpClient(const AsyncHttpClient&) = delete;

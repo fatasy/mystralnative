@@ -317,11 +317,12 @@ void RuntimeIOBindings::install(Engine* engine, const uint64_t* generation) {
 
 
 
-void RuntimeIOBindings::processFileCallbacks() {
+size_t RuntimeIOBindings::processFileCallbacks(size_t maxCount) {
     // Process pending file callbacks - these come from async file reads
     // We process them on the main thread to ensure JS context safety
 
-    while (!pendingFileCallbacks_.empty()) {
+    size_t processed = 0;
+    while (!pendingFileCallbacks_.empty() && processed < maxCount) {
         auto pending = std::move(pendingFileCallbacks_.front());
         pendingFileCallbacks_.pop();
 
@@ -341,7 +342,9 @@ void RuntimeIOBindings::processFileCallbacks() {
 
         // Unprotect the callback now that we're done with it
         engine_->unprotect(pending.callback);
+        ++processed;
     }
+    return processed;
 }
 
 void RuntimeIOBindings::clearFileCallbacks() {

@@ -50,9 +50,13 @@ public:
 
 private:
     Operation operation_;
+    bool enabled_ = false;
     std::chrono::steady_clock::time_point startedAt_;
 };
 
+void setEnabled(bool enabled);
+bool isEnabled();
+void reset();
 void record(Operation operation, uint64_t nanoseconds);
 void recordBytes(Operation operation, uint64_t bytes);
 

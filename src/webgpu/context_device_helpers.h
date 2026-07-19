@@ -21,9 +21,10 @@ struct DeviceRequestData {
     bool completed = false;
 };
 
-void attachDawnCache(
+void attachDawnDeviceOptions(
     WGPUDeviceDescriptor& deviceDesc,
-    WGPUDawnCacheDeviceDescriptor& cacheDesc);
+    WGPUDawnCacheDeviceDescriptor& cacheDesc,
+    WGPUDawnTogglesDescriptor& togglesDesc);
 void onAdapterRequestEnded(
     WGPURequestAdapterStatus status,
     WGPUAdapter adapter,

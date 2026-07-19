@@ -285,11 +285,11 @@ WorkerThreadStats WorkerThread::stats() const {
     return result;
 }
 
-std::vector<WorkerMessage> WorkerThread::drainMessages() {
+std::vector<WorkerMessage> WorkerThread::drainMessages(size_t maxCount) {
     std::vector<WorkerMessage> messages;
     std::lock_guard<std::mutex> lock(outputMutex_);
-    messages.reserve(outputQueue_.size());
-    while (!outputQueue_.empty()) {
+    messages.reserve(std::min(maxCount, outputQueue_.size()));
+    while (!outputQueue_.empty() && messages.size() < maxCount) {
         const auto measured = messageBytes(
             outputQueue_.front().payload, outputQueue_.front().transfers);
         outputQueuedBytes_ = measured.overflow || measured.value > outputQueuedBytes_
@@ -299,6 +299,11 @@ std::vector<WorkerMessage> WorkerThread::drainMessages() {
         outputQueue_.pop();
     }
     return messages;
+}
+
+bool WorkerThread::hasPendingMessages() const {
+    std::lock_guard<std::mutex> lock(outputMutex_);
+    return !outputQueue_.empty();
 }
 
 WorkerPostStatus WorkerThread::enqueueOutput(

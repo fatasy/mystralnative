@@ -207,6 +207,10 @@ public:
 
         // Initialize WebGPU context
         webgpu_ = std::make_unique<webgpu::Context>();
+        webgpu_->setPresentationOptions(
+            config_.vsync,
+            static_cast<uint32_t>(config_.presentMode),
+            config_.maxFrameLatency);
 
         // No-SDL mode: headless GPU without window system
         if (config_.noSdl) {
@@ -487,7 +491,7 @@ public:
         // Set up WebGPU bindings in JS
         // For no-SDL mode, pass nullptr for surface (offscreen rendering uses texture directly)
         WGPUSurface surface = config_.noSdl ? nullptr : webgpu_->getSurface();
-        if (!webgpu::initBindings(jsEngine_.get(), webgpu_->getInstance(), webgpu_->getAdapter(), webgpu_->getDevice(), webgpu_->getQueue(), surface, webgpu_->getPreferredFormat(), width_, height_, config_.debug)) {
+        if (!webgpu::initBindings(jsEngine_.get(), webgpu_->getInstance(), webgpu_->getAdapter(), webgpu_->getDevice(), webgpu_->getQueue(), surface, webgpu_->getPreferredFormat(), width_, height_, config_.debug, config_.maxFrameLatency, config_.maxTrackedGpuMemoryBytes)) {
             std::cerr << "[Mystral] Failed to initialize WebGPU bindings" << std::endl;
             return false;
         }
@@ -1053,25 +1057,25 @@ public:
 
         if (paused_ && stepFramesRemaining_ == 0) {
             // Release native job results even while JavaScript callbacks are paused.
-            async::getJobSystem().processCompletions();
-            webgpu::processAsyncCompletions();
+            async::getJobSystem().processCompletions(config_.maxJobCompletionsPerFrame);
+            webgpu::processAsyncCompletions(config_.maxWebGpuCompletionsPerFrame);
             gameLoop_.rebaseClock();
             return running_;
         }
 
         // Process completed async HTTP requests (invoke their JS callbacks)
         // This must be called after runOnce() to invoke callbacks safely on the main thread
-        http::getAsyncHttpClient().processCompletedRequests();
+        http::getAsyncHttpClient().processCompletedRequests(config_.maxHttpCompletionsPerFrame);
 
         // Drive WebTransport QUIC sessions and dispatch their JS events (main thread)
-        webtransport::processEvents();
+        webtransport::processEvents(config_.maxWebTransportEventsPerFrame);
 
         // Drain native job completions on the main thread. File completions
         // enqueue their JavaScript callbacks for the callback phase below.
-        async::getJobSystem().processCompletions();
+        async::getJobSystem().processCompletions(config_.maxJobCompletionsPerFrame);
 
         // Process file watch events (for hot reload)
-        fs::getFileWatcher().processPendingEvents();
+        fs::getFileWatcher().processPendingEvents(config_.maxFileWatchEventsPerFrame);
 
         // Check if hot reload was requested
         const auto reloadNow = std::chrono::steady_clock::now();
@@ -1088,20 +1092,20 @@ public:
         }
 
         // Execute timer callbacks (setTimeout, setInterval)
-        timers_.executeCallbacks();
+        timers_.executeCallbacks(config_.maxTimerCallbacksPerFrame);
 
         // Process any queued file callbacks that were deferred from previous frames
         // We process them here (after other callbacks) to ensure we're not in a nested callback stack
-        ioBindings_.processFileCallbacks();
+        ioBindings_.processFileCallbacks(config_.maxFileCallbacksPerFrame);
 
         // Process completed async Draco decode results
-        processPendingDracoCallbacks();
+        processPendingDracoCallbacks(config_.maxDracoCallbacksPerFrame);
 
         processWorkerMessages();
 
         // Dawn callbacks may run on internal threads. Their JavaScript Promise
         // settlement is marshalled here so V8 is only touched by this thread.
-        webgpu::processAsyncCompletions();
+        webgpu::processAsyncCompletions(config_.maxWebGpuCompletionsPerFrame);
 
         // Process microtask queue for promises
         processMicrotasks();
@@ -1998,12 +2002,16 @@ globalThis.__mystralNativeDecodeDracoAsync = function(buffer, attrs) {
 #endif
     }
 
-    void processPendingDracoCallbacks() {
+    void processPendingDracoCallbacks(size_t maxCount) {
 #ifdef MYSTRAL_HAS_DRACO
         std::queue<std::unique_ptr<DracoDecodeContext>> toProcess;
         {
             std::lock_guard<std::mutex> lock(dracoMutex_);
-            std::swap(toProcess, pendingDracoCallbacks_);
+            size_t count = 0;
+            while (!pendingDracoCallbacks_.empty() && count++ < maxCount) {
+                toProcess.push(std::move(pendingDracoCallbacks_.front()));
+                pendingDracoCallbacks_.pop();
+            }
         }
 
         while (!toProcess.empty()) {
@@ -2064,7 +2072,8 @@ globalThis.__mystralNativeDecodeDracoAsync = function(buffer, attrs) {
         if (!workerRegistry_ || !jsEngine_) return;
         std::string error;
         if (!workers::dispatchWorkerRegistryMessages(
-                jsEngine_.get(), workerRegistry_.get(), &error)) {
+                jsEngine_.get(), workerRegistry_.get(), &error,
+                config_.maxWorkerMessagesPerFrame)) {
             std::cerr << "[Worker] Main-thread message handler failed: " << error << std::endl;
         }
     }

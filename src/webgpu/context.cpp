@@ -5,6 +5,7 @@
  */
 
 #include "mystral/webgpu/context.h"
+#include <algorithm>
 #include <iostream>
 #include <vector>
 #include <filesystem>
@@ -33,6 +34,12 @@ namespace webgpu {
 using namespace detail;
 
 Context::Context() = default;
+
+void Context::setPresentationOptions(bool vsync, uint32_t presentMode, uint32_t maxFrameLatency) {
+    vsync_ = vsync;
+    requestedPresentMode_ = presentMode;
+    maxFrameLatency_ = std::max<uint32_t>(1, maxFrameLatency);
+}
 
 Context::~Context() {
     // Clean up offscreen resources
@@ -71,7 +78,13 @@ bool Context::initialize() {
     std::cout << "[WebGPU] Dawn proc table initialized" << std::endl;
 #endif
 
-    WGPUInstanceDescriptor instanceDesc = {};
+    WGPUInstanceFeatureName instanceFeatures[] = {WGPUInstanceFeatureName_TimedWaitAny};
+    WGPUInstanceLimits instanceLimits = WGPU_INSTANCE_LIMITS_INIT;
+    instanceLimits.timedWaitAnyMaxCount = 1;
+    WGPUInstanceDescriptor instanceDesc = WGPU_INSTANCE_DESCRIPTOR_INIT;
+    instanceDesc.requiredFeatureCount = 1;
+    instanceDesc.requiredFeatures = instanceFeatures;
+    instanceDesc.requiredLimits = &instanceLimits;
 
     instance_ = wgpuCreateInstance(&instanceDesc);
     if (!instance_) {
@@ -141,7 +154,8 @@ bool Context::initializeHeadless() {
     WGPUDeviceDescriptor deviceDesc = {};
     WGPU_SET_LABEL(deviceDesc, "Mystral Headless Device");
     WGPUDawnCacheDeviceDescriptor cacheDesc;
-    attachDawnCache(deviceDesc, cacheDesc);
+    WGPUDawnTogglesDescriptor togglesDesc;
+    attachDawnDeviceOptions(deviceDesc, cacheDesc, togglesDesc);
 
     WGPULimits adapterLimits = {};
     wgpuAdapterGetLimits(adapter_, &adapterLimits);

@@ -38,6 +38,8 @@ public:
      */
     bool initializeHeadless();
 
+    void setPresentationOptions(bool vsync, uint32_t presentMode, uint32_t maxFrameLatency);
+
     /**
      * Create an offscreen render target for headless rendering
      * @param width Texture width
@@ -133,6 +135,8 @@ public:
     WGPUDevice getDevice() const { return device_; }
     WGPUQueue getQueue() const { return queue_; }
     uint32_t getPreferredFormat() const { return preferredFormat_; }
+    uint32_t getPresentMode() const { return presentMode_; }
+    uint32_t getMaxFrameLatency() const { return maxFrameLatency_; }
 
     // Check if initialized
     bool isInitialized() const { return initialized_; }
@@ -165,6 +169,10 @@ private:
     bool initialized_ = false;
     bool hasIndirectFirstInstance_ = false;  // Whether INDIRECT_FIRST_INSTANCE feature is available
     bool headless_ = false;  // Running without SDL/window
+    bool vsync_ = true;
+    uint32_t requestedPresentMode_ = 0;
+    uint32_t presentMode_ = 1;
+    uint32_t maxFrameLatency_ = 2;
 
     // Offscreen rendering (for headless mode)
     void* offscreenTexture_ = nullptr;  // WGPUTexture

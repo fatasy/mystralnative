@@ -138,7 +138,8 @@ bool Context::createSurface(void* nativeHandle, int platformType) {
     WGPUDeviceDescriptor deviceDesc = {};
     WGPU_SET_LABEL(deviceDesc, "Mystral Device");
     WGPUDawnCacheDeviceDescriptor cacheDesc;
-    attachDawnCache(deviceDesc, cacheDesc);
+    WGPUDawnTogglesDescriptor togglesDesc;
+    attachDawnDeviceOptions(deviceDesc, cacheDesc, togglesDesc);
 
     // Set up required limits - copy adapter limits and override what we need
     // WebGPU default is 32 bytes per sample, but deferred rendering needs ~40
@@ -288,7 +289,8 @@ bool Context::createSurfaceWithDisplay(void* display, void* window, int platform
     WGPUDeviceDescriptor deviceDesc = {};
     WGPU_SET_LABEL(deviceDesc, "Mystral Device");
     WGPUDawnCacheDeviceDescriptor cacheDesc;
-    attachDawnCache(deviceDesc, cacheDesc);
+    WGPUDawnTogglesDescriptor togglesDesc;
+    attachDawnDeviceOptions(deviceDesc, cacheDesc, togglesDesc);
 
     WGPULimits adapterLimits = {};
     wgpuAdapterGetLimits(adapter_, &adapterLimits);
@@ -384,6 +386,27 @@ bool Context::configureSurface(uint32_t width, uint32_t height) {
     }
     std::cout << "[WebGPU] Using surface format: " << preferredFormat_ << std::endl;
 
+    auto supportsPresentMode = [&](WGPUPresentMode mode) {
+        for (size_t index = 0; index < capabilities.presentModeCount; ++index) {
+            if (capabilities.presentModes[index] == mode) return true;
+        }
+        return false;
+    };
+    WGPUPresentMode selectedPresentMode = WGPUPresentMode_Fifo;
+    if (requestedPresentMode_ != 0) {
+        const auto requested = static_cast<WGPUPresentMode>(requestedPresentMode_);
+        if (supportsPresentMode(requested)) selectedPresentMode = requested;
+    } else if (!vsync_) {
+        if (supportsPresentMode(WGPUPresentMode_Mailbox)) {
+            selectedPresentMode = WGPUPresentMode_Mailbox;
+        } else if (supportsPresentMode(WGPUPresentMode_Immediate)) {
+            selectedPresentMode = WGPUPresentMode_Immediate;
+        } else if (supportsPresentMode(WGPUPresentMode_FifoRelaxed)) {
+            selectedPresentMode = WGPUPresentMode_FifoRelaxed;
+        }
+    }
+    presentMode_ = static_cast<uint32_t>(selectedPresentMode);
+
     // Configure surface
     WGPUSurfaceConfiguration config = {};
     config.device = device_;
@@ -392,10 +415,12 @@ bool Context::configureSurface(uint32_t width, uint32_t height) {
     config.alphaMode = WGPUCompositeAlphaMode_Auto;
     config.width = width;
     config.height = height;
-    config.presentMode = WGPUPresentMode_Fifo;  // VSync
+    config.presentMode = selectedPresentMode;
 
     wgpuSurfaceConfigure(surface_, &config);
-    std::cout << "[WebGPU] Surface configured: " << width << "x" << height << std::endl;
+    std::cout << "[WebGPU] Surface configured: " << width << "x" << height
+              << ", presentMode=" << presentMode_
+              << ", maxFrameLatency=" << maxFrameLatency_ << std::endl;
 
     wgpuSurfaceCapabilitiesFreeMembers(capabilities);
     return true;

@@ -5,20 +5,66 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <limits>
 
 namespace mystral::webgpu::bridge {
 
-void FrameQueue::configure(WGPUDevice device, WGPUQueue queue) {
+namespace {
+
+void onFrameWorkDone(WGPUQueueWorkDoneStatus, WGPUStringView, void*, void*) {}
+
+}  // namespace
+
+void FrameQueue::configure(WGPUInstance instance, WGPUDevice device, WGPUQueue queue,
+                           uint32_t maxFrameLatency) {
+    if (device_ && device_ != device) reset();
+    instance_ = instance;
     device_ = device;
     queue_ = queue;
+    maxFrameLatency_ = std::max<uint32_t>(1, maxFrameLatency);
+}
+
+void FrameQueue::reset() {
+    if (hasPendingWork()) flush();
+    while (!inFlightSubmissions_.empty()) waitForOldestSubmission();
+    for (auto& slot : uploadRing_) {
+        if (slot.buffer) wgpuBufferRelease(slot.buffer);
+        slot = {};
+    }
+    nextUploadSlot_ = 0;
+    instance_ = nullptr;
+    device_ = nullptr;
+    queue_ = nullptr;
+    frameActive_ = false;
 }
 
 void FrameQueue::beginFrame() {
+    while (inFlightSubmissions_.size() >= maxFrameLatency_) {
+        waitForOldestSubmission();
+    }
     if (hasPendingWork()) {
         stats_.forcedFrameFlushes++;
         flush();
     }
     frameActive_ = true;
+}
+
+void FrameQueue::waitForOldestSubmission() {
+    if (inFlightSubmissions_.empty()) return;
+    if (!instance_) {
+        inFlightSubmissions_.pop_front();
+        return;
+    }
+
+    WGPUFutureWaitInfo waitInfo = WGPU_FUTURE_WAIT_INFO_INIT;
+    waitInfo.future = inFlightSubmissions_.front();
+    const auto startedAt = std::chrono::steady_clock::now();
+    wgpuInstanceWaitAny(instance_, 1, &waitInfo, (std::numeric_limits<uint64_t>::max)());
+    const auto elapsed = std::chrono::steady_clock::now() - startedAt;
+    stats_.frameLatencyWaits++;
+    stats_.frameLatencyWaitNanoseconds += static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count());
+    inFlightSubmissions_.pop_front();
 }
 
 void FrameQueue::endFrame() {
@@ -35,6 +81,14 @@ void FrameQueue::recordNativeSubmit(const std::vector<WGPUCommandBuffer>& comman
 
     const auto startedAt = std::chrono::steady_clock::now();
     wgpuQueueSubmit(queue_, commandBuffers.size(), commandBuffers.data());
+    if (instance_) {
+        WGPUQueueWorkDoneCallbackInfo callbackInfo = WGPU_QUEUE_WORK_DONE_CALLBACK_INFO_INIT;
+        callbackInfo.mode = WGPUCallbackMode_WaitAnyOnly;
+        callbackInfo.callback = onFrameWorkDone;
+        inFlightSubmissions_.push_back(wgpuQueueOnSubmittedWorkDone(queue_, callbackInfo));
+        stats_.maxInFlightSubmissions = std::max<uint64_t>(
+            stats_.maxInFlightSubmissions, inFlightSubmissions_.size());
+    }
     const auto elapsed = std::chrono::steady_clock::now() - startedAt;
     const uint64_t elapsedNanoseconds = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count());
@@ -82,6 +136,36 @@ void FrameQueue::fallbackFlush() {
     clearWork();
 }
 
+WGPUBuffer FrameQueue::acquireUploadBuffer(size_t requiredSize) {
+    if (!device_ || !queue_ || requiredSize == 0) return nullptr;
+    auto& slot = uploadRing_[nextUploadSlot_++ % uploadRing_.size()];
+    const uint64_t alignedSize = alignToCopyOffset(requiredSize);
+    if (!slot.buffer || slot.capacity < alignedSize) {
+        uint64_t capacity = 64 * 1024;
+        while (capacity < alignedSize) capacity *= 2;
+
+        WGPUBufferDescriptor descriptor = {};
+        descriptor.size = capacity;
+        descriptor.usage = WGPUBufferUsage_CopySrc | WGPUBufferUsage_CopyDst;
+        descriptor.mappedAtCreation = false;
+        WGPUBuffer replacement = wgpuDeviceCreateBuffer(device_, &descriptor);
+        if (!replacement) return nullptr;
+        if (slot.buffer) wgpuBufferRelease(slot.buffer);
+        slot.buffer = replacement;
+        slot.capacity = capacity;
+        stats_.uploadBufferAllocations++;
+        stats_.uploadBufferCapacityBytes = 0;
+        for (const auto& current : uploadRing_) {
+            stats_.uploadBufferCapacityBytes += current.capacity;
+        }
+    }
+
+    wgpuQueueWriteBuffer(queue_, slot.buffer, 0, uploadBytes_.data(), uploadBytes_.size());
+    stats_.peakUploadBytesPerFlush = std::max<uint64_t>(
+        stats_.peakUploadBytesPerFlush, uploadBytes_.size());
+    return slot.buffer;
+}
+
 void FrameQueue::flush() {
     if (work_.empty()) return;
     if (!queue_ || !device_) {
@@ -92,23 +176,11 @@ void FrameQueue::flush() {
 
     WGPUBuffer stagingBuffer = nullptr;
     if (!uploadBytes_.empty()) {
-        WGPUBufferDescriptor descriptor = {};
-        descriptor.size = alignToCopyOffset(uploadBytes_.size());
-        descriptor.usage = WGPUBufferUsage_MapWrite | WGPUBufferUsage_CopySrc;
-        descriptor.mappedAtCreation = true;
-        stagingBuffer = wgpuDeviceCreateBuffer(device_, &descriptor);
-
-        void* mapped = stagingBuffer
-            ? wgpuBufferGetMappedRange(stagingBuffer, 0, descriptor.size)
-            : nullptr;
-        if (!mapped) {
-            if (stagingBuffer) wgpuBufferRelease(stagingBuffer);
+        stagingBuffer = acquireUploadBuffer(uploadBytes_.size());
+        if (!stagingBuffer) {
             fallbackFlush();
             return;
         }
-
-        std::memcpy(mapped, uploadBytes_.data(), uploadBytes_.size());
-        wgpuBufferUnmap(stagingBuffer);
     }
 
     std::vector<WGPUCommandBuffer> submissionBuffers;
@@ -154,7 +226,6 @@ void FrameQueue::flush() {
         for (auto commandBuffer : uploadCommandBuffers) {
             wgpuCommandBufferRelease(commandBuffer);
         }
-        if (stagingBuffer) wgpuBufferRelease(stagingBuffer);
         fallbackFlush();
         return;
     }
@@ -164,7 +235,6 @@ void FrameQueue::flush() {
     for (auto commandBuffer : uploadCommandBuffers) {
         wgpuCommandBufferRelease(commandBuffer);
     }
-    if (stagingBuffer) wgpuBufferRelease(stagingBuffer);
     clearWork();
 }
 

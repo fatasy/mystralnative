@@ -1,5 +1,6 @@
 #include "webgpu/binding_internal.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <limits>
@@ -43,6 +44,84 @@ std::unordered_map<uint64_t, WGPUComputePipeline>& g_computePipelineRegistry = c
 uint64_t& g_nextComputePipelineId = context.nextComputePipelineId;
 std::unordered_map<uint64_t, WGPURenderPipeline>& g_renderPipelineRegistry = context.renderPipelineRegistry;
 uint64_t& g_nextRenderPipelineId = context.nextRenderPipelineId;
+uint64_t& g_trackedBufferBytes = context.trackedBufferBytes;
+uint64_t& g_estimatedTextureBytes = context.estimatedTextureBytes;
+uint64_t& g_peakTrackedGpuBytes = context.peakTrackedGpuBytes;
+uint64_t& g_maxTrackedGpuMemoryBytes = context.maxTrackedGpuMemoryBytes;
+
+namespace {
+
+uint64_t saturatingAdd(uint64_t left, uint64_t right) {
+    const uint64_t maximum = (std::numeric_limits<uint64_t>::max)();
+    return left > maximum - right ? maximum : left + right;
+}
+
+uint64_t saturatingMultiply(uint64_t left, uint64_t right) {
+    if (left == 0 || right == 0) return 0;
+    const uint64_t maximum = (std::numeric_limits<uint64_t>::max)();
+    return left > maximum / right ? maximum : left * right;
+}
+
+}  // namespace
+
+uint64_t estimateTextureBytes(WGPUTextureFormat format, uint32_t width, uint32_t height,
+                              uint32_t depthOrLayers, uint32_t mipLevels, uint32_t samples) {
+    uint64_t bytesPerPixel = 4;
+    switch (format) {
+        case WGPUTextureFormat_R8Unorm:
+        case WGPUTextureFormat_R8Snorm:
+        case WGPUTextureFormat_R8Uint:
+        case WGPUTextureFormat_R8Sint:
+            bytesPerPixel = 1; break;
+        case WGPUTextureFormat_R16Uint:
+        case WGPUTextureFormat_R16Sint:
+        case WGPUTextureFormat_R16Float:
+        case WGPUTextureFormat_RG8Unorm:
+        case WGPUTextureFormat_RG8Snorm:
+        case WGPUTextureFormat_RG8Uint:
+        case WGPUTextureFormat_RG8Sint:
+            bytesPerPixel = 2; break;
+        case WGPUTextureFormat_RG32Uint:
+        case WGPUTextureFormat_RG32Sint:
+        case WGPUTextureFormat_RG32Float:
+        case WGPUTextureFormat_RGBA16Uint:
+        case WGPUTextureFormat_RGBA16Sint:
+        case WGPUTextureFormat_RGBA16Float:
+            bytesPerPixel = 8; break;
+        case WGPUTextureFormat_RGBA32Uint:
+        case WGPUTextureFormat_RGBA32Sint:
+        case WGPUTextureFormat_RGBA32Float:
+            bytesPerPixel = 16; break;
+        default:
+            break;
+    }
+    uint64_t total = 0;
+    uint64_t mipWidth = std::max<uint32_t>(1, width);
+    uint64_t mipHeight = std::max<uint32_t>(1, height);
+    const uint64_t layers = std::max<uint32_t>(1, depthOrLayers);
+    for (uint32_t level = 0; level < std::max<uint32_t>(1, mipLevels); ++level) {
+        uint64_t levelBytes = saturatingMultiply(mipWidth, mipHeight);
+        levelBytes = saturatingMultiply(levelBytes, layers);
+        levelBytes = saturatingMultiply(levelBytes, bytesPerPixel);
+        levelBytes = saturatingMultiply(levelBytes, std::max<uint32_t>(1, samples));
+        total = saturatingAdd(total, levelBytes);
+        mipWidth = std::max<uint64_t>(1, mipWidth / 2);
+        mipHeight = std::max<uint64_t>(1, mipHeight / 2);
+    }
+    return total;
+}
+
+bool canAllocateTrackedGpuBytes(uint64_t additionalBytes) {
+    if (g_maxTrackedGpuMemoryBytes == 0) return true;
+    const uint64_t current = saturatingAdd(g_trackedBufferBytes, g_estimatedTextureBytes);
+    return additionalBytes <= g_maxTrackedGpuMemoryBytes &&
+        current <= g_maxTrackedGpuMemoryBytes - additionalBytes;
+}
+
+void updatePeakTrackedGpuBytes() {
+    g_peakTrackedGpuBytes = std::max(
+        g_peakTrackedGpuBytes, saturatingAdd(g_trackedBufferBytes, g_estimatedTextureBytes));
+}
 
 bool gcReleaseEnabled() {
     static const bool enabled = std::getenv("MYSTRAL_NO_GC_RELEASE") == nullptr;

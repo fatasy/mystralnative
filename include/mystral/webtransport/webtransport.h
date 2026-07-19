@@ -23,6 +23,8 @@
 
 #pragma once
 
+#include <cstddef>
+
 namespace mystral {
 namespace js {
 class Engine;
@@ -57,7 +59,7 @@ void resetBindings();
  * session's UDP socket, advances the QUIC/handshake state machine, fires any due
  * timers, and dispatches events on the main thread.
  */
-void processEvents();
+void processEvents(size_t maxEvents = static_cast<size_t>(-1));
 
 /**
  * True if there is at least one active WebTransport session. The runtime uses

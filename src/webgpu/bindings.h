@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 
 namespace mystral::js {
@@ -18,9 +19,11 @@ bool initBindings(
     uint32_t surfaceFormat,
     uint32_t width,
     uint32_t height,
-    bool debug = false);
+    bool debug = false,
+    uint32_t maxFrameLatency = 2,
+    uint64_t maxTrackedGpuMemoryBytes = 0);
 
-void processAsyncCompletions();
+size_t processAsyncCompletions(size_t maxCount = static_cast<size_t>(-1));
 void* getCurrentSurfaceTexture();
 void setOffscreenTexture(void* texture, void* textureView);
 void beginDawnFrame();

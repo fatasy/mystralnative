@@ -60,7 +60,8 @@ public:
         const std::vector<int>& ids,
         const std::string& payload);
     void terminateWorker(int id);
-    bool drainMessages(const MessageCallback& callback);
+    bool drainMessages(const MessageCallback& callback,
+                       size_t maxCount = static_cast<size_t>(-1));
     void shutdown();
     size_t size() const;
     uint32_t suggestedWorkerCount() const;
@@ -94,6 +95,7 @@ private:
     uint64_t largestOutputMessageBytes_ = 0;
     uint64_t completedDescendantWorkers_ = 0;
     uint32_t maxObservedDepth_ = 0;
+    int lastDrainWorkerId_ = 0;
     bool shuttingDown_ = false;
     mutable std::mutex mutex_;
 };
@@ -102,7 +104,8 @@ bool installWorkerRegistryBindings(js::Engine* engine, WorkerRegistry* registry)
 bool dispatchWorkerRegistryMessages(
     js::Engine* engine,
     WorkerRegistry* registry,
-    std::string* error = nullptr);
+    std::string* error = nullptr,
+    size_t maxCount = static_cast<size_t>(-1));
 const char* nestedWorkerFacadeSource();
 
 }  // namespace mystral::workers

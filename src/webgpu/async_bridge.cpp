@@ -1,5 +1,7 @@
 #include "webgpu/async_bridge.h"
 
+#include <algorithm>
+
 namespace mystral::webgpu::bridge {
 
 void AsyncBridge::configure(js::Engine* engine, WGPUInstance instance, WGPUDevice device) {
@@ -91,7 +93,7 @@ void AsyncBridge::enqueue(std::function<void()> completion) {
     completions_.push_back(std::move(completion));
 }
 
-void AsyncBridge::process() {
+size_t AsyncBridge::process(size_t maxCount) {
     if (!pendingPromises_.empty()) {
         if (instance_) wgpuInstanceProcessEvents(instance_);
         if (device_) wgpuDeviceTick(device_);
@@ -100,9 +102,14 @@ void AsyncBridge::process() {
     std::deque<std::function<void()>> completions;
     {
         std::lock_guard<std::mutex> lock(completionMutex_);
-        completions.swap(completions_);
+        const size_t count = std::min(maxCount, completions_.size());
+        for (size_t index = 0; index < count; ++index) {
+            completions.push_back(std::move(completions_.front()));
+            completions_.pop_front();
+        }
     }
     for (auto& completion : completions) completion();
+    return completions.size();
 }
 
 void AsyncBridge::abandonPendingPromises() {

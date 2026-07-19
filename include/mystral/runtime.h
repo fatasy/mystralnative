@@ -8,6 +8,14 @@
 
 namespace mystral {
 
+enum class PresentMode : uint32_t {
+    Auto,
+    Fifo,
+    FifoRelaxed,
+    Immediate,
+    Mailbox,
+};
+
 /**
  * Runtime configuration options
  */
@@ -17,6 +25,8 @@ struct RuntimeConfig {
     const char* title = "Mystral Game";
     bool fullscreen = false;
     bool vsync = true;
+    PresentMode presentMode = PresentMode::Auto;
+    uint32_t maxFrameLatency = 2;
     bool resizable = true;
     bool noSdl = false;  // Run without SDL (headless GPU mode, no window)
     bool watch = false;  // Watch mode: reload script on file changes
@@ -24,6 +34,16 @@ struct RuntimeConfig {
     uint32_t maxWorkerDepth = 2;  // main=0, simulation Worker=1, pool Workers=2
     uint32_t maxWorkerThreads = 64;  // Maximum active Workers across the runtime tree
     uint32_t maxCpuThreads = 0;  // 0 reserves one logical CPU for main/render
+    uint32_t maxJobCompletionsPerFrame = 64;
+    uint32_t maxHttpCompletionsPerFrame = 32;
+    uint32_t maxFileCallbacksPerFrame = 16;
+    uint32_t maxWorkerMessagesPerFrame = 128;
+    uint32_t maxWebGpuCompletionsPerFrame = 64;
+    uint32_t maxTimerCallbacksPerFrame = 64;
+    uint32_t maxWebTransportEventsPerFrame = 128;
+    uint32_t maxFileWatchEventsPerFrame = 32;
+    uint32_t maxDracoCallbacksPerFrame = 4;
+    uint64_t maxTrackedGpuMemoryBytes = 0;  // 0 = no runtime-enforced cap
 };
 
 struct EvaluationResult {

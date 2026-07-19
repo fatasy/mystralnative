@@ -53,8 +53,8 @@ namespace mystral {
 namespace webgpu {
 
 
-void processAsyncCompletions() {
-    g_asyncBridge.process();
+size_t processAsyncCompletions(size_t maxCount) {
+    return g_asyncBridge.process(maxCount);
 }
 
 
@@ -94,7 +94,7 @@ void presentSurfaceIfReady() {
 /**
  * Initialize WebGPU bindings in the JS engine
  */
-bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, void* wgpuDevice, void* wgpuQueue, void* wgpuSurface, uint32_t surfaceFormat, uint32_t width, uint32_t height, bool debug) {
+bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, void* wgpuDevice, void* wgpuQueue, void* wgpuSurface, uint32_t surfaceFormat, uint32_t width, uint32_t height, bool debug, uint32_t maxFrameLatency, uint64_t maxTrackedGpuMemoryBytes) {
     if (!engine) {
         std::cerr << "[WebGPU] No JS engine provided for bindings" << std::endl;
         return false;
@@ -109,8 +109,9 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
     g_device = (WGPUDevice)wgpuDevice;
     g_queue = (WGPUQueue)wgpuQueue;
     g_surface = (WGPUSurface)wgpuSurface;
+    g_maxTrackedGpuMemoryBytes = maxTrackedGpuMemoryBytes;
     g_asyncBridge.configure(engine, g_instance, g_device);
-    g_frameQueue.configure(g_device, g_queue);
+    g_frameQueue.configure(g_instance, g_device, g_queue, maxFrameLatency);
     g_capabilities.configure(engine, g_adapter, g_device);
 
     if (!engine->evalScript(R"JS(
@@ -473,6 +474,7 @@ void releaseReloadResources() {
         wgpuBufferRelease(entry.second.buffer);
     }
     g_bufferRegistry.clear();
+    g_trackedBufferBytes = 0;
 
     for (auto& entry : g_textureRegistry) {
         auto& info = entry.second;
@@ -484,6 +486,7 @@ void releaseReloadResources() {
         }
     }
     g_textureRegistry.clear();
+    g_estimatedTextureBytes = 0;
 
     for (auto& entry : g_renderPipelineRegistry) {
         wgpuRenderPipelineRelease(entry.second);
@@ -516,6 +519,7 @@ void resetSessionBindings() {
     g_imageDecoder.cancelPending();
 
     processAsyncCompletions();
+    g_frameQueue.reset();
 
     g_transientMethods = {};
     g_asyncBridge.detach();

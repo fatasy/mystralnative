@@ -20,9 +20,15 @@ namespace js {
  * JavaScript value handle
  * Opaque handle to a JS value in the engine
  */
+enum class JSValueLifetime : uint8_t {
+    Persistent,
+    Borrowed,
+};
+
 struct JSValueHandle {
     void* ptr = nullptr;
     void* ctx = nullptr;  // Context needed for some operations
+    JSValueLifetime lifetime = JSValueLifetime::Persistent;
 };
 
 /**
@@ -271,7 +277,8 @@ public:
      * Protect a value from garbage collection
      * Must call unprotect() when done
      */
-    virtual void protect(JSValueHandle value) = 0;
+    // May promote a call-local borrowed handle to a persistent handle.
+    virtual void protect(JSValueHandle& value) = 0;
 
     /**
      * Allow a value to be garbage collected

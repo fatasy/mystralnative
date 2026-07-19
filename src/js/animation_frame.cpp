@@ -23,8 +23,9 @@ void AnimationFrameScheduler::install(Engine* engine) {
         engine_->newFunction("requestAnimationFrame", [this](void*, const std::vector<JSValueHandle>& args) {
             if (args.empty()) return engine_->newNumber(-1);
             const int id = nextId_++;
-            engine_->protect(args[0]);
-            callbacks_.push_back({id, args[0]});
+            auto callback = args[0];
+            engine_->protect(callback);
+            callbacks_.push_back({id, callback});
             return engine_->newNumber(id);
         }));
 

@@ -257,12 +257,13 @@ void RuntimeTimers::setupChronoTimers() {
                 }
 
                 int id = nextTimerId_++;
-                engine_->protect(args[0]);
+                auto callback = args[0];
+                engine_->protect(callback);
 
                 auto targetTime = std::chrono::high_resolution_clock::now() +
                                   std::chrono::milliseconds(delay);
 
-                timerCallbacks_.push_back({id, args[0], targetTime, 0, false});
+                timerCallbacks_.push_back({id, callback, targetTime, 0, false});
 
                 return engine_->newNumber(id);
             })
@@ -303,12 +304,13 @@ void RuntimeTimers::setupChronoTimers() {
                 if (delay < 1) delay = 1;
 
                 int id = nextTimerId_++;
-                engine_->protect(args[0]);
+                auto callback = args[0];
+                engine_->protect(callback);
 
                 auto targetTime = std::chrono::high_resolution_clock::now() +
                                   std::chrono::milliseconds(delay);
 
-                timerCallbacks_.push_back({id, args[0], targetTime, delay, false});
+                timerCallbacks_.push_back({id, callback, targetTime, delay, false});
 
                 return engine_->newNumber(id);
             })
@@ -338,15 +340,20 @@ void RuntimeTimers::setupChronoTimers() {
     }
 #endif // !MYSTRAL_TIMERS_USE_LIBUV
 
-void RuntimeTimers::executeCallbacks() {
+size_t RuntimeTimers::executeCallbacks(size_t maxCount) {
 #ifdef MYSTRAL_TIMERS_USE_LIBUV
         // Process pending timer callbacks from libuv
         std::queue<PendingTimerCallback> toProcess;
         {
             std::lock_guard<std::mutex> lock(timerMutex_);
-            std::swap(toProcess, pendingTimerCallbacks_);
+            size_t count = 0;
+            while (!pendingTimerCallbacks_.empty() && count++ < maxCount) {
+                toProcess.push(std::move(pendingTimerCallbacks_.front()));
+                pendingTimerCallbacks_.pop();
+            }
         }
 
+        size_t executed = 0;
         while (!toProcess.empty()) {
             auto pending = std::move(toProcess.front());
             toProcess.pop();
@@ -360,6 +367,7 @@ void RuntimeTimers::executeCallbacks() {
             // Call the callback
             std::vector<js::JSValueHandle> args;
             engine_->call(pending.callback, engine_->newUndefined(), args);
+            ++executed;
 
             // For setTimeout (intervalMs == 0), clean up the timer
             if (pending.intervalMs == 0) {
@@ -375,9 +383,10 @@ void RuntimeTimers::executeCallbacks() {
             }
             // For setInterval, libuv automatically repeats - nothing to do
         }
+        return executed;
 #else
         // Fallback: std::chrono-based timer processing
-        if (timerCallbacks_.empty()) return;
+        if (timerCallbacks_.empty()) return 0;
 
         auto now = std::chrono::high_resolution_clock::now();
 
@@ -390,12 +399,13 @@ void RuntimeTimers::executeCallbacks() {
                 continue;  // Skip cancelled timers
             }
 
-            if (now >= timer.targetTime) {
+            if (now >= timer.targetTime && toExecute.size() < maxCount) {
                 toExecute.push_back(timer);
             } else {
                 remaining.push_back(timer);
             }
         }
+        const size_t executed = toExecute.size();
 
         timerCallbacks_ = std::move(remaining);
 
@@ -432,6 +442,7 @@ void RuntimeTimers::executeCallbacks() {
                 engine_->unprotect(timer.callback);
             }
         }
+        return executed;
 #endif
     }
 

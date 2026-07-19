@@ -135,24 +135,43 @@ void WorkerRegistry::terminateWorker(int id) {
     }
 }
 
-bool WorkerRegistry::drainMessages(const MessageCallback& callback) {
+bool WorkerRegistry::drainMessages(const MessageCallback& callback, size_t maxCount) {
+    if (maxCount == 0) return false;
     std::vector<std::pair<int, WorkerMessage>> messages;
     std::vector<int> stopped;
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        for (auto& entry : workers_) {
-            for (auto& message : entry.second->drainMessages()) {
-                messages.emplace_back(entry.first, std::move(message));
+        std::vector<int> workerIds;
+        workerIds.reserve(workers_.size());
+        for (const auto& entry : workers_) workerIds.push_back(entry.first);
+        std::sort(workerIds.begin(), workerIds.end());
+        auto start = std::upper_bound(workerIds.begin(), workerIds.end(), lastDrainWorkerId_);
+        if (start == workerIds.end()) start = workerIds.begin();
+
+        size_t remaining = maxCount;
+        for (size_t offset = 0; offset < workerIds.size(); ++offset) {
+            const size_t startIndex = static_cast<size_t>(start - workerIds.begin());
+            const int id = workerIds[(startIndex + offset) % workerIds.size()];
+            auto entry = workers_.find(id);
+            if (entry == workers_.end()) continue;
+            lastDrainWorkerId_ = id;
+            for (auto& message : entry->second->drainMessages(remaining)) {
+                messages.emplace_back(id, std::move(message));
+                --remaining;
             }
-            if (entry.second->isFinished()) {
+            if (entry->second->isFinished() && remaining > 0) {
                 // finishThread publishes Exited before the terminal state. Drain
                 // once more after observing that state so the facade cannot miss
                 // an exit published between the first drain and this check.
-                for (auto& message : entry.second->drainMessages()) {
-                    messages.emplace_back(entry.first, std::move(message));
+                for (auto& message : entry->second->drainMessages(remaining)) {
+                    messages.emplace_back(id, std::move(message));
+                    --remaining;
                 }
-                stopped.push_back(entry.first);
             }
+            if (entry->second->isFinished() && !entry->second->hasPendingMessages()) {
+                stopped.push_back(id);
+            }
+            if (remaining == 0) break;
         }
     }
 
@@ -415,7 +434,8 @@ bool installWorkerRegistryBindings(js::Engine* engine, WorkerRegistry* registry)
 bool dispatchWorkerRegistryMessages(
     js::Engine* engine,
     WorkerRegistry* registry,
-    std::string* error) {
+    std::string* error,
+    size_t maxCount) {
     if (!engine || !registry) return true;
     auto dispatch = engine->getGlobalProperty("__mystralDispatchWorkerMessage");
     if (!engine->isFunction(dispatch)) {
@@ -459,7 +479,7 @@ bool dispatchWorkerRegistryMessages(
                 if (error && error->empty()) *error = currentError;
                 succeeded = false;
             }
-        });
+        }, maxCount);
     engine->releaseValue(dispatch);
     return succeeded;
 }

@@ -12,7 +12,7 @@ namespace mystral::js {
 class RuntimeIOBindings {
 public:
     void install(Engine* engine, const uint64_t* generation);
-    void processFileCallbacks();
+    size_t processFileCallbacks(size_t maxCount = static_cast<size_t>(-1));
     void clearFileCallbacks();
 
 private:

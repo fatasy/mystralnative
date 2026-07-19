@@ -23,7 +23,7 @@ public:
     void clear();
     void finishShutdown();
     bool hasActive() const;
-    void executeCallbacks();
+    size_t executeCallbacks(size_t maxCount = static_cast<size_t>(-1));
 
 private:
     void setupTimers();

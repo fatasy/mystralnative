@@ -32,6 +32,7 @@ struct TextureInfo {
     WGPUTextureDimension dimension = WGPUTextureDimension_2D;
     bool ownsReference = false;
     bool destroyOnReload = false;
+    uint64_t estimatedBytes = 0;
 };
 
 struct BufferInfo {
@@ -46,6 +47,8 @@ struct BufferInfo {
 };
 
 struct TransientMethodCache {
+    js::JSValueHandle surfaceTextureCreateView;
+    js::JSValueHandle surfaceTextureDestroy;
     js::JSValueHandle encoderBeginRenderPass;
     js::JSValueHandle encoderBeginComputePass;
     js::JSValueHandle encoderCopyBufferToBuffer;
@@ -53,6 +56,8 @@ struct TransientMethodCache {
     js::JSValueHandle encoderCopyTextureToBuffer;
     js::JSValueHandle encoderCopyTextureToTexture;
     js::JSValueHandle encoderClearBuffer;
+    js::JSValueHandle encoderWriteTimestamp;
+    js::JSValueHandle encoderResolveQuerySet;
     js::JSValueHandle encoderFinish;
     js::JSValueHandle renderSetPipeline;
     js::JSValueHandle renderSetBindGroup;
@@ -67,10 +72,14 @@ struct TransientMethodCache {
     js::JSValueHandle renderSetBlendConstant;
     js::JSValueHandle renderSetStencilReference;
     js::JSValueHandle renderExecuteBundles;
+    js::JSValueHandle renderWriteTimestamp;
+    js::JSValueHandle renderBeginOcclusionQuery;
+    js::JSValueHandle renderEndOcclusionQuery;
     js::JSValueHandle renderEnd;
     js::JSValueHandle computeSetPipeline;
     js::JSValueHandle computeSetBindGroup;
     js::JSValueHandle computeDispatchWorkgroups;
+    js::JSValueHandle computeWriteTimestamp;
     js::JSValueHandle computeEnd;
 };
 
@@ -117,6 +126,10 @@ public:
     uint64_t nextComputePipelineId = 1;
     std::unordered_map<uint64_t, WGPURenderPipeline> renderPipelineRegistry;
     uint64_t nextRenderPipelineId = 1;
+    uint64_t trackedBufferBytes = 0;
+    uint64_t estimatedTextureBytes = 0;
+    uint64_t peakTrackedGpuBytes = 0;
+    uint64_t maxTrackedGpuMemoryBytes = 0;
 };
 
 inline BindingContext& bindingContext() {

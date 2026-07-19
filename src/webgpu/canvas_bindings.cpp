@@ -36,6 +36,50 @@ static WGPUTexture getCurrentSwapchainTexture() {
     return surfaceTexture.texture;
 }
 
+static uint64_t textureIdFromReceiver(js::JSValueHandle receiver) {
+    auto id = g_engine->getProperty(receiver, "_textureId");
+    return g_engine->isUndefined(id) ? 0 : static_cast<uint64_t>(g_engine->toNumber(id));
+}
+
+static js::JSValueHandle createSurfaceTextureView(
+    void*, js::JSValueHandle receiver, const std::vector<js::JSValueHandle>&) {
+    const uint64_t textureId = textureIdFromReceiver(receiver);
+    auto it = g_textureRegistry.find(textureId);
+    if (it == g_textureRegistry.end()) {
+        g_engine->throwException("Texture not found in registry");
+        return g_engine->newUndefined();
+    }
+
+    WGPUTextureViewDescriptor viewDesc = {};
+    viewDesc.format = it->second.format;
+    viewDesc.dimension = WGPUTextureViewDimension_2D;
+    viewDesc.baseMipLevel = 0;
+    viewDesc.mipLevelCount = 1;
+    viewDesc.baseArrayLayer = 0;
+    viewDesc.arrayLayerCount = 1;
+    viewDesc.aspect = WGPUTextureAspect_All;
+
+    WGPUTextureView view = wgpuTextureCreateView(it->second.texture, &viewDesc);
+    if (!view) {
+        g_engine->throwException("Failed to create current texture view");
+        return g_engine->newUndefined();
+    }
+
+    g_currentTextureView = view;
+    g_currentViewSourceTexture = it->second.texture;
+
+    auto jsView = g_engine->newObject();
+    g_engine->setPrivateData(jsView, view);
+    g_engine->setProperty(jsView, "_type", g_engine->newString("textureView"));
+    return jsView;
+}
+
+static js::JSValueHandle destroySurfaceTexture(
+    void*, js::JSValueHandle receiver, const std::vector<js::JSValueHandle>&) {
+    g_textureRegistry.erase(textureIdFromReceiver(receiver));
+    return g_engine->newUndefined();
+}
+
 void installCanvasBindings(js::Engine* engine) {    // ========================================================================
     // Create a mock parent element for the canvas (needed by Debugger)
     // ========================================================================
@@ -195,56 +239,12 @@ void installCanvasBindings(js::Engine* engine) {    // =========================
                     g_engine->setProperty(jsTexture, "format", g_engine->newString(formatToString(g_surfaceFormat)));
                     g_engine->setProperty(jsTexture, "_textureId", g_engine->newNumber((double)textureId));
 
-                    // texture.createView(descriptor?) -> GPUTextureView
-                    // Capture textureId to look up the correct texture (not g_currentTexture which may change)
                     g_engine->setProperty(jsTexture, "createView",
-                        g_engine->newFunction("createView", [textureId](void* ctx, const std::vector<js::JSValueHandle>& args) {
-                            // Look up texture from registry using captured textureId
-                            auto it = g_textureRegistry.find(textureId);
-                            if (it == g_textureRegistry.end()) {
-                                std::cerr << "[WebGPU] Canvas createView: Texture " << textureId << " not found in registry" << std::endl;
-                                g_engine->throwException("Texture not found in registry");
-                                return g_engine->newUndefined();
-                            }
-
-                            WGPUTexture texture = it->second.texture;
-                            if (!texture) {
-                                g_engine->throwException("No current texture");
-                                return g_engine->newUndefined();
-                            }
-
-                            // Create texture view
-                            WGPUTextureViewDescriptor viewDesc = {};
-                            viewDesc.format = it->second.format;
-                            viewDesc.dimension = WGPUTextureViewDimension_2D;
-                            viewDesc.baseMipLevel = 0;
-                            viewDesc.mipLevelCount = 1;
-                            viewDesc.baseArrayLayer = 0;
-                            viewDesc.arrayLayerCount = 1;
-                            viewDesc.aspect = WGPUTextureAspect_All;
-
-                            WGPUTextureView view = wgpuTextureCreateView(texture, &viewDesc);
-
-                            g_currentTextureView = view;
-                            g_currentViewSourceTexture = texture;  // Track which texture the view was created from
-
-                            // Create JS wrapper
-                            auto jsView = g_engine->newObject();
-                            g_engine->setPrivateData(jsView, view);
-                            g_engine->setProperty(jsView, "_type", g_engine->newString("textureView"));
-
-                            return jsView;
-                        })
-                    );
-
-                    // texture.destroy()
+                        sharedMethod(g_transientMethods.surfaceTextureCreateView,
+                            "createView", createSurfaceTextureView));
                     g_engine->setProperty(jsTexture, "destroy",
-                        g_engine->newFunction("destroy", [textureId](void* ctx, const std::vector<js::JSValueHandle>& args) {
-                            // Swapchain textures are managed by the surface, but remove from registry
-                            g_textureRegistry.erase(textureId);
-                            return g_engine->newUndefined();
-                        })
-                    );
+                        sharedMethod(g_transientMethods.surfaceTextureDestroy,
+                            "destroy", destroySurfaceTexture));
 
                     return jsTexture;
                 })
@@ -478,55 +478,12 @@ void installCanvasBindings(js::Engine* engine) {    // =========================
                                 g_engine->setProperty(jsTexture, "format", g_engine->newString(formatToString(g_surfaceFormat)));
                                 g_engine->setProperty(jsTexture, "_textureId", g_engine->newNumber((double)textureId));
 
-                                // texture.createView(descriptor?) -> GPUTextureView
-                                // Capture textureId to look up the correct texture (not g_currentTexture which may change)
                                 g_engine->setProperty(jsTexture, "createView",
-                                    g_engine->newFunction("createView", [textureId](void* c, const std::vector<js::JSValueHandle>& a) {
-                                        // Look up texture from registry using captured textureId
-                                        auto it = g_textureRegistry.find(textureId);
-                                        if (it == g_textureRegistry.end()) {
-                                            std::cerr << "[WebGPU] Offscreen createView: Texture " << textureId << " not found in registry" << std::endl;
-                                            g_engine->throwException("Texture not found in registry");
-                                            return g_engine->newUndefined();
-                                        }
-
-                                        WGPUTexture texture = it->second.texture;
-                                        if (!texture) {
-                                            g_engine->throwException("No current texture");
-                                            return g_engine->newUndefined();
-                                        }
-
-                                        WGPUTextureViewDescriptor viewDesc = {};
-                                        viewDesc.format = it->second.format;
-                                        viewDesc.dimension = WGPUTextureViewDimension_2D;
-                                        viewDesc.baseMipLevel = 0;
-                                        viewDesc.mipLevelCount = 1;
-                                        viewDesc.baseArrayLayer = 0;
-                                        viewDesc.arrayLayerCount = 1;
-                                        viewDesc.aspect = WGPUTextureAspect_All;
-
-                                        WGPUTextureView view = wgpuTextureCreateView(texture, &viewDesc);
-                                        g_currentTextureView = view;
-                                        g_currentViewSourceTexture = texture;  // Track which texture the view was created from
-                                        if (g_verboseLogging) std::cout << "[Canvas] Offscreen createView: texture=" << (void*)texture
-                                                  << ", view=" << (void*)view << std::endl;
-
-                                        auto jsView = g_engine->newObject();
-                                        g_engine->setPrivateData(jsView, view);
-                                        g_engine->setProperty(jsView, "_type", g_engine->newString("textureView"));
-
-                                        return jsView;
-                                    })
-                                );
-
-                                // texture.destroy()
+                                    sharedMethod(g_transientMethods.surfaceTextureCreateView,
+                                        "createView", createSurfaceTextureView));
                                 g_engine->setProperty(jsTexture, "destroy",
-                                    g_engine->newFunction("destroy", [textureId](void* c, const std::vector<js::JSValueHandle>& a) {
-                                        // Swapchain textures are managed by the surface, but remove from registry
-                                        g_textureRegistry.erase(textureId);
-                                        return g_engine->newUndefined();
-                                    })
-                                );
+                                    sharedMethod(g_transientMethods.surfaceTextureDestroy,
+                                        "destroy", destroySurfaceTexture));
 
                                 return jsTexture;
                             })

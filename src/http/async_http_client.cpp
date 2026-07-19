@@ -530,18 +530,20 @@ int AsyncHttpClient::activeRequestCount() const {
     return impl_->activeRequests;
 }
 
-bool AsyncHttpClient::processCompletedRequests() {
+bool AsyncHttpClient::processCompletedRequests(size_t maxCount) {
     if (!impl_->initialized) return false;
 
     bool hadCallbacks = !impl_->completedQueue.empty();
 
-    while (!impl_->completedQueue.empty()) {
+    size_t processed = 0;
+    while (!impl_->completedQueue.empty() && processed < maxCount) {
         auto completed = std::move(impl_->completedQueue.front());
         impl_->completedQueue.pop();
 
         if (completed.callback) {
             completed.callback(std::move(completed.response));
         }
+        ++processed;
     }
 
     return hadCallbacks;
@@ -608,7 +610,7 @@ void AsyncHttpClient::request(const std::string& method,
 
 int AsyncHttpClient::activeRequestCount() const { return 0; }
 
-bool AsyncHttpClient::processCompletedRequests() { return false; }
+bool AsyncHttpClient::processCompletedRequests(size_t) { return false; }
 
 } // namespace http
 } // namespace mystral

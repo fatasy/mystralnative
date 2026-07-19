@@ -13,6 +13,7 @@
  *   });
  */
 
+#include <cstddef>
 #include <functional>
 #include <string>
 #include <memory>
@@ -81,7 +82,7 @@ public:
      * Call this from the main loop after EventLoop::runOnce().
      * Returns true if any callbacks were invoked.
      */
-    bool processPendingEvents();
+    bool processPendingEvents(size_t maxCount = static_cast<size_t>(-1));
 
     // Prevent copying
     FileWatcher(const FileWatcher&) = delete;

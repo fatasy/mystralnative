@@ -28,10 +28,58 @@ void releaseTexture(uint64_t id, bool destroy) {
     if (it->second.ownsReference) {
         wgpuTextureRelease(it->second.texture);
     }
+    g_estimatedTextureBytes = it->second.estimatedBytes > g_estimatedTextureBytes
+        ? 0
+        : g_estimatedTextureBytes - it->second.estimatedBytes;
     g_textureRegistry.erase(it);
 }
 
 void installResourceBindings(js::JSValueHandle device) {    // device.createTexture(descriptor)
+    g_engine->setProperty(device, "createQuerySet",
+        g_engine->newFunction("createQuerySet", [](void*, const std::vector<js::JSValueHandle>& args) {
+            if (args.empty()) {
+                g_engine->throwException("createQuerySet requires a descriptor");
+                return g_engine->newUndefined();
+            }
+            auto descriptor = args[0];
+            const std::string type = g_engine->toString(g_engine->getProperty(descriptor, "type"));
+            const uint32_t count = static_cast<uint32_t>(
+                g_engine->toNumber(g_engine->getProperty(descriptor, "count")));
+            if (count == 0 || (type != "timestamp" && type != "occlusion")) {
+                g_engine->throwException("Invalid GPUQuerySet descriptor");
+                return g_engine->newUndefined();
+            }
+            if (type == "timestamp" &&
+                !wgpuDeviceHasFeature(g_device, WGPUFeatureName_TimestampQuery)) {
+                g_engine->throwException("timestamp-query is not enabled on this device");
+                return g_engine->newUndefined();
+            }
+
+            WGPUQuerySetDescriptor nativeDescriptor = {};
+            nativeDescriptor.type = type == "timestamp"
+                ? WGPUQueryType_Timestamp
+                : WGPUQueryType_Occlusion;
+            nativeDescriptor.count = count;
+            WGPUQuerySet querySet = wgpuDeviceCreateQuerySet(g_device, &nativeDescriptor);
+            if (!querySet) {
+                g_engine->throwException("Failed to create GPUQuerySet");
+                return g_engine->newUndefined();
+            }
+
+            auto wrapper = g_engine->newObject();
+            g_engine->setPrivateData(wrapper, querySet);
+            g_engine->setProperty(wrapper, "type", g_engine->newString(type.c_str()));
+            g_engine->setProperty(wrapper, "count", g_engine->newNumber(count));
+            g_engine->setProperty(wrapper, "destroy",
+                g_engine->newFunction("destroy", [querySet](void*, const std::vector<js::JSValueHandle>&) {
+                    wgpuQuerySetDestroy(querySet);
+                    return g_engine->newUndefined();
+                }));
+            g_engine->registerRelease(wrapper, [querySet]() { wgpuQuerySetRelease(querySet); });
+            return wrapper;
+        }));
+
+    // device.createTexture(descriptor)
     g_engine->setProperty(device, "createTexture",
         g_engine->newFunction("createTexture", [](void* ctx, const std::vector<js::JSValueHandle>& args) {
             if (args.empty()) {
@@ -95,6 +143,13 @@ void installResourceBindings(js::JSValueHandle device) {    // device.createText
             auto sampleCountVal = g_engine->getProperty(descriptor, "sampleCount");
             uint32_t sampleCount = g_engine->isUndefined(sampleCountVal) ? 1 : (uint32_t)g_engine->toNumber(sampleCountVal);
 
+            const uint64_t estimatedBytes = estimateTextureBytes(
+                format, width, height, depthOrArrayLayers, mipLevelCount, sampleCount);
+            if (!canAllocateTrackedGpuBytes(estimatedBytes)) {
+                g_engine->throwException("GPU memory budget exceeded by createTexture");
+                return g_engine->newUndefined();
+            }
+
             // Create texture descriptor
             WGPUTextureDescriptor texDesc = {};
             texDesc.size.width = width;
@@ -129,8 +184,10 @@ void installResourceBindings(js::JSValueHandle device) {    // device.createText
             uint64_t textureId = g_nextTextureId++;
             g_textureRegistry[textureId] = {
                 texture, format, width, height, depthOrArrayLayers, mipLevelCount,
-                dimension, true, true
+                dimension, true, true, estimatedBytes
             };
+            g_estimatedTextureBytes += estimatedBytes;
+            updatePeakTrackedGpuBytes();
 
             // Store texture ID for lookup
             g_engine->setProperty(jsTexture, "_textureId", g_engine->newNumber((double)textureId));

@@ -218,14 +218,17 @@ void FileWatcher::unwatch(int watchId) {
     impl_->watches.erase(it);
 }
 
-bool FileWatcher::processPendingEvents() {
+bool FileWatcher::processPendingEvents(size_t maxCount) {
     if (!impl_->initialized) return false;
 
-    // Move pending events out of the queue while holding the lock
     std::queue<PendingEvent> toProcess;
     {
         std::lock_guard<std::mutex> lock(g_eventsMutex);
-        std::swap(toProcess, g_pendingEvents);
+        size_t count = 0;
+        while (!g_pendingEvents.empty() && count++ < maxCount) {
+            toProcess.push(std::move(g_pendingEvents.front()));
+            g_pendingEvents.pop();
+        }
     }
 
     bool hadEvents = !toProcess.empty();
@@ -277,7 +280,7 @@ int FileWatcher::watch(const std::string& path, FileWatchCallback callback) {
 
 void FileWatcher::unwatch(int watchId) {}
 
-bool FileWatcher::processPendingEvents() { return false; }
+bool FileWatcher::processPendingEvents(size_t) { return false; }
 
 } // namespace fs
 } // namespace mystral

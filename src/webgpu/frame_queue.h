@@ -1,7 +1,9 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <unordered_set>
 #include <vector>
 
@@ -16,11 +18,19 @@ struct FrameQueueStats {
     uint64_t deferredUploadCommandBuffers = 0;
     uint64_t forcedFrameFlushes = 0;
     uint64_t maxCommandBuffersPerNativeSubmit = 0;
+    uint64_t uploadBufferAllocations = 0;
+    uint64_t uploadBufferCapacityBytes = 0;
+    uint64_t peakUploadBytesPerFlush = 0;
+    uint64_t frameLatencyWaits = 0;
+    uint64_t frameLatencyWaitNanoseconds = 0;
+    uint64_t maxInFlightSubmissions = 0;
 };
 
 class FrameQueue {
 public:
-    void configure(WGPUDevice device, WGPUQueue queue);
+    void configure(WGPUInstance instance, WGPUDevice device, WGPUQueue queue,
+                   uint32_t maxFrameLatency);
+    void reset();
 
     void beginFrame();
     void endFrame();
@@ -49,17 +59,29 @@ private:
         std::vector<WGPUCommandBuffer> commandBuffers;
     };
 
+    struct UploadSlot {
+        WGPUBuffer buffer = nullptr;
+        uint64_t capacity = 0;
+    };
+
     static uint64_t alignToCopyOffset(uint64_t value);
     void recordNativeSubmit(const std::vector<WGPUCommandBuffer>& commandBuffers);
     void releaseDeferredCommandBuffers();
     void clearWork();
     void fallbackFlush();
+    WGPUBuffer acquireUploadBuffer(size_t requiredSize);
+    void waitForOldestSubmission();
 
+    WGPUInstance instance_ = nullptr;
     WGPUDevice device_ = nullptr;
     WGPUQueue queue_ = nullptr;
+    uint32_t maxFrameLatency_ = 2;
     bool frameActive_ = false;
     std::vector<Work> work_;
     std::vector<uint8_t> uploadBytes_;
+    std::array<UploadSlot, 3> uploadRing_{};
+    size_t nextUploadSlot_ = 0;
+    std::deque<WGPUFuture> inFlightSubmissions_;
     std::unordered_set<WGPUBuffer> retainedUploadBuffers_;
     FrameQueueStats stats_;
 };
