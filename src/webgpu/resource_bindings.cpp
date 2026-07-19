@@ -257,7 +257,7 @@ void installResourceBindings(js::JSValueHandle device) {    // device.createText
                     }
 
                     WGPUTextureView view = wgpuTextureCreateView(texture, &viewDesc);
-        
+
                     if (!view) {
                         std::cerr << "[WebGPU] createView: Failed to create texture view" << std::endl;
                         return g_engine->newUndefined();
