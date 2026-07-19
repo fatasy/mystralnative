@@ -242,8 +242,8 @@ mystral --version                      Show version
 mystral --help                         Show help
 
 Run Options:
-  --width <n>           Window width (default: 1280)
-  --height <n>          Window height (default: 720)
+  --width <n>           Window width (default: 1920)
+  --height <n>          Window height (default: 1080)
   --title <str>         Window title
   --headless            Run with hidden window
   --watch, -w           Auto-reload on file changes
@@ -254,6 +254,7 @@ Run Options:
 Compile Options:
   --include <dir>       Asset directory to bundle (repeatable)
   --output, -o <file>   Output path
+  --windowed            Build a Windows GUI executable without a console window
   --bundle-only         Create .bundle file (for .app packaging)
   --root <dir>          Root directory for bundle paths (default: cwd)
 ```

@@ -355,8 +355,8 @@ USAGE:
     mystral --help                            Show this help message
 
 RUN OPTIONS:
-    --width <n>           Window width (default: 1280)
-    --height <n>          Window height (default: 720)
+    --width <n>           Window width (default: 1920)
+    --height <n>          Window height (default: 1080)
     --title <str>         Window title (default: "Mystral")
     --headless            Run with hidden window (background mode)
     --no-sdl              Run without SDL (headless GPU, no window system required)
@@ -395,6 +395,7 @@ COMPILE OPTIONS:
     --output <file>       Output binary path (default: ./<entry-stem>)
     --out, -o <file>      Alias for --output
     --root <dir>          Root directory for bundle paths (default: cwd)
+    --windowed            Mark the Windows executable as a GUI app (no console)
     --bundle-only         Create standalone .bundle file (no exe, for .app packaging)
 
 BAKE OPTIONS (Lightmap Generation):
@@ -465,8 +466,8 @@ std::string readFile(const std::string& path) {
 struct CLIOptions {
     std::string command;
     std::string scriptPath;
-    int width = 1280;
-    int height = 720;
+    int width = 1920;
+    int height = 1080;
     std::string title = "Mystral";
     bool showHelp = false;
     bool showVersion = false;
@@ -496,6 +497,7 @@ struct CLIOptions {
     std::vector<std::string> assetDirs;
     std::string outputPath;
     std::string rootDir;
+    bool windowed = false;  // Windows GUI subsystem for packaged games
     bool bundleOnly = false;  // Create standalone .bundle file (no exe copy)
 
     // Debug server
@@ -562,6 +564,8 @@ CLIOptions parseArgs(int argc, char* argv[]) {
             opts.gpuMemoryBudgetMiB = std::stoull(argv[++i]);
         } else if (arg == "--bundle-only") {
             opts.bundleOnly = true;
+        } else if (arg == "--windowed") {
+            opts.windowed = true;
         } else if ((arg == "--video" || arg == "--record") && i + 1 < argc) {
             opts.videoPath = argv[++i];
             // Auto-detect --mp4 from extension
@@ -708,6 +712,50 @@ static bool writeFileToStream(const std::filesystem::path& path, std::ofstream& 
     }
     return copyStream(in, out);
 }
+
+#ifdef _WIN32
+static bool setWindowsGuiSubsystem(const std::filesystem::path& path) {
+    std::fstream file(path, std::ios::binary | std::ios::in | std::ios::out);
+    if (!file.is_open()) {
+        return false;
+    }
+
+    uint16_t dosMagic = 0;
+    uint32_t peOffset = 0;
+    uint32_t peSignature = 0;
+    uint16_t optionalMagic = 0;
+    file.read(reinterpret_cast<char*>(&dosMagic), sizeof(dosMagic));
+    if (dosMagic != 0x5A4D) {
+        return false;
+    }
+    file.seekg(0x3C, std::ios::beg);
+    file.read(reinterpret_cast<char*>(&peOffset), sizeof(peOffset));
+    file.seekg(static_cast<std::streamoff>(peOffset), std::ios::beg);
+    file.read(reinterpret_cast<char*>(&peSignature), sizeof(peSignature));
+    if (peSignature != 0x00004550) {
+        return false;
+    }
+
+    constexpr std::streamoff kCoffHeaderSize = 20;
+    constexpr std::streamoff kSubsystemOffsetInOptionalHeader = 68;
+    const std::streamoff optionalHeaderOffset =
+        static_cast<std::streamoff>(peOffset) + sizeof(peSignature) + kCoffHeaderSize;
+    file.seekg(optionalHeaderOffset, std::ios::beg);
+    file.read(reinterpret_cast<char*>(&optionalMagic), sizeof(optionalMagic));
+    if (optionalMagic != 0x010B && optionalMagic != 0x020B) {
+        return false;
+    }
+
+    constexpr uint16_t kWindowsGuiSubsystem = 2;
+    file.seekp(optionalHeaderOffset + kSubsystemOffsetInOptionalHeader, std::ios::beg);
+    file.write(
+        reinterpret_cast<const char*>(&kWindowsGuiSubsystem),
+        sizeof(kWindowsGuiSubsystem)
+    );
+    file.flush();
+    return file.good();
+}
+#endif
 
 // Extract import/require specifiers from source code
 static std::vector<std::string> extractImportSpecifiers(const std::string& source) {
@@ -1340,6 +1388,14 @@ static int compileBundle(const CLIOptions& opts) {
         std::cerr << "Error: Failed to finalize bundle." << std::endl;
         return 1;
     }
+    out.close();
+
+#ifdef _WIN32
+    if (opts.windowed && !opts.bundleOnly && !setWindowsGuiSubsystem(outputPath)) {
+        std::cerr << "Error: Failed to mark packaged executable as a Windows GUI app." << std::endl;
+        return 1;
+    }
+#endif
 
     if (!opts.bundleOnly) {
         // Copy executable permissions (only for compiled binaries, not standalone bundles)
@@ -1419,8 +1475,14 @@ static std::string makeBenchmarkJson(
         << ",\"phases\":{";
     out << "\"frame\":";
     appendProfileStatisticsJson(out, report.frame);
+    out << ",\"gpuPacing\":";
+    appendProfileStatisticsJson(out, report.gpuPacing);
+    out << ",\"cpuPacing\":";
+    appendProfileStatisticsJson(out, report.cpuPacing);
     out << ",\"events\":";
     appendProfileStatisticsJson(out, report.events);
+    out << ",\"gpuProgress\":";
+    appendProfileStatisticsJson(out, report.gpuProgress);
     out << ",\"asyncWork\":";
     appendProfileStatisticsJson(out, report.asyncWork);
     out << ",\"callbacks\":";
@@ -1525,7 +1587,10 @@ static void printBenchmarkSummary(
     };
 
     printPhase("frame", report.frame);
+    printPhase("gpuPacing", report.gpuPacing);
+    printPhase("cpuPacing", report.cpuPacing);
     printPhase("events", report.events);
+    printPhase("gpuProgress", report.gpuProgress);
     printPhase("async", report.asyncWork);
     printPhase("callbacks", report.callbacks);
     printPhase("simulation", report.simulation);
@@ -1676,10 +1741,16 @@ int runScript(const CLIOptions& opts) {
         uint64_t targetFrame;
         std::chrono::steady_clock::time_point deadline;
     };
+    struct PendingScreenshot {
+        int clientId;
+        int requestId;
+        std::chrono::steady_clock::time_point deadline;
+    };
 
     std::unique_ptr<mystral::debug::DebugServer> debugServer;
     std::deque<DebugLogEntry> debugLogs;
     std::vector<PendingFrameWait> pendingFrameWaits;
+    std::vector<PendingScreenshot> pendingScreenshots;
     uint64_t nextLogSequence = 1;
     int quitDelayPolls = -1;
     bool debugProfilerActive = false;
@@ -1773,8 +1844,10 @@ int runScript(const CLIOptions& opts) {
     if (screenshotMode) {
         // Screenshot mode: run for N frames, take screenshot, quit
         auto startTime = std::chrono::high_resolution_clock::now();
+        const int captureLeadFrames = (std::min)(opts.frames, 5);
 
         for (int frame = 0; frame < opts.frames; frame++) {
+            if (frame >= opts.frames - captureLeadFrames) runtime->requestFrameCapture();
             if (!runtime->pollEvents()) {
                 if (!opts.quiet) {
                     std::cerr << "Warning: Runtime quit early at frame " << frame << std::endl;
@@ -1788,6 +1861,17 @@ int runScript(const CLIOptions& opts) {
 
         auto endTime = std::chrono::high_resolution_clock::now();
         auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime);
+
+        // Fast startup can finish the requested poll count before an async
+        // renderer has produced its first RAF. Wait for an actual captured
+        // frame instead of relying on incidental per-frame GPU cost.
+        for (int extraFrame = 0;
+             extraFrame < 120 && !runtime->isFrameCaptureReady();
+             ++extraFrame) {
+            runtime->requestFrameCapture();
+            if (!runtime->pollEvents()) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
 
         // Take screenshot
         bool success = runtime->saveScreenshot(opts.screenshotPath);
@@ -1933,6 +2017,7 @@ int runScript(const CLIOptions& opts) {
             int capturedFrames = 0;
 
             for (int frame = 0; frame <= opts.endFrame; frame++) {
+                if (frame >= opts.startFrame) runtime->requestFrameCapture();
                 if (!runtime->pollEvents()) {
                     if (!opts.quiet) {
                         std::cerr << "[Video] Runtime quit early at frame " << frame << std::endl;
@@ -2178,19 +2263,13 @@ int runScript(const CLIOptions& opts) {
 
                     // Handle screenshot
                     if (method == "screenshot") {
-                        std::vector<uint8_t> frameData;
-                        uint32_t width, height;
-                        if (runtime->captureFrame(frameData, width, height)) {
-                            // Encode to PNG
-                            std::vector<uint8_t> pngData;
-                            if (stbi_write_png_to_func(pngWriteCallback, &pngData, width, height, 4, frameData.data(), width * 4)) {
-                                // Base64 encode
-                                std::string base64 = base64Encode(pngData.data(), pngData.size());
-                                return "{\"data\":\"" + base64 + "\",\"width\":" + std::to_string(width) + ",\"height\":" + std::to_string(height) + "}";
-                            }
-                            return fail("Failed to encode PNG");
-                        }
-                        return fail("Failed to capture frame");
+                        runtime->requestFrameCapture();
+                        pendingScreenshots.push_back({
+                            clientId,
+                            requestId,
+                            std::chrono::steady_clock::now() + std::chrono::seconds(5)
+                        });
+                        return "";
                     }
 
                     // Handle keyboard.press, keyboard.down, keyboard.up, keyboard.type
@@ -2439,6 +2518,42 @@ int runScript(const CLIOptions& opts) {
                         it = pendingFrameWaits.erase(it);
                     } else {
                         ++it;
+                    }
+                }
+
+                if (!pendingScreenshots.empty()) {
+                    std::vector<uint8_t> frameData;
+                    uint32_t width = 0;
+                    uint32_t height = 0;
+                    if (runtime->captureFrame(frameData, width, height)) {
+                        std::vector<uint8_t> pngData;
+                        if (stbi_write_png_to_func(
+                                pngWriteCallback, &pngData, width, height, 4,
+                                frameData.data(), width * 4)) {
+                            const std::string result = "{\"data\":\"" +
+                                base64Encode(pngData.data(), pngData.size()) +
+                                "\",\"width\":" + std::to_string(width) +
+                                ",\"height\":" + std::to_string(height) + "}";
+                            for (const auto& pending : pendingScreenshots) {
+                                debugServer->sendResponse(pending.clientId, pending.requestId, result);
+                            }
+                        } else {
+                            for (const auto& pending : pendingScreenshots) {
+                                debugServer->sendError(
+                                    pending.clientId, pending.requestId, "Failed to encode PNG");
+                            }
+                        }
+                        pendingScreenshots.clear();
+                    } else {
+                        for (auto it = pendingScreenshots.begin(); it != pendingScreenshots.end();) {
+                            if (now >= it->deadline) {
+                                debugServer->sendError(
+                                    it->clientId, it->requestId, "Screenshot capture timed out");
+                                it = pendingScreenshots.erase(it);
+                            } else {
+                                ++it;
+                            }
+                        }
                     }
                 }
 
@@ -2693,6 +2808,9 @@ int main(int argc, char* argv[]) {
     if (opts.command.empty() && !embeddedEntry.empty()) {
         opts.command = "run";
         opts.scriptPath = embeddedEntry;
+        if (opts.title == "Mystral") {
+            opts.title = std::filesystem::path(mystral::vfs::getExecutablePath()).stem().string();
+        }
     }
 
     // Handle no args with no embedded entry

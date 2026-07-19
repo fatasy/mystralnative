@@ -35,13 +35,22 @@ static void onBufferMapped(WGPUMapAsyncStatus status, WGPUStringView message, vo
 
 // Forward declarations for bindings.cpp functions
 void* getCurrentRenderedTexture();
-uint32_t getCurrentTextureWidth();
-uint32_t getCurrentTextureHeight();
 void* getScreenshotBuffer();
 size_t getScreenshotBufferSize();
 uint32_t getScreenshotBytesPerRow();
 bool isScreenshotReady();
 void clearScreenshotReady();
+void requestScreenshotCapture();
+uint32_t getScreenshotWidth();
+uint32_t getScreenshotHeight();
+
+void Context::requestFrameCapture() {
+    requestScreenshotCapture();
+}
+
+bool Context::isFrameCaptureReady() const {
+    return isScreenshotReady();
+}
 
 bool Context::saveScreenshot(const char* filename) {
     if (!device_ || !queue_) {
@@ -62,8 +71,8 @@ bool Context::saveScreenshot(const char* filename) {
     }
 
     // Get dimensions for screenshot
-    uint32_t width = getCurrentTextureWidth();
-    uint32_t height = getCurrentTextureHeight();
+    uint32_t width = getScreenshotWidth();
+    uint32_t height = getScreenshotHeight();
     uint32_t bytesPerRow = getScreenshotBytesPerRow();
     size_t bufferSize = getScreenshotBufferSize();
 
@@ -140,6 +149,7 @@ bool Context::saveScreenshot(const char* filename) {
 
     // Unmap the screenshot buffer (keep it for future screenshots)
     wgpuBufferUnmap(screenshotBuffer);
+    clearScreenshotReady();
 
     // Save as PNG using stb_image_write
     if (!stbi_write_png(filename, width, height, 4, rgbaData.data(), width * 4)) {
@@ -167,8 +177,8 @@ bool Context::captureFrame(std::vector<uint8_t>& outData, uint32_t& outWidth, ui
     }
 
     // Get dimensions
-    outWidth = getCurrentTextureWidth();
-    outHeight = getCurrentTextureHeight();
+    outWidth = getScreenshotWidth();
+    outHeight = getScreenshotHeight();
     uint32_t bytesPerRow = getScreenshotBytesPerRow();
     size_t bufferSize = getScreenshotBufferSize();
 
@@ -220,6 +230,7 @@ bool Context::captureFrame(std::vector<uint8_t>& outData, uint32_t& outWidth, ui
     }
 
     wgpuBufferUnmap(screenshotBuffer);
+    clearScreenshotReady();
     return true;
 }
 

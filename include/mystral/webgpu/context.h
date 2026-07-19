@@ -114,6 +114,12 @@ public:
     bool saveScreenshot(const char* filename);
 
     /**
+     * Arm a readback for the next rendered frame.
+     */
+    void requestFrameCapture();
+    bool isFrameCaptureReady() const;
+
+    /**
      * Capture the current frame as RGBA pixel data
      * @param outData Output vector to receive RGBA data (width * height * 4 bytes)
      * @param outWidth Output parameter for frame width

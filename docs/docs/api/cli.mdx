@@ -26,8 +26,8 @@ mystral run <script.js> [options]
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `--width` | number | 1280 | Window width in pixels |
-| `--height` | number | 720 | Window height in pixels |
+| `--width` | number | 1920 | Window width in pixels |
+| `--height` | number | 1080 | Window height in pixels |
 | `--title` | string | "Mystral" | Window title |
 | `--headless` | flag | - | Run without displaying a window |
 | `--no-sdl` | flag | - | Run without SDL (headless GPU, no window system) |
@@ -231,6 +231,7 @@ mystral compile <entry.js> [options]
 | `--output`, `--out`, `-o` | string | `./<entry-stem>` | Output file path |
 | `--include`, `--assets` | string | - | Asset directory to bundle (repeatable) |
 | `--root` | string | cwd | Root directory for bundle paths |
+| `--windowed` | flag | - | Mark the packaged Windows executable as a GUI app without a console window |
 | `--bundle-only` | flag | - | Create standalone `.bundle` file instead of executable |
 
 ### Examples

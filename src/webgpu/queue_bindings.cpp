@@ -161,53 +161,61 @@ void installQueueBindings(js::JSValueHandle device) {    // device.queue
             // Only capture when the surface render pass has ended, matching the present condition
             // Also ensure we only capture once per frame (Three.js does multiple queue.submit() per frame)
             WGPUTexture screenshotTexture = g_currentViewSourceTexture ? g_currentViewSourceTexture : g_currentTexture;
-            if (g_commandEncoders.surfaceRenderPassEnded() && !g_screenshot.capturedThisFrame() && screenshotTexture && g_device && g_queue) {
+            if (g_commandEncoders.surfaceRenderPassEnded() && g_screenshot.shouldCapture() &&
+                screenshotTexture && g_device && g_queue) {
                 WGPUBuffer screenshotBuffer =
                     g_screenshot.ensureBuffer(g_device, g_canvasWidth, g_canvasHeight);
+                if (screenshotBuffer) {
+                    WGPUCommandEncoderDescriptor encDesc = {};
+                    WGPUCommandEncoder copyEncoder =
+                        wgpuDeviceCreateCommandEncoder(g_device, &encDesc);
+                    if (copyEncoder) {
+                        WGPUImageCopyTexture_Compat srcCopy = {};
+                        srcCopy.texture = screenshotTexture;
+                        srcCopy.mipLevel = 0;
+                        srcCopy.origin = {0, 0, 0};
+                        srcCopy.aspect = WGPUTextureAspect_All;
 
-                // Create encoder to copy texture to buffer
-                WGPUCommandEncoderDescriptor encDesc = {};
-                WGPUCommandEncoder copyEncoder = wgpuDeviceCreateCommandEncoder(g_device, &encDesc);
+                        WGPUImageCopyBuffer_Compat dstCopy = {};
+                        dstCopy.buffer = screenshotBuffer;
+                        dstCopy.layout.offset = 0;
+                        dstCopy.layout.bytesPerRow = g_screenshot.bytesPerRow();
+                        dstCopy.layout.rowsPerImage = g_canvasHeight;
 
-                WGPUImageCopyTexture_Compat srcCopy = {};
-                srcCopy.texture = screenshotTexture;
-                srcCopy.mipLevel = 0;
-                srcCopy.origin = {0, 0, 0};
-                srcCopy.aspect = WGPUTextureAspect_All;
+                        WGPUExtent3D copySize = {g_canvasWidth, g_canvasHeight, 1};
+                        wgpuCommandEncoderCopyTextureToBuffer(
+                            copyEncoder, &srcCopy, &dstCopy, &copySize);
 
-                WGPUImageCopyBuffer_Compat dstCopy = {};
-                dstCopy.buffer = screenshotBuffer;
-                dstCopy.layout.offset = 0;
-                dstCopy.layout.bytesPerRow = g_screenshot.bytesPerRow();
-                dstCopy.layout.rowsPerImage = g_canvasHeight;
+                        if (g_verboseLogging) {
+                            std::cout << "[Screenshot] Copying from texture "
+                                      << (void*)screenshotTexture
+                                      << " (format=" << g_surfaceFormat << ", size="
+                                      << g_canvasWidth << "x" << g_canvasHeight << ")"
+                                      << std::endl;
+                        }
 
-                WGPUExtent3D copySize = {g_canvasWidth, g_canvasHeight, 1};
-                wgpuCommandEncoderCopyTextureToBuffer(copyEncoder, &srcCopy, &dstCopy, &copySize);
+                        WGPUCommandBufferDescriptor cmdDesc = {};
+                        WGPUCommandBuffer copyCmd =
+                            wgpuCommandEncoderFinish(copyEncoder, &cmdDesc);
+                        wgpuCommandEncoderRelease(copyEncoder);
+                        if (copyCmd) {
+                            std::vector<WGPUCommandBuffer> screenshotCommands = {copyCmd};
+                            g_frameQueue.submit(std::move(screenshotCommands));
 
-                if (g_verboseLogging) std::cout << "[Screenshot] Copying from texture " << (void*)screenshotTexture
-                          << " (format=" << g_surfaceFormat << ", size=" << g_canvasWidth << "x" << g_canvasHeight << ")" << std::endl;
-
-                WGPUCommandBufferDescriptor cmdDesc = {};
-                WGPUCommandBuffer copyCmd = wgpuCommandEncoderFinish(copyEncoder, &cmdDesc);
-                wgpuCommandEncoderRelease(copyEncoder);
-                if (copyCmd) {
-                    std::vector<WGPUCommandBuffer> screenshotCommands = {copyCmd};
-                    g_frameQueue.submit(std::move(screenshotCommands));
-                }
-
-                // Outside the animation-frame scope, retain the previous eager
-                // completion behavior. Normal frames flush this copy in endDawnFrame.
-                if (!g_frameQueue.frameActive()) {
-                    for (int syncIter = 0; syncIter < 100; syncIter++) {
-                        wgpuDeviceTick(g_device);
-                        if (g_instance) {
-                            wgpuInstanceProcessEvents(g_instance);
+                            // Outside the animation-frame scope, retain the previous eager
+                            // completion behavior. Normal frames flush this copy in endDawnFrame.
+                            if (!g_frameQueue.frameActive()) {
+                                for (int syncIter = 0; syncIter < 100; syncIter++) {
+                                    wgpuDeviceTick(g_device);
+                                    if (g_instance) {
+                                        wgpuInstanceProcessEvents(g_instance);
+                                    }
+                                }
+                            }
+                            g_screenshot.markCaptured(g_canvasWidth, g_canvasHeight);
                         }
                     }
                 }
-
-                g_screenshot.markReady();
-                g_screenshot.markCapturedThisFrame();
             }
 
             if (!g_frameQueue.frameActive()) presentSurfaceIfReady();

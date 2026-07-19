@@ -57,11 +57,19 @@ size_t processAsyncCompletions(size_t maxCount) {
     return g_asyncBridge.process(maxCount);
 }
 
+void waitForDawnFrameSlot() {
+    g_frameQueue.waitForFrameSlot();
+}
+
+bool submittedDawnWorkLastFrame() {
+    return g_frameQueue.submittedLastFrame();
+}
+
+void pumpDawnProgress() {
+    g_frameQueue.pumpProgress();
+}
 
 
-static bool g_screenshotPending = false;
-// Prevent capturing multiple screenshots per frame (Three.js does multiple queue.submit() per frame)
-static std::vector<uint8_t> g_screenshotData;
 
 void presentSurfaceIfReady() {
     if (!g_surface || !g_currentTexture || !g_commandEncoders.surfaceRenderPassEnded()) return;
@@ -110,7 +118,7 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
     g_queue = (WGPUQueue)wgpuQueue;
     g_surface = (WGPUSurface)wgpuSurface;
     g_maxTrackedGpuMemoryBytes = maxTrackedGpuMemoryBytes;
-    g_asyncBridge.configure(engine, g_instance, g_device);
+    g_asyncBridge.configure(engine);
     g_frameQueue.configure(g_instance, g_device, g_queue, maxFrameLatency);
     g_capabilities.configure(engine, g_adapter, g_device);
 
@@ -417,14 +425,6 @@ void* getCurrentRenderedTexture() {
     return g_currentTexture;
 }
 
-uint32_t getCurrentTextureWidth() {
-    return g_canvasWidth;
-}
-
-uint32_t getCurrentTextureHeight() {
-    return g_canvasHeight;
-}
-
 void* getCurrentSurfaceTexture() {
     // Return the texture that the current view was created from (for screenshots)
     // or the current texture if no view was created yet
@@ -450,6 +450,18 @@ bool isScreenshotReady() {
 
 void clearScreenshotReady() {
     g_screenshot.clearReady();
+}
+
+void requestScreenshotCapture() {
+    g_screenshot.requestCapture();
+}
+
+uint32_t getScreenshotWidth() {
+    return g_screenshot.capturedWidth();
+}
+
+uint32_t getScreenshotHeight() {
+    return g_screenshot.capturedHeight();
 }
 
 void setOffscreenTexture(void* texture, void* textureView) {
@@ -555,21 +567,18 @@ void invokeVideoCaptureCallback(WGPUTexture texture, uint32_t width, uint32_t he
 
 void endDawnFrame() {
     // Composite Canvas 2D content to WebGPU if the main canvas uses 2D context
-    if (auto texture = g_canvasCompositor.composite(g_canvasWidth, g_canvasHeight)) {
-        g_currentTexture = texture;
-    }
+    const bool canvasComposited =
+        g_canvasCompositor.composite(g_canvasWidth, g_canvasHeight, g_frameQueue);
 
     // Preserve all Three.js pass boundaries inside the command-buffer array,
     // but cross the actual Dawn queue only once for the normal WebGPU frame.
     g_frameQueue.endFrame();
-    presentSurfaceIfReady();
-
-    // Tick the WebGPU device to process completed GPU work and free internal
-    // resources (staging buffers, command encoder state, etc.). Without this,
-    // internal objects accumulate unboundedly since completion callbacks never fire.
-    if (g_device) {
-        wgpuDeviceTick(g_device);
+    if (canvasComposited) {
+        g_canvasCompositor.present();
+    } else {
+        presentSurfaceIfReady();
     }
+
 }
 
 }  // namespace webgpu

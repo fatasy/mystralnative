@@ -43,6 +43,13 @@ struct ImageData {
     std::vector<uint8_t> data;  // RGBA pixels
 };
 
+struct CanvasDirtyRect {
+    int x = 0;
+    int y = 0;
+    int width = 0;
+    int height = 0;
+};
+
 /**
  * Canvas2DContext - CanvasRenderingContext2D implementation
  *
@@ -140,9 +147,18 @@ public:
     const uint8_t* getPixelData() const;
     size_t getPixelDataSize() const;
 
+    bool isDirty() const { return dirty_; }
+    CanvasDirtyRect getDirtyRect() const { return dirtyRect_; }
+    void clearDirty();
+
 private:
+    void markDirty();
+    void markDirty(int x, int y, int width, int height);
+
     int width_;
     int height_;
+    bool dirty_ = false;
+    CanvasDirtyRect dirtyRect_;
 
     // Skia implementation details (pimpl pattern)
     struct Impl;

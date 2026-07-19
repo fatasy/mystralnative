@@ -24,6 +24,9 @@ bool initBindings(
     uint64_t maxTrackedGpuMemoryBytes = 0);
 
 size_t processAsyncCompletions(size_t maxCount = static_cast<size_t>(-1));
+void waitForDawnFrameSlot();
+bool submittedDawnWorkLastFrame();
+void pumpDawnProgress();
 void* getCurrentSurfaceTexture();
 void setOffscreenTexture(void* texture, void* textureView);
 void beginDawnFrame();

@@ -24,6 +24,8 @@ struct FrameQueueStats {
     uint64_t frameLatencyWaits = 0;
     uint64_t frameLatencyWaitNanoseconds = 0;
     uint64_t maxInFlightSubmissions = 0;
+    uint64_t progressPumps = 0;
+    uint64_t progressPumpNanoseconds = 0;
 };
 
 class FrameQueue {
@@ -32,10 +34,13 @@ public:
                    uint32_t maxFrameLatency);
     void reset();
 
+    void waitForFrameSlot();
+    void pumpProgress();
     void beginFrame();
     void endFrame();
     bool frameActive() const { return frameActive_; }
     bool hasPendingWork() const { return !work_.empty(); }
+    bool submittedLastFrame() const { return submittedLastFrame_; }
 
     void submit(std::vector<WGPUCommandBuffer>&& commandBuffers);
     void writeBuffer(WGPUBuffer buffer, uint64_t offset, const void* data, size_t size);
@@ -77,6 +82,8 @@ private:
     WGPUQueue queue_ = nullptr;
     uint32_t maxFrameLatency_ = 2;
     bool frameActive_ = false;
+    bool submittedThisFrame_ = false;
+    bool submittedLastFrame_ = false;
     std::vector<Work> work_;
     std::vector<uint8_t> uploadBytes_;
     std::array<UploadSlot, 3> uploadRing_{};

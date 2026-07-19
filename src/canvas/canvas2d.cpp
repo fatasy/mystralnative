@@ -6,6 +6,7 @@
  */
 
 #include "mystral/canvas/canvas2d.h"
+#include <algorithm>
 #include <iostream>
 #include <cmath>
 #include <regex>
@@ -338,6 +339,7 @@ struct Canvas2DContext::Impl {
 Canvas2DContext::Canvas2DContext(int width, int height)
     : width_(width), height_(height) {
     impl_ = std::make_unique<Impl>(width, height);
+    markDirty();
     std::cout << "[Canvas2D] Created " << width << "x" << height << " context" << std::endl;
 }
 
@@ -347,6 +349,43 @@ void Canvas2DContext::resize(int width, int height) {
     width_ = width;
     height_ = height;
     impl_->resize(width, height);
+    markDirty();
+}
+
+void Canvas2DContext::markDirty() {
+    dirty_ = width_ > 0 && height_ > 0;
+    dirtyRect_ = {0, 0, width_, height_};
+}
+
+void Canvas2DContext::markDirty(int x, int y, int width, int height) {
+    if (width <= 0 || height <= 0 || width_ <= 0 || height_ <= 0) return;
+    const int left = std::clamp(x, 0, width_);
+    const int top = std::clamp(y, 0, height_);
+    const int right = std::clamp(x + width, 0, width_);
+    const int bottom = std::clamp(y + height, 0, height_);
+    if (left >= right || top >= bottom) return;
+
+    if (!dirty_) {
+        dirty_ = true;
+        dirtyRect_ = {left, top, right - left, bottom - top};
+        return;
+    }
+
+    const int mergedLeft = std::min(dirtyRect_.x, left);
+    const int mergedTop = std::min(dirtyRect_.y, top);
+    const int mergedRight = std::max(dirtyRect_.x + dirtyRect_.width, right);
+    const int mergedBottom = std::max(dirtyRect_.y + dirtyRect_.height, bottom);
+    dirtyRect_ = {
+        mergedLeft,
+        mergedTop,
+        mergedRight - mergedLeft,
+        mergedBottom - mergedTop,
+    };
+}
+
+void Canvas2DContext::clearDirty() {
+    dirty_ = false;
+    dirtyRect_ = {};
 }
 
 // State Management
@@ -461,6 +500,7 @@ void Canvas2DContext::fillText(const std::string& text, float x, float y) {
 
     impl_->canvas->drawString(text.c_str(), x, y, impl_->currentFont, paint);
 #endif
+    markDirty();
 }
 
 void Canvas2DContext::strokeText(const std::string& text, float x, float y) {
@@ -491,6 +531,7 @@ void Canvas2DContext::strokeText(const std::string& text, float x, float y) {
 
     impl_->canvas->drawString(text.c_str(), x, y, impl_->currentFont, paint);
 #endif
+    markDirty();
 }
 
 TextMetrics Canvas2DContext::measureText(const std::string& text) {
@@ -526,6 +567,7 @@ void Canvas2DContext::fillRect(float x, float y, float width, float height) {
     if (!impl_->canvas) return;
     impl_->canvas->drawRect(SkRect::MakeXYWH(x, y, width, height), impl_->makeFillPaint());
 #endif
+    markDirty();
 }
 
 void Canvas2DContext::strokeRect(float x, float y, float width, float height) {
@@ -533,6 +575,7 @@ void Canvas2DContext::strokeRect(float x, float y, float width, float height) {
     if (!impl_->canvas) return;
     impl_->canvas->drawRect(SkRect::MakeXYWH(x, y, width, height), impl_->makeStrokePaint());
 #endif
+    markDirty();
 }
 
 void Canvas2DContext::clearRect(float x, float y, float width, float height) {
@@ -557,6 +600,7 @@ void Canvas2DContext::clearRect(float x, float y, float width, float height) {
         }
     }
 #endif
+    markDirty();
 }
 
 // Paths
@@ -652,6 +696,7 @@ void Canvas2DContext::fill() {
     // snapshot() returns an SkPath without consuming the builder
     impl_->canvas->drawPath(impl_->pathBuilder.snapshot(), impl_->makeFillPaint());
 #endif
+    markDirty();
 }
 
 void Canvas2DContext::stroke() {
@@ -660,6 +705,7 @@ void Canvas2DContext::stroke() {
     // snapshot() returns an SkPath without consuming the builder
     impl_->canvas->drawPath(impl_->pathBuilder.snapshot(), impl_->makeStrokePaint());
 #endif
+    markDirty();
 }
 
 // Transformations
@@ -756,6 +802,7 @@ void Canvas2DContext::putImageData(const ImageData& imageData, int x, int y) {
 
     impl_->canvas->drawImage(bitmap.asImage(), x, y);
 #endif
+    markDirty(x, y, imageData.width, imageData.height);
 }
 
 const uint8_t* Canvas2DContext::getPixelData() const {

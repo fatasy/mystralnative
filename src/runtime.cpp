@@ -407,6 +407,7 @@ public:
             return false;
         }
         LOGI("Surface configured successfully");
+        configureCpuFramePacing();
 
         return initializeJSAndBindings();
     }
@@ -960,6 +961,48 @@ private:
         return true;
     }
 
+    void configureCpuFramePacing() {
+        cpuFramePacingEnabled_ = false;
+        cpuFramePacingArmed_ = false;
+        if (config_.noSdl || !webgpu_) return;
+
+        const auto presentMode = static_cast<WGPUPresentMode>(webgpu_->getPresentMode());
+        if (presentMode != WGPUPresentMode_Fifo &&
+            presentMode != WGPUPresentMode_FifoRelaxed) {
+            return;
+        }
+
+        const double refreshRate = platform::getDisplayRefreshRate();
+        cpuFrameInterval_ = std::chrono::duration_cast<FrameClock::duration>(
+            std::chrono::duration<double>(1.0 / refreshRate));
+        cpuFramePacingEnabled_ = cpuFrameInterval_ > FrameClock::duration::zero();
+        if (cpuFramePacingEnabled_) {
+            std::cout << "[Mystral] CPU frame pacer: " << refreshRate << " Hz" << std::endl;
+        }
+    }
+
+    void waitForCpuFrameDeadline() {
+        if (!cpuFramePacingEnabled_) return;
+
+        auto now = FrameClock::now();
+        if (!cpuFramePacingArmed_) {
+            cpuFrameDeadline_ = now + cpuFrameInterval_;
+            cpuFramePacingArmed_ = true;
+            return;
+        }
+
+        if (now < cpuFrameDeadline_) {
+            const auto remaining = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                cpuFrameDeadline_ - now);
+            SDL_DelayPrecise(static_cast<Uint64>(remaining.count()));
+            now = FrameClock::now();
+        }
+
+        do {
+            cpuFrameDeadline_ += cpuFrameInterval_;
+        } while (cpuFrameDeadline_ <= now);
+    }
+
 public:
 
     // ========================================================================
@@ -1037,6 +1080,28 @@ public:
             profilePhaseStart = profileFrameStart;
         }
 
+        // Acquire a GPU frame slot before reading input so freshly processed
+        // events flow directly into simulation and rendering.
+        if (!paused_ || stepFramesRemaining_ > 0) {
+            webgpu::waitForDawnFrameSlot();
+        }
+        if (profilingFrame && profiler_.active()) {
+            auto now = ProfileClock::now();
+            profileSample.gpuPacingMs =
+                debug::RuntimeProfiler::millisecondsBetween(profilePhaseStart, now);
+            profilePhaseStart = now;
+        }
+
+        if (!webgpu::submittedDawnWorkLastFrame()) {
+            waitForCpuFrameDeadline();
+        }
+        if (profilingFrame && profiler_.active()) {
+            auto now = ProfileClock::now();
+            profileSample.cpuPacingMs =
+                debug::RuntimeProfiler::millisecondsBetween(profilePhaseStart, now);
+            profilePhaseStart = now;
+        }
+
         // Poll SDL events through our platform layer (skip in no-SDL mode)
         if (!config_.noSdl) {
             if (!platform::pollEvents()) {
@@ -1052,6 +1117,16 @@ public:
         if (profilingFrame && profiler_.active()) {
             auto now = ProfileClock::now();
             profileSample.eventsMs = debug::RuntimeProfiler::millisecondsBetween(profilePhaseStart, now);
+            profilePhaseStart = now;
+        }
+
+        // One explicit Dawn progress pump per runtime frame. Promise callbacks
+        // are drained later without ticking the device a second time.
+        webgpu::pumpDawnProgress();
+        if (profilingFrame && profiler_.active()) {
+            auto now = ProfileClock::now();
+            profileSample.gpuProgressMs =
+                debug::RuntimeProfiler::millisecondsBetween(profilePhaseStart, now);
             profilePhaseStart = now;
         }
 
@@ -1271,6 +1346,14 @@ public:
             return false;
         }
         return webgpu_->saveScreenshot(filename.c_str());
+    }
+
+    void requestFrameCapture() override {
+        if (webgpu_) webgpu_->requestFrameCapture();
+    }
+
+    bool isFrameCaptureReady() const override {
+        return webgpu_ && webgpu_->isFrameCaptureReady();
     }
 
     bool captureFrame(std::vector<uint8_t>& outData, uint32_t& outWidth, uint32_t& outHeight) override {
@@ -2082,6 +2165,8 @@ globalThis.__mystralNativeDecodeDracoAsync = function(buffer, attrs) {
         // V8 performs microtask checkpoints after engine calls.
     }
 
+    using FrameClock = std::chrono::steady_clock;
+
     RuntimeConfig config_;
     bool running_;
     int exitCode_ = 0;  // Exit code set by process.exit()
@@ -2090,6 +2175,10 @@ globalThis.__mystralNativeDecodeDracoAsync = function(buffer, attrs) {
     uint64_t frameCount_ = 0;
     int width_;
     int height_;
+    bool cpuFramePacingEnabled_ = false;
+    bool cpuFramePacingArmed_ = false;
+    FrameClock::duration cpuFrameInterval_{};
+    FrameClock::time_point cpuFrameDeadline_{};
 
     std::unique_ptr<webgpu::Context> webgpu_;
     std::unique_ptr<js::Engine> jsEngine_;

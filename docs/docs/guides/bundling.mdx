@@ -408,10 +408,10 @@ To distribute your app, compile it into a standalone binary with `mystral compil
 ```bash
 # If using a bundler:
 npm run build
-mystral compile dist/game.js --include assets --out dist/my-game
+mystral compile dist/game.js --include assets --windowed --out dist/my-game
 
 # If your app is a single file:
-mystral compile src/game.js --include assets --out dist/my-game
+mystral compile src/game.js --include assets --windowed --out dist/my-game
 
 # Run the executable directly (no mystral CLI needed)
 ./dist/my-game

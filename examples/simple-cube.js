@@ -254,7 +254,7 @@ async function main() {
     mat4.multiply(mvp, projection, tempMat);
 
     // Upload MVP matrix
-    device.queue.writeBuffer(uniformBuffer, 0, mvp, 0, mvp.byteLength);
+    device.queue.writeBuffer(uniformBuffer, 0, mvp);
 
     const commandEncoder = device.createCommandEncoder();
 

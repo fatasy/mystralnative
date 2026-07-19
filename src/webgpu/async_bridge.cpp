@@ -4,16 +4,12 @@
 
 namespace mystral::webgpu::bridge {
 
-void AsyncBridge::configure(js::Engine* engine, WGPUInstance instance, WGPUDevice device) {
+void AsyncBridge::configure(js::Engine* engine) {
     engine_ = engine;
-    instance_ = instance;
-    device_ = device;
 }
 
 void AsyncBridge::detach() {
     engine_ = nullptr;
-    instance_ = nullptr;
-    device_ = nullptr;
 }
 
 AsyncBridge::PendingPromise* AsyncBridge::createPromise(js::JSValueHandle& promise) {
@@ -94,11 +90,6 @@ void AsyncBridge::enqueue(std::function<void()> completion) {
 }
 
 size_t AsyncBridge::process(size_t maxCount) {
-    if (!pendingPromises_.empty()) {
-        if (instance_) wgpuInstanceProcessEvents(instance_);
-        if (device_) wgpuDeviceTick(device_);
-    }
-
     std::deque<std::function<void()>> completions;
     {
         std::lock_guard<std::mutex> lock(completionMutex_);

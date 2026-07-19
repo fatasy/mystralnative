@@ -36,12 +36,28 @@ void FrameQueue::reset() {
     device_ = nullptr;
     queue_ = nullptr;
     frameActive_ = false;
+    submittedThisFrame_ = false;
+    submittedLastFrame_ = false;
 }
 
-void FrameQueue::beginFrame() {
+void FrameQueue::waitForFrameSlot() {
     while (inFlightSubmissions_.size() >= maxFrameLatency_) {
         waitForOldestSubmission();
     }
+}
+
+void FrameQueue::pumpProgress() {
+    const auto startedAt = std::chrono::steady_clock::now();
+    if (instance_) wgpuInstanceProcessEvents(instance_);
+    if (device_) wgpuDeviceTick(device_);
+    const auto elapsed = std::chrono::steady_clock::now() - startedAt;
+    stats_.progressPumps++;
+    stats_.progressPumpNanoseconds += static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count());
+}
+
+void FrameQueue::beginFrame() {
+    submittedThisFrame_ = false;
     if (hasPendingWork()) {
         stats_.forcedFrameFlushes++;
         flush();
@@ -69,6 +85,7 @@ void FrameQueue::waitForOldestSubmission() {
 
 void FrameQueue::endFrame() {
     flush();
+    submittedLastFrame_ = submittedThisFrame_;
     frameActive_ = false;
 }
 
@@ -98,6 +115,7 @@ void FrameQueue::recordNativeSubmit(const std::vector<WGPUCommandBuffer>& comman
     stats_.maxCommandBuffersPerNativeSubmit = std::max<uint64_t>(
         stats_.maxCommandBuffersPerNativeSubmit, commandBuffers.size());
     stats_.nativeQueueSubmitNanoseconds += elapsedNanoseconds;
+    if (frameActive_) submittedThisFrame_ = true;
     record(Operation::NativeQueueSubmit, elapsedNanoseconds);
 }
 

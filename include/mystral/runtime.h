@@ -73,7 +73,10 @@ struct RuntimeProfileReport {
     uint64_t sampledFrames = 0;
     double wallTimeMs = 0.0;
     RuntimeProfileStatistics frame;
+    RuntimeProfileStatistics gpuPacing;
+    RuntimeProfileStatistics cpuPacing;
     RuntimeProfileStatistics events;
+    RuntimeProfileStatistics gpuProgress;
     RuntimeProfileStatistics asyncWork;
     RuntimeProfileStatistics callbacks;
     RuntimeProfileStatistics simulation;
@@ -307,6 +310,12 @@ public:
      * @return true on success
      */
     virtual bool saveScreenshot(const std::string& filename) = 0;
+
+    /**
+     * Arm a readback for the next rendered frame.
+     */
+    virtual void requestFrameCapture() = 0;
+    virtual bool isFrameCaptureReady() const = 0;
 
     /**
      * Capture the current frame as RGBA pixel data (for video recording)

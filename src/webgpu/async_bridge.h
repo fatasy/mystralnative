@@ -10,8 +10,6 @@
 #include <string>
 #include <unordered_set>
 
-#include <webgpu/webgpu.h>
-
 namespace mystral::webgpu::bridge {
 
 class AsyncBridge {
@@ -24,7 +22,7 @@ public:
         bool active = true;
     };
 
-    void configure(js::Engine* engine, WGPUInstance instance, WGPUDevice device);
+    void configure(js::Engine* engine);
     void detach();
 
     PendingPromise* createPromise(js::JSValueHandle& promise);
@@ -47,8 +45,6 @@ private:
     void abandonPendingPromises();
 
     js::Engine* engine_ = nullptr;
-    WGPUInstance instance_ = nullptr;
-    WGPUDevice device_ = nullptr;
     mutable std::mutex completionMutex_;
     std::deque<std::function<void()>> completions_;
     std::unordered_set<PendingPromise*> pendingPromises_;

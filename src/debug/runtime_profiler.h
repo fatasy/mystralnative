@@ -23,7 +23,10 @@ class RuntimeProfiler {
 public:
     struct FrameSample {
         double frameMs = 0.0;
+        double gpuPacingMs = 0.0;
+        double cpuPacingMs = 0.0;
         double eventsMs = 0.0;
+        double gpuProgressMs = 0.0;
         double asyncWorkMs = 0.0;
         double callbacksMs = 0.0;
         double simulationMs = 0.0;

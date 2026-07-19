@@ -2,6 +2,8 @@
 
 #include "mystral/webgpu_compat.h"
 
+#include <algorithm>
+#include <cstring>
 #include <iostream>
 
 namespace mystral::webgpu::bridge {
@@ -17,10 +19,27 @@ void CanvasCompositor::configure(
     surfaceFormat_ = surfaceFormat;
 }
 
-WGPUTexture CanvasCompositor::composite(uint32_t canvasWidth, uint32_t canvasHeight) {
-    if (!context_ || !device_ || !queue_ || !surface_) {
-        return nullptr;
+void CanvasCompositor::setSurfaceFormat(WGPUTextureFormat surfaceFormat) {
+    if (surfaceFormat_ == surfaceFormat) return;
+    surfaceFormat_ = surfaceFormat;
+    if (pipeline_) {
+        wgpuRenderPipelineRelease(pipeline_);
+        pipeline_ = nullptr;
     }
+    if (bindGroup_) {
+        wgpuBindGroupRelease(bindGroup_);
+        bindGroup_ = nullptr;
+    }
+}
+
+bool CanvasCompositor::composite(
+    uint32_t canvasWidth, uint32_t canvasHeight, FrameQueue& frameQueue) {
+    if (!context_ || !device_ || !queue_ || !surface_) {
+        return false;
+    }
+
+    const bool pixelsChanged = context_->isDirty();
+    if (!pixelsChanged) stats_.framesWithoutUpload++;
 
     // Get Canvas 2D pixel data
     const uint8_t* pixelData = context_->getPixelData();
@@ -29,7 +48,7 @@ WGPUTexture CanvasCompositor::composite(uint32_t canvasWidth, uint32_t canvasHei
     int height = context_->getHeight();
 
     if (!pixelData || pixelDataSize == 0) {
-        return nullptr;
+        return false;
     }
 
     // Create or resize texture if needed
@@ -54,22 +73,49 @@ WGPUTexture CanvasCompositor::composite(uint32_t canvasWidth, uint32_t canvasHei
         texture_ = wgpuDeviceCreateTexture(device_, &texDesc);
         textureWidth_ = width;
         textureHeight_ = height;
+        if (!texture_) return false;
     }
 
-    // Upload pixel data to texture
-    WGPUImageCopyTexture_Compat destTexture = {};
-    destTexture.texture = texture_;
-    destTexture.mipLevel = 0;
-    destTexture.origin = {0, 0, 0};
-    destTexture.aspect = WGPUTextureAspect_All;
+    if (pixelsChanged) {
+        const auto dirty = context_->getDirtyRect();
+        const uint32_t uploadWidth = static_cast<uint32_t>(dirty.width);
+        const uint32_t uploadHeight = static_cast<uint32_t>(dirty.height);
+        const uint32_t sourceBytesPerRow = static_cast<uint32_t>(width) * 4;
+        const uint32_t uploadBytesPerRow = ((uploadWidth * 4 + 255) / 256) * 256;
+        uploadScratch_.resize(static_cast<size_t>(uploadBytesPerRow) * uploadHeight);
+        for (uint32_t row = 0; row < uploadHeight; ++row) {
+            const auto* source = pixelData +
+                static_cast<size_t>(dirty.y + row) * sourceBytesPerRow +
+                static_cast<size_t>(dirty.x) * 4;
+            std::memcpy(
+                uploadScratch_.data() + static_cast<size_t>(row) * uploadBytesPerRow,
+                source,
+                static_cast<size_t>(uploadWidth) * 4);
+        }
 
-    WGPUTextureDataLayout_Compat dataLayout = {};
-    dataLayout.offset = 0;
-    dataLayout.bytesPerRow = width * 4;
-    dataLayout.rowsPerImage = height;
+        WGPUImageCopyTexture_Compat destTexture = {};
+        destTexture.texture = texture_;
+        destTexture.mipLevel = 0;
+        destTexture.origin = {
+            static_cast<uint32_t>(dirty.x),
+            static_cast<uint32_t>(dirty.y),
+            0,
+        };
+        destTexture.aspect = WGPUTextureAspect_All;
 
-    WGPUExtent3D writeSize = {(uint32_t)width, (uint32_t)height, 1};
-    wgpuQueueWriteTexture(queue_, &destTexture, pixelData, pixelDataSize, &dataLayout, &writeSize);
+        WGPUTextureDataLayout_Compat dataLayout = {};
+        dataLayout.offset = 0;
+        dataLayout.bytesPerRow = uploadBytesPerRow;
+        dataLayout.rowsPerImage = uploadHeight;
+
+        WGPUExtent3D writeSize = {uploadWidth, uploadHeight, 1};
+        wgpuQueueWriteTexture(
+            queue_, &destTexture, uploadScratch_.data(), uploadScratch_.size(),
+            &dataLayout, &writeSize);
+        context_->clearDirty();
+        stats_.textureUploads++;
+        stats_.textureUploadBytes += uploadScratch_.size();
+    }
 
     // Create pipeline if needed
     if (!pipeline_) {
@@ -122,7 +168,7 @@ WGPUTexture CanvasCompositor::composite(uint32_t canvasWidth, uint32_t canvasHei
         samplerDesc.maxAnisotropy = 1;
         samplerDesc.lodMinClamp = 0.0f;
         samplerDesc.lodMaxClamp = 1.0f;
-        sampler_ = wgpuDeviceCreateSampler(device_, &samplerDesc);
+        if (!sampler_) sampler_ = wgpuDeviceCreateSampler(device_, &samplerDesc);
 
         // Create bind group layout
         WGPUBindGroupLayoutEntry bgLayoutEntries[2] = {};
@@ -174,14 +220,14 @@ WGPUTexture CanvasCompositor::composite(uint32_t canvasWidth, uint32_t canvasHei
 
         if (!pipeline_) {
             std::cerr << "[Canvas2D] Failed to create compositing pipeline" << std::endl;
-            return nullptr;
+            return false;
         }
     }
 
     // Create bind group (recreate if texture changed)
     if (!bindGroup_) {
         if (!sampler_ || !texture_) {
-            return nullptr;
+            return false;
         }
 
         WGPUTextureViewDescriptor viewDesc = {};
@@ -194,7 +240,7 @@ WGPUTexture CanvasCompositor::composite(uint32_t canvasWidth, uint32_t canvasHei
         WGPUTextureView texView = wgpuTextureCreateView(texture_, &viewDesc);
 
         if (!texView) {
-            return nullptr;
+            return false;
         }
 
         WGPUBindGroupEntry bgEntries[2] = {};
@@ -206,7 +252,7 @@ WGPUTexture CanvasCompositor::composite(uint32_t canvasWidth, uint32_t canvasHei
         WGPUBindGroupLayout layout = wgpuRenderPipelineGetBindGroupLayout(pipeline_, 0);
         if (!layout) {
             wgpuTextureViewRelease(texView);
-            return nullptr;
+            return false;
         }
 
         WGPUBindGroupDescriptor bgDesc = {};
@@ -219,7 +265,7 @@ WGPUTexture CanvasCompositor::composite(uint32_t canvasWidth, uint32_t canvasHei
         wgpuTextureViewRelease(texView);
 
         if (!bindGroup_) {
-            return nullptr;
+            return false;
         }
     }
 
@@ -227,7 +273,7 @@ WGPUTexture CanvasCompositor::composite(uint32_t canvasWidth, uint32_t canvasHei
     WGPUSurfaceTexture surfaceTexture;
     wgpuSurfaceGetCurrentTexture(surface_, &surfaceTexture);
     if (!wgpuSurfaceTextureStatusIsSuccess(surfaceTexture.status)) {
-        return nullptr;
+        return false;
     }
 
     WGPUTextureViewDescriptor surfaceViewDesc = {};
@@ -238,10 +284,19 @@ WGPUTexture CanvasCompositor::composite(uint32_t canvasWidth, uint32_t canvasHei
     surfaceViewDesc.baseArrayLayer = 0;
     surfaceViewDesc.arrayLayerCount = 1;
     WGPUTextureView surfaceView = wgpuTextureCreateView(surfaceTexture.texture, &surfaceViewDesc);
+    if (!surfaceView) {
+        wgpuTextureRelease(surfaceTexture.texture);
+        return false;
+    }
 
     // Create command encoder and render pass
     WGPUCommandEncoderDescriptor encDesc = {};
     WGPUCommandEncoder encoder = wgpuDeviceCreateCommandEncoder(device_, &encDesc);
+    if (!encoder) {
+        wgpuTextureViewRelease(surfaceView);
+        wgpuTextureRelease(surfaceTexture.texture);
+        return false;
+    }
 
     WGPURenderPassColorAttachment colorAttachment = {};
     colorAttachment.view = surfaceView;
@@ -257,46 +312,70 @@ WGPUTexture CanvasCompositor::composite(uint32_t canvasWidth, uint32_t canvasHei
     renderPassDesc.colorAttachments = &colorAttachment;
 
     WGPURenderPassEncoder renderPass = wgpuCommandEncoderBeginRenderPass(encoder, &renderPassDesc);
+    if (!renderPass) {
+        wgpuCommandEncoderRelease(encoder);
+        wgpuTextureViewRelease(surfaceView);
+        wgpuTextureRelease(surfaceTexture.texture);
+        return false;
+    }
     wgpuRenderPassEncoderSetPipeline(renderPass, pipeline_);
     wgpuRenderPassEncoderSetBindGroup(renderPass, 0, bindGroup_, 0, nullptr);
     wgpuRenderPassEncoderDraw(renderPass, 6, 1, 0, 0);
     wgpuRenderPassEncoderEnd(renderPass);
     wgpuRenderPassEncoderRelease(renderPass);
 
-    // Copy rendered texture to screenshot buffer
-    WGPUBuffer screenshotBuffer =
-        screenshot_.ensureBuffer(device_, canvasWidth, canvasHeight);
+    bool capturedScreenshot = false;
+    if (screenshot_.shouldCapture()) {
+        WGPUBuffer screenshotBuffer =
+            screenshot_.ensureBuffer(device_, canvasWidth, canvasHeight);
+        if (screenshotBuffer) {
+            WGPUImageCopyTexture_Compat srcCopy = {};
+            srcCopy.texture = surfaceTexture.texture;
+            srcCopy.mipLevel = 0;
+            srcCopy.origin = {0, 0, 0};
+            srcCopy.aspect = WGPUTextureAspect_All;
 
-    // Copy surface texture to screenshot buffer
-    WGPUImageCopyTexture_Compat srcCopy = {};
-    srcCopy.texture = surfaceTexture.texture;
-    srcCopy.mipLevel = 0;
-    srcCopy.origin = {0, 0, 0};
-    srcCopy.aspect = WGPUTextureAspect_All;
+            WGPUImageCopyBuffer_Compat dstCopy = {};
+            dstCopy.buffer = screenshotBuffer;
+            dstCopy.layout.offset = 0;
+            dstCopy.layout.bytesPerRow = screenshot_.bytesPerRow();
+            dstCopy.layout.rowsPerImage = canvasHeight;
 
-    WGPUImageCopyBuffer_Compat dstCopy = {};
-    dstCopy.buffer = screenshotBuffer;
-    dstCopy.layout.offset = 0;
-    dstCopy.layout.bytesPerRow = screenshot_.bytesPerRow();
-    dstCopy.layout.rowsPerImage = canvasHeight;
-
-    WGPUExtent3D copySize = {canvasWidth, canvasHeight, 1};
-    wgpuCommandEncoderCopyTextureToBuffer_Compat(encoder, &srcCopy, &dstCopy, &copySize);
+            WGPUExtent3D copySize = {canvasWidth, canvasHeight, 1};
+            wgpuCommandEncoderCopyTextureToBuffer_Compat(
+                encoder, &srcCopy, &dstCopy, &copySize);
+            capturedScreenshot = true;
+        }
+    }
 
     WGPUCommandBufferDescriptor cmdDesc = {};
     WGPUCommandBuffer cmdBuffer = wgpuCommandEncoderFinish(encoder, &cmdDesc);
-    wgpuQueueSubmit(queue_, 1, &cmdBuffer);
-
-    wgpuCommandBufferRelease(cmdBuffer);
     wgpuCommandEncoderRelease(encoder);
-    wgpuTextureViewRelease(surfaceView);
+    if (!cmdBuffer) {
+        wgpuTextureViewRelease(surfaceView);
+        wgpuTextureRelease(surfaceTexture.texture);
+        return false;
+    }
 
-    // Present
+    std::vector<WGPUCommandBuffer> commandBuffers = {cmdBuffer};
+    frameQueue.submit(std::move(commandBuffers));
+    surfaceTexture_ = surfaceTexture.texture;
+    surfaceView_ = surfaceView;
+    if (capturedScreenshot) screenshot_.markCaptured(canvasWidth, canvasHeight);
+    stats_.framesComposited++;
+    return true;
+}
+
+void CanvasCompositor::present() {
+    if (!surfaceTexture_) return;
     wgpuSurfacePresent(surface_);
-
-    // Track for screenshot
-    screenshot_.markReady();
-    return surfaceTexture.texture;
+    screenshot_.beginPresentedFrame();
+    if (surfaceView_) {
+        wgpuTextureViewRelease(surfaceView_);
+        surfaceView_ = nullptr;
+    }
+    wgpuTextureRelease(surfaceTexture_);
+    surfaceTexture_ = nullptr;
 }
 
 } // namespace mystral::webgpu::bridge

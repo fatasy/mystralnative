@@ -65,6 +65,12 @@ void setMetalLayerDrawableSize(void* metalLayer, int width, int height);
 void getWindowSize(int* width, int* height);
 
 /**
+ * Get the refresh rate of the display containing the window.
+ * Returns 60 Hz when SDL cannot report a usable mode.
+ */
+double getDisplayRefreshRate();
+
+/**
  * Set fullscreen mode
  */
 void setFullscreen(bool fullscreen);

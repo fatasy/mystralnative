@@ -43,6 +43,18 @@ void installDiagnosticsBindings(js::Engine* engine) {
             set("frameLatencyWaits", queueStats.frameLatencyWaits);
             set("frameLatencyWaitNanoseconds", queueStats.frameLatencyWaitNanoseconds);
             set("maxInFlightSubmissions", queueStats.maxInFlightSubmissions);
+            set("dawnProgressPumps", queueStats.progressPumps);
+            set("dawnProgressPumpNanoseconds", queueStats.progressPumpNanoseconds);
+            const auto& screenshotStats = g_screenshot.stats();
+            set("screenshotRequests", screenshotStats.requests);
+            set("screenshotCapturedFrames", screenshotStats.capturedFrames);
+            set("screenshotCapturedBytes", screenshotStats.capturedBytes);
+            set("screenshotBufferBytes", g_screenshot.bufferSize());
+            const auto& compositorStats = g_canvasCompositor.stats();
+            set("canvas2DFramesComposited", compositorStats.framesComposited);
+            set("canvas2DFramesWithoutUpload", compositorStats.framesWithoutUpload);
+            set("canvas2DTextureUploads", compositorStats.textureUploads);
+            set("canvas2DTextureUploadBytes", compositorStats.textureUploadBytes);
             set("activeCommandEncoders", g_commandEncoders.liveCommandEncoderCount());
             set("activeRenderPasses", g_commandEncoders.liveRenderPassCount());
             set("activeComputePasses", g_commandEncoders.liveComputePassCount());

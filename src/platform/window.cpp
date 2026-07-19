@@ -245,6 +245,19 @@ void getWindowSize(int* width, int* height) {
     *height = g_window.height;
 }
 
+double getDisplayRefreshRate() {
+    if (!g_window.sdlWindow) return 60.0;
+
+    const SDL_DisplayID display = SDL_GetDisplayForWindow(g_window.sdlWindow);
+    const SDL_DisplayMode* mode = display ? SDL_GetCurrentDisplayMode(display) : nullptr;
+    if (!mode) return 60.0;
+    if (mode->refresh_rate_numerator > 0 && mode->refresh_rate_denominator > 0) {
+        return static_cast<double>(mode->refresh_rate_numerator) /
+               static_cast<double>(mode->refresh_rate_denominator);
+    }
+    return mode->refresh_rate > 1.0f ? static_cast<double>(mode->refresh_rate) : 60.0;
+}
+
 /**
  * Set fullscreen mode
  */

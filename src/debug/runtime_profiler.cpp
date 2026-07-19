@@ -141,7 +141,10 @@ RuntimeProfileReport RuntimeProfiler::stop(RuntimeProfilerSnapshot endSnapshot) 
     };
 
     report.frame = summarize(&FrameSample::frameMs);
+    report.gpuPacing = summarize(&FrameSample::gpuPacingMs);
+    report.cpuPacing = summarize(&FrameSample::cpuPacingMs);
     report.events = summarize(&FrameSample::eventsMs);
+    report.gpuProgress = summarize(&FrameSample::gpuProgressMs);
     report.asyncWork = summarize(&FrameSample::asyncWorkMs);
     report.callbacks = summarize(&FrameSample::callbacksMs);
     report.simulation = summarize(&FrameSample::simulationMs);
