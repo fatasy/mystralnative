@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <condition_variable>
 #include <chrono>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <queue>
@@ -17,6 +18,9 @@
 #include <vector>
 
 namespace mystral::workers {
+
+class WorkerRegistry;
+class NativeTaskMailbox;
 
 enum class WorkerSourceKind {
     Script,
@@ -47,6 +51,16 @@ struct WorkerQueueLimits {
     size_t maxQueuedBytes = 64 * 1024 * 1024;
 };
 
+struct WorkerRuntimeState {
+    uint32_t maxDepth = 2;
+    uint32_t maxWorkers = 64;
+    uint32_t maxParallelism = 1;
+    std::atomic<uint32_t> activeWorkers{0};
+
+    bool tryAcquireWorker();
+    void releaseWorker();
+};
+
 struct WorkerThreadStats {
     WorkerState state = WorkerState::Created;
     uint64_t processedMessages = 0;
@@ -66,6 +80,9 @@ struct WorkerThreadStats {
     size_t peakQueuedOutputBytes = 0;
     size_t largestInputMessageBytes = 0;
     size_t largestOutputMessageBytes = 0;
+    uint64_t descendantCreatedWorkers = 0;
+    uint64_t descendantActiveWorkers = 0;
+    uint32_t maxDepth = 0;
 };
 
 struct WorkerMessage {
@@ -95,10 +112,14 @@ public:
                  std::string rootDir,
                  std::string name,
                  std::shared_ptr<SharedBufferRegistry> sharedBuffers,
-                 WorkerQueueLimits queueLimits = {});
+                 WorkerQueueLimits queueLimits = {},
+                 std::shared_ptr<WorkerRuntimeState> runtimeState = {},
+                 uint32_t depth = 1,
+                 std::function<void()> outputReadyCallback = {});
     ~WorkerThread();
 
     void start();
+    void requestStop();
     WorkerPostStatus postMessage(
         std::string payload,
         std::vector<js::TransferredArrayBuffer> transfers = {});
@@ -124,6 +145,8 @@ private:
     std::vector<int> collectDueTimers();
     bool dispatchTimer(js::Engine* engine, int id);
     bool dispatchMessage(js::Engine* engine, const WorkerPayload& payload);
+    bool dispatchChildMessages(js::Engine* engine);
+    bool dispatchNativeTaskMessages(js::Engine* engine);
     WorkerPostStatus enqueueOutput(
         WorkerMessage::Type type,
         std::string payload,
@@ -137,7 +160,12 @@ private:
     std::string rootDir_;
     std::string name_;
     std::shared_ptr<SharedBufferRegistry> sharedBuffers_;
+    std::shared_ptr<WorkerRuntimeState> runtimeState_;
     WorkerQueueLimits queueLimits_;
+    uint32_t depth_ = 1;
+    std::function<void()> outputReadyCallback_;
+    std::unique_ptr<WorkerRegistry> childRegistry_;
+    std::shared_ptr<NativeTaskMailbox> nativeTaskMailbox_;
     std::thread thread_;
 
     mutable std::mutex engineMutex_;
@@ -151,6 +179,8 @@ private:
     size_t peakInputQueuedBytes_ = 0;
     size_t peakOutputQueuedBytes_ = 0;
     std::condition_variable inputCondition_;
+    std::atomic<bool> childActivity_{false};
+    std::atomic<bool> nativeTaskActivity_{false};
     std::unordered_map<int, WorkerTimer> timers_;
     int nextTimerId_ = 1;
     std::atomic<bool> terminated_{false};

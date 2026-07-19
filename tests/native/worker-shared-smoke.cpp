@@ -1,5 +1,7 @@
+#include "mystral/async/job_system.h"
 #include "mystral/js/engine.h"
 #include "mystral/js/module_system.h"
+#include "mystral/workers/native_task.h"
 #include "mystral/workers/shared_buffer.h"
 #include "mystral/workers/worker_registry.h"
 #include "mystral/workers/worker_thread.h"
@@ -85,11 +87,18 @@ int main() {
     js::ModuleSystem mainModules(mainEngine.get(), std::filesystem::current_path().string());
     js::setModuleSystem(&mainModules);
     if (!mainEngine->eval(
-            "import { SharedTable } from 'mystral/shared';\n"
-            "import { WorkerPool, exposeWorkerTask, transferResult } from 'mystral/worker-pool';\n"
+            "import { SharedCommandBuffer, SharedTable } from 'mystral/shared';\n"
+            "import { WorkerPool, exposeWorkerTasks, transferResult } from 'mystral/worker-pool';\n"
             "globalThis.__sharedModuleLoaded = typeof SharedTable === 'function' && "
-            "typeof WorkerPool === 'function' && typeof exposeWorkerTask === 'function' && "
-            "typeof transferResult === 'function';\n",
+            "typeof SharedCommandBuffer === 'function' && "
+            "typeof WorkerPool === 'function' && typeof exposeWorkerTasks === 'function' && "
+            "typeof transferResult === 'function' && "
+            "typeof WorkerPool.prototype.run === 'undefined' && "
+            "typeof WorkerPool.prototype.runTask === 'undefined' && "
+            "typeof WorkerPool.prototype.terminate === 'undefined' && "
+            "!('exposeWorkerTask' in globalThis.__mystralWorkerPool) && "
+            "!('deterministicPartitions' in globalThis.__mystralWorkerPool) && "
+            "!('deterministicReduce' in globalThis.__mystralWorkerPool);\n",
             "worker-shared-module-smoke.mjs")) {
         return 6;
     }
@@ -98,6 +107,7 @@ int main() {
 
     if (!mainEngine->evalScript(R"JS(
 (() => {
+    globalThis.__workerPoolResult = 'pending';
     const fakeWorkers = [];
     globalThis.Worker = class FakeWorker {
         constructor() {
@@ -106,6 +116,13 @@ int main() {
             fakeWorkers.push(this);
         }
         postMessage(task) {
+            if (task.$mystralWorkerPoolInit === 1) {
+                this.onmessage({ data: {
+                    $mystralWorkerPoolReady: 1,
+                    workerIndex: this.index,
+                }});
+                return;
+            }
             this.task = task;
             if (this.index < 2) {
                 this.respond();
@@ -125,28 +142,45 @@ int main() {
         terminate() {}
     };
 
-    const Rows = __mystralShared.SharedTable.define('test.pool-resize/v1', { value: 'i32' });
-    const rows = Rows.create({ capacity: 1 });
-    rows.length = 1;
-    rows.value[0] = 77;
-    const pool = new __mystralWorkerPool.WorkerPool('fake-worker.mjs', { size: 3 });
-    const pending = pool.run({ tag: 'round-1' }, { length: 10 });
-    if (!pool.busy) throw new Error('duplicate WorkerPool result completed the barrier early');
-    let resizeBlocked = false;
-    try { pool.resizeTable(Rows, rows, { capacity: 2 }); } catch (_) { resizeBlocked = true; }
-    if (!resizeBlocked) throw new Error('WorkerPool resized shared state during an active round');
-    fakeWorkers[2].respond();
-    if (pool.busy) throw new Error('WorkerPool barrier did not complete');
-    const resized = pool.resizeTable(Rows, rows, { capacity: 2 });
-    if (resized.length !== 1 || resized.value[0] !== 77) {
-        throw new Error('WorkerPool safe resize lost table data');
+    let directConstructionRejected = false;
+    try {
+        new __mystralWorkerPool.WorkerPool('fake-worker.mjs', { size: 1 });
+    } catch (error) {
+        directConstructionRejected = String(error.message).includes('WorkerPool.create');
     }
-    globalThis.__workerPoolResult = 'pending';
-    pending.then(
-        results => { globalThis.__workerPoolResult = JSON.stringify(results); },
-        error => { globalThis.__workerPoolResult = 'error:' + error.message; });
-    pool.terminate();
-    resized.release();
+    if (!directConstructionRejected) {
+        throw new Error('WorkerPool direct construction remains public');
+    }
+
+    (async () => {
+        const Rows = __mystralShared.SharedTable.define('test.pool-resize/v1', { value: 'i32' });
+        const rows = Rows.create({ capacity: 1 });
+        rows.length = 1;
+        rows.value[0] = 77;
+        const pool = await __mystralWorkerPool.WorkerPool.create(
+            'fake-worker.mjs', { size: 3 });
+        if (typeof pool.ready !== 'undefined') {
+            throw new Error('WorkerPool ready Promise remains public');
+        }
+        const pending = pool.parallelFor(
+            'partition', { tag: 'round-1' }, { length: 10, schedule: 'static' });
+        if (!pool.busy) throw new Error('duplicate WorkerPool result completed the barrier early');
+        let resizeBlocked = false;
+        try { pool.resizeTable(Rows, rows, { capacity: 2 }); } catch (_) { resizeBlocked = true; }
+        if (!resizeBlocked) throw new Error('WorkerPool resized shared state during an active round');
+        fakeWorkers[2].respond();
+        if (pool.busy) throw new Error('WorkerPool barrier did not complete');
+        const resized = pool.resizeTable(Rows, rows, { capacity: 2 });
+        if (resized.length !== 1 || resized.value[0] !== 77) {
+            throw new Error('WorkerPool safe resize lost table data');
+        }
+        const results = await pending;
+        await pool.close();
+        resized.release();
+        globalThis.__workerPoolResult = JSON.stringify(results);
+    })().catch(error => {
+        globalThis.__workerPoolResult = 'error:' + error.message;
+    });
 })()
 )JS", "worker-pool-smoke.js")) {
         return 23;
@@ -667,7 +701,7 @@ const interval = setInterval(() => {
     if (!waitForWorkerMessage(poolTaskWorker, [](const workers::WorkerMessage& message) {
             return message.type == workers::WorkerMessage::Type::Ready;
         }) || poolTaskWorker.postMessage(
-            R"JSON({"$mystralWorkerPoolTask":1,"round":9,"workerIndex":2,"workerCount":4,"begin":5,"end":8,"data":{"tag":"native"}})JSON") !=
+            R"JSON({"$mystralWorkerPoolTask":1,"round":9,"taskName":"partition","workerIndex":2,"workerCount":4,"begin":5,"end":8,"data":{"tag":"native"}})JSON") !=
             workers::WorkerPostStatus::Posted) {
         std::cerr << "WorkerPool task helper did not start" << std::endl;
         poolTaskWorker.terminate();
@@ -696,6 +730,7 @@ const interval = setInterval(() => {
     globalThis.__poolBinaryPrepared = __mystralPrepareMessage({
         $mystralWorkerPoolTask: 1,
         round: 10,
+        taskName: 'partition',
         workerIndex: 2,
         workerCount: 4,
         begin: 8,
@@ -744,6 +779,448 @@ const interval = setInterval(() => {
     if (!poolBinaryReceived) {
         std::cerr << "WorkerPool transferResult did not return its ArrayBuffer" << std::endl;
         return 30;
+    }
+
+    if (!mainEngine->eval(R"JS(
+import { NestedRows } from './tests/native/fixtures/nested-worker-schema.mjs';
+globalThis.__nestedRows = NestedRows.create({ capacity: 10 });
+globalThis.__nestedRows.length = 10;
+globalThis.__nestedRows.energy.fill(1);
+globalThis.__nestedPrepared = __mystralPrepareMessage({
+    rows: globalThis.__nestedRows.handle(),
+    length: globalThis.__nestedRows.length,
+});
+)JS", "nested-worker-prepare.mjs")) {
+        std::cerr << "Nested WorkerPool shared state setup failed" << std::endl;
+        return 39;
+    }
+    auto nestedPrepared = mainEngine->getGlobalProperty("__nestedPrepared");
+    const std::string nestedPayload = mainEngine->toString(
+        mainEngine->getProperty(nestedPrepared, "payload"));
+    mainEngine->releaseValue(nestedPrepared);
+
+    auto nestedRuntime = std::make_shared<workers::WorkerRuntimeState>();
+    nestedRuntime->maxDepth = 2;
+    nestedRuntime->maxWorkers = 8;
+    workers::WorkerThread nestedOwner(
+        8,
+        engineType,
+        workers::WorkerSourceKind::Module,
+        "./tests/native/fixtures/nested-worker-owner.mjs",
+        std::filesystem::current_path().string(),
+        "nested-worker-owner-smoke.js",
+        sharedBuffers,
+        {},
+        nestedRuntime,
+        1);
+    nestedOwner.start();
+    if (!waitForWorkerMessage(nestedOwner, [](const workers::WorkerMessage& message) {
+            return message.type == workers::WorkerMessage::Type::Ready;
+        }) || nestedOwner.postMessage(nestedPayload) != workers::WorkerPostStatus::Posted) {
+        std::cerr << "Nested WorkerPool owner did not start" << std::endl;
+        nestedOwner.terminate();
+        return 40;
+    }
+    const bool nestedResultReceived = waitForWorkerMessage(
+        nestedOwner,
+        [mainEngine = mainEngine.get()](const workers::WorkerMessage& message) {
+            if (message.type != workers::WorkerMessage::Type::Message) return false;
+            const std::string decoded = decodedMessageJson(mainEngine, message);
+            return decoded.find("\"kind\":\"nested-result\"") != std::string::npos &&
+                decoded.find("\"begin\":0,\"end\":4,\"workerIndex\":0") != std::string::npos &&
+                decoded.find("\"begin\":4,\"end\":7,\"workerIndex\":1") != std::string::npos &&
+                decoded.find("\"begin\":7,\"end\":10,\"workerIndex\":2") != std::string::npos;
+        });
+    if (!nestedResultReceived || !mainEngine->evalScript(R"JS(
+globalThis.__nestedRowsMatch =
+    Array.from(__nestedRows.energy).join(',') === '2,2,2,2,3,3,3,4,4,4';
+)JS", "nested-worker-verify.js")) {
+        std::cerr << "Nested WorkerPool deterministic shared round failed" << std::endl;
+        nestedOwner.terminate();
+        return 41;
+    }
+    auto nestedRowsMatch = mainEngine->getGlobalProperty("__nestedRowsMatch");
+    const auto nestedStats = nestedOwner.stats();
+    const bool nestedMetricsMatch = nestedStats.descendantCreatedWorkers == 3 &&
+        nestedStats.descendantActiveWorkers == 3 && nestedStats.maxDepth == 2;
+    if (!mainEngine->toBoolean(nestedRowsMatch) || !nestedMetricsMatch) {
+        std::cerr << "Nested WorkerPool shared data or metrics failed" << std::endl;
+        mainEngine->releaseValue(nestedRowsMatch);
+        nestedOwner.terminate();
+        return 42;
+    }
+    mainEngine->releaseValue(nestedRowsMatch);
+    nestedOwner.terminate();
+    if (nestedRuntime->activeWorkers.load() != 0) {
+        std::cerr << "Nested WorkerPool cascade shutdown leaked Workers" << std::endl;
+        return 43;
+    }
+
+    if (!mainEngine->evalScript(R"JS(
+globalThis.__nestedFailurePrepared = __mystralPrepareMessage({
+    rows: globalThis.__nestedRows.handle(),
+    length: globalThis.__nestedRows.length,
+    fail: true,
+});
+)JS", "nested-worker-failure-prepare.js")) {
+        return 44;
+    }
+    auto nestedFailurePrepared = mainEngine->getGlobalProperty("__nestedFailurePrepared");
+    const std::string nestedFailurePayload = mainEngine->toString(
+        mainEngine->getProperty(nestedFailurePrepared, "payload"));
+    mainEngine->releaseValue(nestedFailurePrepared);
+    workers::WorkerThread nestedFailureOwner(
+        9,
+        engineType,
+        workers::WorkerSourceKind::Module,
+        "./tests/native/fixtures/nested-worker-owner.mjs",
+        std::filesystem::current_path().string(),
+        "nested-worker-failure-owner-smoke.js",
+        sharedBuffers,
+        {},
+        nestedRuntime,
+        1);
+    nestedFailureOwner.start();
+    if (!waitForWorkerMessage(nestedFailureOwner, [](const workers::WorkerMessage& message) {
+            return message.type == workers::WorkerMessage::Type::Ready;
+        }) || nestedFailureOwner.postMessage(nestedFailurePayload) !=
+            workers::WorkerPostStatus::Posted ||
+        !waitForWorkerMessage(
+            nestedFailureOwner,
+            [mainEngine = mainEngine.get()](const workers::WorkerMessage& message) {
+                if (message.type != workers::WorkerMessage::Type::Message) return false;
+                const std::string decoded = decodedMessageJson(mainEngine, message);
+                return decoded.find("\"kind\":\"nested-error\"") != std::string::npos &&
+                    decoded.find("intentional nested Worker failure") != std::string::npos;
+            })) {
+        std::cerr << "Nested WorkerPool failure propagation failed" << std::endl;
+        nestedFailureOwner.terminate();
+        return 45;
+    }
+    nestedFailureOwner.terminate();
+    if (nestedRuntime->activeWorkers.load() != 0) {
+        std::cerr << "Failed nested WorkerPool leaked siblings" << std::endl;
+        return 46;
+    }
+
+    if (!mainEngine->evalScript(R"JS(
+globalThis.__nestedHangPrepared = __mystralPrepareMessage({
+    rows: globalThis.__nestedRows.handle(),
+    length: globalThis.__nestedRows.length,
+    hang: true,
+});
+)JS", "nested-worker-hang-prepare.js")) {
+        return 49;
+    }
+    auto nestedHangPrepared = mainEngine->getGlobalProperty("__nestedHangPrepared");
+    const std::string nestedHangPayload = mainEngine->toString(
+        mainEngine->getProperty(nestedHangPrepared, "payload"));
+    mainEngine->releaseValue(nestedHangPrepared);
+    workers::WorkerThread nestedHangOwner(
+        10,
+        engineType,
+        workers::WorkerSourceKind::Module,
+        "./tests/native/fixtures/nested-worker-owner.mjs",
+        std::filesystem::current_path().string(),
+        "nested-worker-hang-owner-smoke.js",
+        sharedBuffers,
+        {},
+        nestedRuntime,
+        1);
+    nestedHangOwner.start();
+    if (!waitForWorkerMessage(nestedHangOwner, [](const workers::WorkerMessage& message) {
+            return message.type == workers::WorkerMessage::Type::Ready;
+        }) || nestedHangOwner.postMessage(nestedHangPayload) !=
+            workers::WorkerPostStatus::Posted) {
+        std::cerr << "Nested WorkerPool hang scenario did not start" << std::endl;
+        nestedHangOwner.terminate();
+        return 50;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    const auto nestedShutdownStarted = std::chrono::steady_clock::now();
+    nestedHangOwner.terminate();
+    const auto nestedShutdownElapsed =
+        std::chrono::steady_clock::now() - nestedShutdownStarted;
+    if (nestedShutdownElapsed > std::chrono::seconds(5) ||
+        nestedRuntime->activeWorkers.load() != 0) {
+        std::cerr << "Nested WorkerPool cascade interruption failed" << std::endl;
+        return 51;
+    }
+
+    auto depthLimitedRuntime = std::make_shared<workers::WorkerRuntimeState>();
+    depthLimitedRuntime->maxDepth = 1;
+    workers::WorkerThread depthLimitedOwner(
+        10,
+        engineType,
+        workers::WorkerSourceKind::Script,
+        R"JS(
+let poolError = '';
+(async () => {
+    try {
+        await WorkerPool.create('./tests/native/fixtures/nested-worker-task.mjs', { size: 1 });
+    } catch (error) {
+        poolError = error && error.message ? error.message : String(error);
+    }
+    postMessage({ kind: 'depth-limit', workerType: typeof Worker, poolError });
+    close();
+})();
+)JS",
+        std::filesystem::current_path().string(),
+        "nested-worker-depth-limit-smoke.js",
+        sharedBuffers,
+        {},
+        depthLimitedRuntime,
+        1);
+    depthLimitedOwner.start();
+    const bool depthLimitReported = waitForWorkerMessage(
+        depthLimitedOwner,
+        [mainEngine = mainEngine.get()](const workers::WorkerMessage& message) {
+            if (message.type != workers::WorkerMessage::Type::Message) return false;
+            const std::string decoded = decodedMessageJson(mainEngine, message);
+            return decoded.find("\"workerType\":\"undefined\"") != std::string::npos &&
+                decoded.find("nesting depth") != std::string::npos;
+        });
+    depthLimitedOwner.terminate();
+    if (!depthLimitReported) {
+        std::cerr << "Nested Worker depth limit was not enforced" << std::endl;
+        return 47;
+    }
+
+    auto workerLimitedRuntime = std::make_shared<workers::WorkerRuntimeState>();
+    workerLimitedRuntime->maxDepth = 2;
+    workerLimitedRuntime->maxWorkers = 2;
+    workers::WorkerRegistry workerLimitedRegistry(
+        engineType,
+        std::filesystem::current_path().string(),
+        sharedBuffers,
+        workerLimitedRuntime,
+        1);
+    std::string workerLimitError;
+    const int limitedWorker0 = workerLimitedRegistry.createWorker(
+        workers::WorkerSourceKind::Script,
+        "self.onmessage = () => {};",
+        "nested-worker-limit-0.js",
+        {},
+        &workerLimitError);
+    const int limitedWorker1 = workerLimitedRegistry.createWorker(
+        workers::WorkerSourceKind::Script,
+        "self.onmessage = () => {};",
+        "nested-worker-limit-1.js",
+        {},
+        &workerLimitError);
+    const int rejectedWorker = workerLimitedRegistry.createWorker(
+        workers::WorkerSourceKind::Script,
+        "self.onmessage = () => {};",
+        "nested-worker-limit-rejected.js",
+        {},
+        &workerLimitError);
+    workerLimitedRegistry.shutdown();
+    if (limitedWorker0 < 0 || limitedWorker1 < 0 || rejectedWorker >= 0 ||
+        workerLimitError.find("runtime worker limit") == std::string::npos ||
+        workerLimitedRuntime->activeWorkers.load() != 0) {
+        std::cerr << "Nested Worker global limit or cleanup failed" << std::endl;
+        return 48;
+    }
+
+    if (!mainEngine->eval(R"JS(
+import { V2Commands, V2Rows } from './tests/native/fixtures/worker-pool-v2-schema.mjs';
+globalThis.__v2Rows = V2Rows.create({ capacity: 10 });
+globalThis.__v2Rows.length = 10;
+globalThis.__v2Rows.energy.fill(1);
+globalThis.__v2Commands = V2Commands.create({ workerCount: 3, laneCapacity: 8 });
+globalThis.__v2Prepared = __mystralPrepareMessage({
+    rows: globalThis.__v2Rows.handle(),
+    commands: globalThis.__v2Commands.handle(),
+    length: globalThis.__v2Rows.length,
+});
+
+const UnitCommands = __mystralShared.SharedCommandBuffer.define(
+    'test.worker-pool-v2.unit-commands/v1', { order: 'u32' });
+const unitCommands = UnitCommands.create({ workerCount: 2, laneCapacity: 1 });
+const unitAccepted = unitCommands.push(1, { order: 9 }) &&
+    unitCommands.push(0, { order: 3 }) &&
+    !unitCommands.push(0, { order: 4 });
+const unitDrained = unitCommands.drain({ sortBy: 'order' });
+globalThis.__v2CommandUnitMatch = unitAccepted && unitCommands.size === 0 &&
+    unitDrained.map(command => command.order).join(',') === '3,9';
+unitCommands.release();
+)JS", "worker-pool-v2-prepare.mjs")) {
+        std::cerr << "WorkerPool v2 shared setup failed" << std::endl;
+        return 52;
+    }
+    auto commandUnitMatch = mainEngine->getGlobalProperty("__v2CommandUnitMatch");
+    if (!mainEngine->toBoolean(commandUnitMatch)) {
+        mainEngine->releaseValue(commandUnitMatch);
+        std::cerr << "SharedCommandBuffer deterministic drain failed" << std::endl;
+        return 53;
+    }
+    mainEngine->releaseValue(commandUnitMatch);
+    auto v2Prepared = mainEngine->getGlobalProperty("__v2Prepared");
+    const std::string v2Payload = mainEngine->toString(
+        mainEngine->getProperty(v2Prepared, "payload"));
+    mainEngine->releaseValue(v2Prepared);
+
+    auto v2Runtime = std::make_shared<workers::WorkerRuntimeState>();
+    v2Runtime->maxDepth = 2;
+    v2Runtime->maxWorkers = 8;
+    v2Runtime->maxParallelism = 3;
+    workers::WorkerThread v2Owner(
+        11,
+        engineType,
+        workers::WorkerSourceKind::Module,
+        "./tests/native/fixtures/worker-pool-v2-owner.mjs",
+        std::filesystem::current_path().string(),
+        "worker-pool-v2-owner-smoke.js",
+        sharedBuffers,
+        {},
+        v2Runtime,
+        1);
+    v2Owner.start();
+    const bool v2Ready = waitForWorkerMessage(v2Owner, [](const workers::WorkerMessage& message) {
+        return message.type == workers::WorkerMessage::Type::Ready;
+    });
+    const bool v2Result = v2Ready &&
+        v2Owner.postMessage(v2Payload) == workers::WorkerPostStatus::Posted &&
+        waitForWorkerMessage(
+            v2Owner,
+            [mainEngine = mainEngine.get()](const workers::WorkerMessage& message) {
+                if (message.type != workers::WorkerMessage::Type::Message) return false;
+                const std::string decoded = decodedMessageJson(mainEngine, message);
+                return decoded.find("\"kind\":\"worker-pool-v2\"") != std::string::npos &&
+                    decoded.find("\"updated\":10") != std::string::npos &&
+                    decoded.find("\"queuedAbort\":\"AbortError\"") != std::string::npos &&
+                    decoded.find("\"activeAbort\":\"AbortError\"") != std::string::npos &&
+                    decoded.find("\"staticAbort\":\"AbortError\"") != std::string::npos &&
+                    decoded.find("\"startupTimeout\":true") != std::string::npos &&
+                    decoded.find("\"ready\":true") != std::string::npos &&
+                    decoded.find("\"broadcastRounds\":3") != std::string::npos &&
+                    decoded.find("\"barrierRounds\":2") != std::string::npos &&
+                    decoded.find("\"completedRounds\":5") != std::string::npos &&
+                    decoded.find("\"begin\":0,\"end\":3,\"workerIndex\":0") != std::string::npos &&
+                    decoded.find("\"begin\":3,\"end\":6,\"workerIndex\":1") != std::string::npos &&
+                    decoded.find("\"begin\":6,\"end\":8,\"workerIndex\":2") != std::string::npos &&
+                    decoded.find("\"order\":0") != std::string::npos &&
+                    decoded.find("\"order\":8") != std::string::npos;
+            });
+    v2Owner.terminate();
+    if (!v2Result || v2Runtime->activeWorkers.load() != 0 ||
+        !mainEngine->evalScript(R"JS(
+globalThis.__v2RowsMatch = Array.from(__v2Rows.energy).every(value => value === 2);
+)JS", "worker-pool-v2-verify.js")) {
+        std::cerr << "WorkerPool v2 scheduling, broadcast, or queueing failed" << std::endl;
+        return 54;
+    }
+    auto v2RowsMatch = mainEngine->getGlobalProperty("__v2RowsMatch");
+    if (!mainEngine->toBoolean(v2RowsMatch)) {
+        mainEngine->releaseValue(v2RowsMatch);
+        std::cerr << "WorkerPool v2 dynamic chunks missed shared rows" << std::endl;
+        return 55;
+    }
+    mainEngine->releaseValue(v2RowsMatch);
+
+    async::configureCpuBudget(1);
+    workers::WorkerThread budgetBlocker(
+        13,
+        engineType,
+        workers::WorkerSourceKind::Script,
+        R"JS(
+self.onmessage = () => {
+    postMessage({ kind: 'cpu-budget-blocker-started' });
+    while (true) {}
+};
+)JS",
+        std::filesystem::current_path().string(),
+        "cpu-budget-blocker-smoke.js",
+        sharedBuffers);
+    budgetBlocker.start();
+    const bool budgetBlockerReady = waitForWorkerMessage(
+        budgetBlocker,
+        [](const workers::WorkerMessage& message) {
+            return message.type == workers::WorkerMessage::Type::Ready;
+        });
+    const bool budgetBlockerStarted = budgetBlockerReady &&
+        budgetBlocker.postMessage("null") == workers::WorkerPostStatus::Posted &&
+        waitForWorkerMessage(
+            budgetBlocker,
+            [](const workers::WorkerMessage& message) {
+                return message.type == workers::WorkerMessage::Type::Message;
+            });
+    workers::WorkerThread budgetWaiter(
+        14,
+        engineType,
+        workers::WorkerSourceKind::Script,
+        "self.onmessage = () => {};",
+        std::filesystem::current_path().string(),
+        "cpu-budget-waiter-smoke.js",
+        sharedBuffers);
+    budgetWaiter.start();
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    const auto budgetCancelStarted = std::chrono::steady_clock::now();
+    budgetWaiter.terminate();
+    const auto budgetCancelElapsed = std::chrono::steady_clock::now() - budgetCancelStarted;
+    budgetBlocker.terminate();
+    if (!budgetBlockerStarted || budgetCancelElapsed > std::chrono::seconds(1) ||
+        async::cpuBudgetStats().active != 0) {
+        std::cerr << "CPU budget cancellation blocked Worker shutdown" << std::endl;
+        return 59;
+    }
+
+    async::configureCpuBudget(2);
+    if (!async::getJobSystem().start({2, 16}) ||
+        !workers::getNativeTaskRegistry().registerTask(
+            "test.native.echo",
+            [](std::string_view payload, const async::JobContext&) {
+                return workers::NativeTaskResult::success(std::string(payload));
+            }) ||
+        !workers::getNativeTaskRegistry().registerTask(
+            "test.native.failure",
+            [](std::string_view, const async::JobContext&) {
+                return workers::NativeTaskResult::failure("intentional native task failure");
+            })) {
+        std::cerr << "Native task registry setup failed" << std::endl;
+        return 56;
+    }
+    if (!mainEngine->evalScript(R"JS(
+globalThis.__nativeTaskPrepared = __mystralPrepareMessage({ value: 37, label: 'echo' });
+)JS", "native-task-prepare.js")) {
+        return 57;
+    }
+    auto nativePrepared = mainEngine->getGlobalProperty("__nativeTaskPrepared");
+    const std::string nativePayload = mainEngine->toString(
+        mainEngine->getProperty(nativePrepared, "payload"));
+    mainEngine->releaseValue(nativePrepared);
+    workers::WorkerThread nativeTaskWorker(
+        12,
+        engineType,
+        workers::WorkerSourceKind::Module,
+        "./tests/native/fixtures/native-task-worker.mjs",
+        std::filesystem::current_path().string(),
+        "native-task-worker-smoke.js",
+        sharedBuffers);
+    nativeTaskWorker.start();
+    const bool nativeReady = waitForWorkerMessage(
+        nativeTaskWorker,
+        [](const workers::WorkerMessage& message) {
+            return message.type == workers::WorkerMessage::Type::Ready;
+        });
+    const bool nativeResult = nativeReady &&
+        nativeTaskWorker.postMessage(nativePayload) == workers::WorkerPostStatus::Posted &&
+        waitForWorkerMessage(
+            nativeTaskWorker,
+            [mainEngine = mainEngine.get()](const workers::WorkerMessage& message) {
+                if (message.type != workers::WorkerMessage::Type::Message) return false;
+                const std::string decoded = decodedMessageJson(mainEngine, message);
+                return decoded.find("\"kind\":\"native-task-result\"") != std::string::npos &&
+                    decoded.find("\"value\":37") != std::string::npos &&
+                    decoded.find("intentional native task failure") != std::string::npos;
+            });
+    nativeTaskWorker.terminate();
+    workers::getNativeTaskRegistry().unregisterTask("test.native.echo");
+    workers::getNativeTaskRegistry().unregisterTask("test.native.failure");
+    async::getJobSystem().shutdown();
+    if (!nativeResult) {
+        std::cerr << "Isolate-aware native task bridge failed" << std::endl;
+        return 58;
     }
 
     workers::WorkerRegistry exitRegistry(

@@ -1418,8 +1418,10 @@ static std::string makeBenchmarkJson(
         << ",\"33.33ms\":" << report.framesOver33_33Ms
         << "},\"workers\":{"
         << "\"created\":" << report.workersCreated
+        << ",\"nestedCreated\":" << report.nestedWorkersCreated
         << ",\"activeStart\":" << report.workersActiveStart
         << ",\"activeEnd\":" << report.workersActiveEnd
+        << ",\"maxDepth\":" << report.workerMaxDepth
         << ",\"messagesProcessed\":" << report.workerMessagesProcessed
         << ",\"timerCallbacks\":" << report.workerTimerCallbacks
         << ",\"messagesRejected\":" << report.workerMessagesRejected
@@ -1438,6 +1440,9 @@ static std::string makeBenchmarkJson(
         << ",\"sharedMemoryEndBytes\":" << report.sharedMemoryEndBytes
         << "},\"jobs\":{"
         << "\"workerCount\":" << report.jobWorkerCount
+        << ",\"cpuBudgetThreads\":" << report.cpuBudgetThreads
+        << ",\"cpuBudgetActiveEnd\":" << report.cpuBudgetActiveEnd
+        << ",\"cpuBudgetPeakActive\":" << report.cpuBudgetPeakActive
         << ",\"submitted\":" << report.jobsSubmitted
         << ",\"completed\":" << report.jobsCompleted
         << ",\"cancelled\":" << report.jobsCancelled
@@ -1507,6 +1512,8 @@ static void printBenchmarkSummary(
               << " >33.33ms=" << report.framesOver33_33Ms << "\n"
               << "Throughput: " << std::fixed << std::setprecision(1) << throughputFps << " frames/s\n"
               << "Workers: created=" << report.workersCreated
+              << " nested=" << report.nestedWorkersCreated
+              << " depth=" << report.workerMaxDepth
               << " messages=" << report.workerMessagesProcessed
               << " timers=" << report.workerTimerCallbacks
               << " rejected=" << report.workerMessagesRejected
@@ -1521,6 +1528,9 @@ static void printBenchmarkSummary(
               << "/" << report.workerLargestOutputMessageBytes << " bytes"
               << " shared=" << report.sharedMemoryEndBytes << " bytes\n"
               << "Jobs: workers=" << report.jobWorkerCount
+              << " cpuBudget=" << report.cpuBudgetActiveEnd
+              << "/" << report.cpuBudgetPeakActive
+              << "/" << report.cpuBudgetThreads
               << " submitted=" << report.jobsSubmitted
               << " completed=" << report.jobsCompleted
               << " cancelled=" << report.jobsCancelled

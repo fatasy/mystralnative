@@ -35,8 +35,8 @@ async function main() {
     const shaderModule = device.createShaderModule({ code: shaderCode });
     console.log("Created compute shader module");
 
-    // Create compute pipeline
-    const pipeline = device.createComputePipeline({
+    // Let Dawn compile/validate without blocking the runtime thread.
+    const pipeline = await device.createComputePipelineAsync({
         layout: 'auto',
         compute: {
             module: shaderModule,
@@ -93,6 +93,10 @@ async function main() {
     // Submit commands
     device.queue.submit([commandEncoder.finish()]);
     console.log("Submitted compute commands");
+
+    // This Promise now tracks native GPU completion rather than resolving at submit time.
+    await device.queue.onSubmittedWorkDone();
+    console.log("GPU queue work completed");
 
     // Read back results
     await stagingBuffer.mapAsync(GPUMapMode.READ);

@@ -131,6 +131,61 @@ int main() {
         jobs.shutdown();
     }
 
+    {
+        configureCpuBudget(2);
+        JobSystem jobs;
+        jobs.start({4, 16});
+        std::atomic<int> active{0};
+        std::atomic<int> peak{0};
+        for (int index = 0; index < 8; index++) {
+            jobs.submit(JobPriority::FrameCritical, 0,
+                [&](const JobContext&) {
+                    const int current = active.fetch_add(1) + 1;
+                    int observed = peak.load();
+                    while (current > observed && !peak.compare_exchange_weak(observed, current)) {}
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                    active.fetch_sub(1);
+                });
+        }
+        jobs.waitIdle();
+        const auto budget = cpuBudgetStats();
+        jobs.shutdown();
+        if (peak.load() != 2 || budget.limit != 2 || budget.peakActive > 2 ||
+            budget.active != 0) {
+            std::cerr << "Global CPU execution budget validation failed" << std::endl;
+            return 11;
+        }
+    }
+
+    {
+        configureCpuBudget(1);
+        auto heldBudget = acquireCpuBudget();
+        JobSystem jobs;
+        jobs.start({1, 4});
+        std::atomic_bool jobRan{false};
+        JobStatus completionStatus = JobStatus::Completed;
+        jobs.submit(JobPriority::FrameCritical, 0,
+            [&](const JobContext&) { jobRan.store(true, std::memory_order_release); },
+            [&](JobStatus status) { completionStatus = status; });
+
+        const auto runningDeadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (jobs.stats().running != 1 &&
+            std::chrono::steady_clock::now() < runningDeadline) {
+            std::this_thread::yield();
+        }
+        const bool waitingOnBudget = jobs.stats().running == 1;
+        const auto shutdownStarted = std::chrono::steady_clock::now();
+        jobs.shutdown();
+        const auto shutdownElapsed = std::chrono::steady_clock::now() - shutdownStarted;
+        if (!waitingOnBudget || jobRan.load(std::memory_order_acquire) ||
+            completionStatus != JobStatus::Cancelled ||
+            shutdownElapsed > std::chrono::seconds(1)) {
+            std::cerr << "CPU-budget waiter did not cancel during shutdown" << std::endl;
+            return 12;
+        }
+    }
+
     std::cout << "Job system smoke test passed" << std::endl;
     return 0;
 }

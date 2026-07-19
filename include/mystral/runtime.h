@@ -21,6 +21,9 @@ struct RuntimeConfig {
     bool noSdl = false;  // Run without SDL (headless GPU mode, no window)
     bool watch = false;  // Watch mode: reload script on file changes
     bool debug = false;  // Enable verbose debug logging
+    uint32_t maxWorkerDepth = 2;  // main=0, simulation Worker=1, pool Workers=2
+    uint32_t maxWorkerThreads = 64;  // Maximum active Workers across the runtime tree
+    uint32_t maxCpuThreads = 0;  // 0 reserves one logical CPU for main/render
 };
 
 struct EvaluationResult {
@@ -61,8 +64,10 @@ struct RuntimeProfileReport {
     RuntimeMemorySnapshot memoryStart;
     RuntimeMemorySnapshot memoryEnd;
     uint64_t workersCreated = 0;
+    uint64_t nestedWorkersCreated = 0;
     uint64_t workersActiveStart = 0;
     uint64_t workersActiveEnd = 0;
+    uint32_t workerMaxDepth = 0;
     uint64_t workerMessagesProcessed = 0;
     uint64_t workerTimerCallbacks = 0;
     uint64_t workerMessagesRejected = 0;
@@ -89,6 +94,9 @@ struct RuntimeProfileReport {
     uint64_t jobInFlightEnd = 0;
     uint64_t jobInFlightPeak = 0;
     uint32_t jobWorkerCount = 0;
+    uint32_t cpuBudgetThreads = 0;
+    uint32_t cpuBudgetActiveEnd = 0;
+    uint32_t cpuBudgetPeakActive = 0;
     RuntimeProfileStatistics jobQueueWait;
     RuntimeProfileStatistics jobExecution;
 };

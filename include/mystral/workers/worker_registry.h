@@ -12,7 +12,9 @@ namespace mystral::workers {
 
 struct WorkerRegistryStats {
     uint64_t createdWorkers = 0;
+    uint64_t nestedCreatedWorkers = 0;
     uint64_t activeWorkers = 0;
+    uint32_t maxDepth = 0;
     uint64_t processedMessages = 0;
     uint64_t processedTimerCallbacks = 0;
     uint64_t busyNanoseconds = 0;
@@ -35,24 +37,33 @@ struct WorkerRegistryStats {
 class WorkerRegistry {
 public:
     using MessageCallback = std::function<void(int, const WorkerMessage&)>;
+    using ActivityCallback = std::function<void()>;
 
     WorkerRegistry(js::EngineType engineType,
                    std::string rootDir,
-                   std::shared_ptr<SharedBufferRegistry> sharedBuffers);
+                   std::shared_ptr<SharedBufferRegistry> sharedBuffers,
+                   std::shared_ptr<WorkerRuntimeState> runtimeState = {},
+                   uint32_t ownerDepth = 0,
+                   ActivityCallback activityCallback = {});
     ~WorkerRegistry();
 
     int createWorker(WorkerSourceKind sourceKind,
                      const std::string& source,
                      const std::string& name = {},
-                     WorkerQueueLimits queueLimits = {});
+                     WorkerQueueLimits queueLimits = {},
+                     std::string* error = nullptr);
     WorkerPostStatus postToWorker(
         int id,
         std::string payload,
         std::vector<js::TransferredArrayBuffer> transfers = {});
+    WorkerPostStatus postToWorkers(
+        const std::vector<int>& ids,
+        const std::string& payload);
     void terminateWorker(int id);
     bool drainMessages(const MessageCallback& callback);
     void shutdown();
     size_t size() const;
+    uint32_t suggestedWorkerCount() const;
     WorkerRegistryStats stats() const;
 
     WorkerRegistry(const WorkerRegistry&) = delete;
@@ -62,6 +73,9 @@ private:
     js::EngineType engineType_ = js::EngineType::Unknown;
     std::string rootDir_;
     std::shared_ptr<SharedBufferRegistry> sharedBuffers_;
+    std::shared_ptr<WorkerRuntimeState> runtimeState_;
+    uint32_t ownerDepth_ = 0;
+    ActivityCallback activityCallback_;
     std::unordered_map<int, std::unique_ptr<WorkerThread>> workers_;
     int nextId_ = 1;
     uint64_t createdWorkers_ = 0;
@@ -78,7 +92,17 @@ private:
     uint64_t peakQueuedOutputBytes_ = 0;
     uint64_t largestInputMessageBytes_ = 0;
     uint64_t largestOutputMessageBytes_ = 0;
+    uint64_t completedDescendantWorkers_ = 0;
+    uint32_t maxObservedDepth_ = 0;
+    bool shuttingDown_ = false;
     mutable std::mutex mutex_;
 };
+
+bool installWorkerRegistryBindings(js::Engine* engine, WorkerRegistry* registry);
+bool dispatchWorkerRegistryMessages(
+    js::Engine* engine,
+    WorkerRegistry* registry,
+    std::string* error = nullptr);
+const char* nestedWorkerFacadeSource();
 
 }  // namespace mystral::workers

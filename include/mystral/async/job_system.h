@@ -79,6 +79,33 @@ struct JobSystemStats {
     JobLatencyHistogram execution;
 };
 
+struct CpuBudgetStats {
+    uint32_t limit = 1;
+    uint32_t active = 0;
+    uint32_t peakActive = 0;
+};
+
+class CpuBudgetLease {
+public:
+    CpuBudgetLease() = default;
+    ~CpuBudgetLease();
+    CpuBudgetLease(CpuBudgetLease&& other) noexcept;
+    CpuBudgetLease& operator=(CpuBudgetLease&& other) noexcept;
+    CpuBudgetLease(const CpuBudgetLease&) = delete;
+    CpuBudgetLease& operator=(const CpuBudgetLease&) = delete;
+    explicit operator bool() const { return held_; }
+
+private:
+    friend CpuBudgetLease acquireCpuBudget(const std::atomic_bool* cancelled);
+    explicit CpuBudgetLease(bool held) : held_(held) {}
+    bool held_ = false;
+};
+
+void configureCpuBudget(uint32_t limit);
+CpuBudgetLease acquireCpuBudget(const std::atomic_bool* cancelled = nullptr);
+void notifyCpuBudgetWaiters();
+CpuBudgetStats cpuBudgetStats();
+
 JobLatencySummary summarizeJobLatency(
     const JobLatencyHistogram& start,
     const JobLatencyHistogram& end);

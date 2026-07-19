@@ -892,6 +892,7 @@ set(MYSTRAL_SOURCES
     src/js/module_system.cpp
     src/js/ts_transpiler.cpp
     src/workers/shared_buffer.cpp
+    src/workers/native_task.cpp
     src/workers/worker_thread.cpp
     src/workers/worker_registry.cpp
     src/webgpu/bindings.cpp
@@ -1409,6 +1410,10 @@ install(TARGETS mystral-runtime
 
 install(DIRECTORY include/mystral
     DESTINATION include
+)
+
+install(DIRECTORY types/
+    DESTINATION types
 )
 
 option(MYSTRAL_BUILD_NATIVE_TESTS "Build native runtime smoke tests" OFF)

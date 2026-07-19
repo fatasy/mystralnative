@@ -206,6 +206,40 @@ Each group is `[buffer, bufferOffset, data, dataOffset, size]`; `dataOffset` and
 
 The bridge profiler reports these calls separately as `queueWriteBufferBatch`, including their total bytes. This extension reduces JS/C++ crossings; it does not combine the underlying WebGPU queue writes.
 
+### Non-blocking GPU and Image Work
+
+On Dawn builds, the standard asynchronous WebGPU methods are connected to the
+native callbacks and settle their Promises on the runtime thread:
+
+```javascript
+const pipeline = await device.createRenderPipelineAsync(descriptor);
+
+device.queue.submit([commandEncoder.finish()]);
+await device.queue.onSubmittedWorkDone();
+
+await readbackBuffer.mapAsync(GPUMapMode.READ);
+const result = readbackBuffer.getMappedRange();
+```
+
+`createComputePipelineAsync()` behaves the same way. These methods do not spin
+or sleep on the JavaScript thread, so timers, workers, input, and frames can keep
+progressing while Dawn compiles a pipeline or waits for GPU work. Keep the
+synchronous `createRenderPipeline()` and `createComputePipeline()` methods for
+small startup-only pipelines or code that requires an immediate result.
+
+`createImageBitmap()` also decodes PNG, JPEG, and WebP data on the shared native
+job system. It is safe to start several texture decodes and await them together:
+
+```javascript
+const bitmaps = await Promise.all(
+  textureUrls.map(async (url) => createImageBitmap(await (await fetch(url)).blob()))
+);
+```
+
+The Promise continuations still run on the main JavaScript isolate. Only native
+decode/compile/wait work runs concurrently; JavaScript game-state mutation must
+still use Workers or `WorkerPool` when it needs parallel CPU execution.
+
 ### Frame Time
 
 Log frame timing to identify bottlenecks:

@@ -16,6 +16,33 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 
+uint32_t defaultCpuBudgetLimit() {
+    const uint32_t hardwareThreads = (std::max)(1u, std::thread::hardware_concurrency());
+    return (std::max)(1u, hardwareThreads - 1);
+}
+
+struct CpuBudgetState {
+    std::mutex mutex;
+    std::condition_variable available;
+    uint32_t limit = defaultCpuBudgetLimit();
+    uint32_t active = 0;
+    uint32_t peakActive = 0;
+};
+
+CpuBudgetState& cpuBudgetState() {
+    static CpuBudgetState state;
+    return state;
+}
+
+void releaseCpuBudget() {
+    auto& state = cpuBudgetState();
+    {
+        std::lock_guard<std::mutex> lock(state.mutex);
+        if (state.active > 0) state.active--;
+    }
+    state.available.notify_one();
+}
+
 size_t priorityIndex(JobPriority priority) {
     return static_cast<size_t>(priority);
 }
@@ -43,6 +70,56 @@ uint64_t counterDelta(uint64_t start, uint64_t end) {
 }
 
 }  // namespace
+
+CpuBudgetLease::~CpuBudgetLease() {
+    if (held_) releaseCpuBudget();
+}
+
+CpuBudgetLease::CpuBudgetLease(CpuBudgetLease&& other) noexcept
+    : held_(other.held_) {
+    other.held_ = false;
+}
+
+CpuBudgetLease& CpuBudgetLease::operator=(CpuBudgetLease&& other) noexcept {
+    if (this == &other) return *this;
+    if (held_) releaseCpuBudget();
+    held_ = other.held_;
+    other.held_ = false;
+    return *this;
+}
+
+void configureCpuBudget(uint32_t limit) {
+    auto& state = cpuBudgetState();
+    {
+        std::lock_guard<std::mutex> lock(state.mutex);
+        state.limit = std::max(1u, limit);
+        state.peakActive = state.active;
+    }
+    state.available.notify_all();
+}
+
+CpuBudgetLease acquireCpuBudget(const std::atomic_bool* cancelled) {
+    auto& state = cpuBudgetState();
+    std::unique_lock<std::mutex> lock(state.mutex);
+    state.available.wait(lock, [&state, cancelled] {
+        return state.active < state.limit ||
+            (cancelled && cancelled->load(std::memory_order_relaxed));
+    });
+    if (cancelled && cancelled->load(std::memory_order_relaxed)) return {};
+    state.active++;
+    state.peakActive = std::max(state.peakActive, state.active);
+    return CpuBudgetLease(true);
+}
+
+void notifyCpuBudgetWaiters() {
+    cpuBudgetState().available.notify_all();
+}
+
+CpuBudgetStats cpuBudgetStats() {
+    auto& state = cpuBudgetState();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    return {state.limit, state.active, state.peakActive};
+}
 
 JobLatencySummary summarizeJobLatency(
     const JobLatencyHistogram& start,
@@ -108,6 +185,7 @@ struct JobSystem::Impl {
     std::array<std::deque<QueuedJob>, 3> queues;
     std::deque<CompletedJob> completions;
     std::vector<std::thread> workers;
+    std::unordered_map<uint64_t, std::shared_ptr<std::atomic_bool>> jobTokens;
     std::unordered_map<uint64_t, std::shared_ptr<std::atomic_bool>> generationTokens;
     std::unordered_set<uint64_t> cancelledGenerations;
     JobSystemStats counters;
@@ -134,6 +212,7 @@ struct JobSystem::Impl {
     }
 
     void queueCompletion(QueuedJob&& job, JobStatus status) {
+        jobTokens.erase(job.id);
         if (job.completion) {
             completions.push_back({status, std::move(job.completion)});
         } else {
@@ -152,6 +231,7 @@ struct JobSystem::Impl {
                 counters.running++;
             }
 
+            auto cpuLease = acquireCpuBudget(job.cancelToken.get());
             const auto startedAt = Clock::now();
             JobStatus status = JobStatus::Completed;
             bool executed = false;
@@ -175,6 +255,10 @@ struct JobSystem::Impl {
             const uint64_t executionNanoseconds = static_cast<uint64_t>(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
                     finishedAt - startedAt).count());
+
+            // Publish the job as idle only after its global execution slot is
+            // available to Workers or other native jobs.
+            cpuLease = {};
 
             {
                 std::lock_guard<std::mutex> lock(mutex);
@@ -210,6 +294,7 @@ bool JobSystem::start(const JobSystemConfig& config) {
     impl_->nextJobId = 1;
     impl_->queues = {};
     impl_->completions.clear();
+    impl_->jobTokens.clear();
     impl_->generationTokens.clear();
     impl_->cancelledGenerations.clear();
     impl_->counters = {};
@@ -230,8 +315,8 @@ void JobSystem::shutdown() {
         if (!impl_->running) return;
         impl_->accepting = false;
         impl_->stopping = true;
-        for (auto& [generation, token] : impl_->generationTokens) {
-            token->store(true, std::memory_order_relaxed);
+        for (auto& entry : impl_->jobTokens) {
+            entry.second->store(true, std::memory_order_relaxed);
         }
         for (auto& queue : impl_->queues) {
             while (!queue.empty()) {
@@ -244,6 +329,7 @@ void JobSystem::shutdown() {
         }
     }
     impl_->workAvailable.notify_all();
+    notifyCpuBudgetWaiters();
     for (auto& worker : impl_->workers) {
         if (worker.joinable()) worker.join();
     }
@@ -252,6 +338,7 @@ void JobSystem::shutdown() {
     processCompletions();
 
     std::lock_guard<std::mutex> lock(impl_->mutex);
+    impl_->jobTokens.clear();
     impl_->generationTokens.clear();
     impl_->cancelledGenerations.clear();
     impl_->running = false;
@@ -288,6 +375,7 @@ JobHandle JobSystem::submit(
     }
 
     const uint64_t id = impl_->nextJobId++;
+    impl_->jobTokens.emplace(id, token);
     auto& queue = impl_->queues[priorityIndex(priority)];
     queue.push_back({
         id,
@@ -334,6 +422,7 @@ size_t JobSystem::cancelGeneration(uint64_t generation) {
         }
     }
     if (!impl_->hasQueuedJobs() && impl_->counters.running == 0) impl_->idle.notify_all();
+    notifyCpuBudgetWaiters();
     return cancelled;
 }
 

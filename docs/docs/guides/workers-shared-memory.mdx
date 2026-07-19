@@ -38,11 +38,12 @@ This is intentionally not a shared JavaScript heap. The runtime shares storage; 
 | Worker lifecycle, thread entry point, Worker-side globals | `include/mystral/workers/worker_thread.h`, `src/workers/worker_thread.cpp` |
 | Runtime-owned Worker collection and message routing | `include/mystral/workers/worker_registry.h`, `src/workers/worker_registry.cpp` |
 | Shared storage registry, native hooks, JS schemas | `include/mystral/workers/shared_buffer.h`, `src/workers/shared_buffer.cpp` |
+| Isolate-aware native task registry and completion mailbox | `include/mystral/workers/native_task.h`, `src/workers/native_task.cpp` |
 | Main-thread Worker facade and event-loop draining | `src/runtime.cpp` |
 | JavaScript engine shared/transfer backing-store contract | `include/mystral/js/engine.h` |
 | V8 external shared and transferable backing stores | `src/js/v8_engine.cpp` |
 | Virtual `mystral/shared` and `mystral/worker-pool` modules | `src/js/module_resolver.cpp` |
-| Fixed benchmarks | `benchmarks/worker-shared.mjs`, `benchmarks/worker-shared-worker.mjs`, `benchmarks/worker-shared-schema.mjs`, `benchmarks/worker-transfer.mjs` |
+| Fixed benchmarks | `benchmarks/worker-shared.mjs`, `benchmarks/worker-nested.mjs`, `benchmarks/worker-scheduler-v2.mjs`, `benchmarks/worker-transfer.mjs` |
 | Native cross-isolate smoke test | `tests/native/worker-shared-smoke.cpp`, `tests/native/fixtures/worker-shared-module.mjs`, `tests/native/fixtures/worker-pool-module.mjs` |
 
 When changing behavior, update the native contract and the JavaScript facade together. Do not patch only the browser-like wrapper in `runtime.cpp`.
@@ -52,17 +53,21 @@ When changing behavior, update the native contract and the JavaScript facade tog
 The current lifecycle is:
 
 1. Runtime startup creates one `WorkerRegistry` and one `SharedBufferRegistry`. They belong to that runtime instance; neither is a process-global singleton.
-2. `setupURL()` installs the public `Worker` class and the private native hooks `__mystralWorkerCreate`, `__mystralWorkerPostMessage`, and `__mystralWorkerTerminate` in the main isolate.
+2. `setupURL()` installs the public `Worker` class and the private native hooks `__mystralWorkerCreate`, `__mystralWorkerPostMessage`, and `__mystralWorkerTerminate` in the main isolate. A first-level Worker installs the same registry hooks with a Worker-owned child registry.
 3. `new Worker(source, options)` asks `WorkerRegistry` to create a `WorkerThread`.
 4. `WorkerThread` starts a `std::thread`, creates a new engine of the configured kind, installs shared-memory APIs and Worker globals, then evaluates either a classic script or an ES module.
 5. Incoming messages and monotonic timer deadlines wait on a `condition_variable`. There is no polling loop.
 6. The Worker parses a message, reconstructs transferred buffers, calls its `message` listeners and `onmessage`, then queues outbound messages produced by `postMessage`.
-7. The main runtime calls `processWorkerMessages()` during its event loop. It drains native outbound queues and invokes `__mystralDispatchWorkerMessage` in the main isolate.
-8. `terminate()`, runtime shutdown, and hot reload request stop, interrupt currently executing JavaScript on V8, and join Worker threads before destroying the main JavaScript engine.
+7. The owning isolate drains native outbound queues and invokes `__mystralDispatchWorkerMessage`. The main runtime does this once per event-loop turn; a Worker parent is awakened through its condition variable when a child publishes output, so nested Workers do not require polling.
+8. `terminate()`, runtime shutdown, and hot reload request stop, interrupt currently executing JavaScript on V8, recursively stop and join descendants, and only then destroy the owning JavaScript engine.
+
+Worker callbacks and native JobSystem handlers acquire the same runtime CPU
+budget only while executing. Waiting isolates and queued native jobs consume no
+permit.
 
 Internally the lifecycle is explicit: `Created`, `Starting`, `Running`, `Stopping`, `Stopped`, or `Failed`. A Worker also emits an internal exit message so the main-side facade removes Workers that call `close()` or fail during startup.
 
-In `--no-sdl` mode, a live Worker counts as pending event-loop work. The runtime stays alive until the Worker calls `close()`, exits after a failure, or is terminated. Call `worker.terminate()` or `pool.terminate()` when a long-lived Worker is no longer needed.
+In `--no-sdl` mode, a live Worker counts as pending event-loop work. The runtime stays alive until the Worker calls `close()`, exits after a failure, or is terminated. Call `worker.terminate()` or `await pool.close()` when a long-lived WorkerPool is no longer needed.
 
 Each Worker has these globals:
 
@@ -74,8 +79,9 @@ Each Worker has these globals:
 - `importScripts`
 - `setTimeout`, `clearTimeout`, `setInterval`, and `clearInterval`
 - `queueMicrotask`
+- `runNativeTask` (also exported by `mystral/native-tasks`)
 
-An internal ready event only marks the main-side `Worker` as ready. It is not emitted to the user's `onmessage` handler.
+An internal ready event only marks the owner-side `Worker` facade as ready. It is not emitted to the user's `onmessage` handler.
 
 ### Script and module sources
 
@@ -163,7 +169,7 @@ Engine status:
 Import the virtual module from every module that defines or attaches a schema:
 
 ```js
-import { SharedBuffer, SharedTable, SharedQueue } from 'mystral/shared';
+import { SharedBuffer, SharedTable, SharedQueue, SharedCommandBuffer } from 'mystral/shared';
 ```
 
 The module is virtual. There is no package file for an application to copy, and a Worker knows a schema only because its own module imports the schema definition. A schema name alone does not generate a JavaScript binding.
@@ -261,25 +267,53 @@ It uses `capacity + 1` physical slots so full and empty states are distinguishab
 
 Do not use one queue with multiple producers or multiple consumers. Create separate SPSC queues or implement a separately specified MPSC/MPMC primitive with the required algorithm and tests. Do not silently broaden this class's contract.
 
+### SharedCommandBuffer
+
+`SharedCommandBuffer` is the pool-oriented alternative to an MPMC queue. It
+allocates one single-writer lane per Worker and merges the lanes only after a
+barrier:
+
+```js
+const Commands = SharedCommandBuffer.define('game.simulation-commands.v1', {
+  entity: 'u32',
+  kind: 'u16',
+  value: 'f32',
+});
+
+const commands = Commands.create({ workerCount: 4, laneCapacity: 4096 });
+commands.push(workerIndex, { entity: 42, kind: 1, value: 3.5 });
+
+// Owner only, after every Worker completed:
+const committed = commands.drain({ sortBy: ['entity', 'kind'] });
+```
+
+`push()` returns `false` instead of overwriting a full lane. `drain()` visits
+lanes in Worker-index order and resets them. With dynamic scheduling, use a
+stable `sortBy` key for globally deterministic commit order; equal keys retain
+their prior lane order, so use a unique tie-breaker when that matters.
+
 ## Deterministic WorkerPool
 
-The virtual `mystral/worker-pool` module exports `WorkerPool`, `exposeWorkerTask`, `transferResult`, and `deterministicPartitions`.
+The virtual `mystral/worker-pool` module exports `WorkerPool`,
+`exposeWorkerTasks`, and `transferResult`.
 
-- `new WorkerPool(url, { size, name })` creates a fixed set of module Workers.
-- `pool.run(data, { start, end })` or `pool.run(data, { length })` assigns stable contiguous ranges. Lower Worker indexes receive remainder rows.
-- Only one round can be active. The returned Promise resolves at a barrier after one result from every Worker and preserves Worker-index order.
+- `await WorkerPool.create(url, options)` creates a fixed set of module Workers and waits for every task module to become ready. Direct construction is unsupported.
+- Startup has a 30-second default bound (`startupTimeoutMs`) so a module that never exposes handlers cannot stall initialization forever.
+- `pool.parallelFor(name, data, { length, grainSize })` lets Workers dynamically claim small chunks through a shared atomic counter.
+- `pool.parallelFor(name, data, { length, schedule: 'static' })` assigns stable contiguous ranges; lower Worker indexes receive remainder rows.
+- `pool.forEach(name, data, options)` is the dynamic mutation-only API. It skips chunk results and only the last Worker publishes one completion message through a shared atomic barrier.
+- Every execution method returns a Promise, task handlers may be `async`, and `close()` provides an awaitable shutdown API.
+- One round executes at a time; additional rounds wait in a bounded FIFO instead of failing merely because the pool is busy.
+- Dynamic tasks can request an ordered owner-side reducer (`sum`, `count`, `min`, `max`, or a local function).
+- Shared-handle dynamic rounds use one native serialization/broadcast. `parallelFor()` returns chunk results; `forEach()` returns one completion message for the whole barrier.
 - Duplicate/stale Worker results do not advance the barrier.
 - A task error rejects the round and terminates the pool.
 - `pool.resizeTable(definition, table, options)` delegates to explicit table migration and rejects while the pool is busy. It cannot guard unrelated Workers, so the global safe-point rule still applies.
 
-`WorkerPool` is currently a **main-isolate API**. Constructing it inside a Worker
-throws `WorkerPool can only be created on the main runtime thread`; Worker
-isolates do not own a nested `WorkerRegistry`. A game that keeps its authoritative
-simulation inside a Worker must therefore stay single-writer there, or place a
-pool on the main isolate and design an explicit authority boundary. Do not move
-authoritative state merely to bypass this restriction.
-
-The intended future topology for a simulation-owned pool is:
+`WorkerPool` is available in the main isolate and in a first-level Worker. The
+default maximum depth is two, counting the main isolate as depth zero. This
+supports a simulation-owned pool while preventing task Workers from recursively
+creating more Workers:
 
 ```text
 main/render isolate -- commands/projections --> simulation Worker (Game owner)
@@ -290,23 +324,86 @@ main/render isolate -- commands/projections --> simulation Worker (Game owner)
                                       SharedTable / optional SPSC queues
 ```
 
-Supporting that topology requires a runtime change, not an application
-workaround: child registry ownership, cascade interruption/join, shared-handle
-lifetime, parent/child profiler attribution, and failure propagation must all be
-implemented and tested. Until a measured phase amortizes scheduling and barrier
-cost, the simpler single-writer simulation is the supported choice.
+Every parent isolate owns the registry for its direct children. All registries in
+the tree share the runtime's worker budget and shared-buffer registry. Child
+output wakes the parent event loop, errors are delivered to the direct parent,
+and parent shutdown recursively interrupts and joins descendants. The runtime
+defaults to at most 64 active Workers across the complete tree. Embedders can
+change `RuntimeConfig::maxWorkerDepth` and `RuntimeConfig::maxWorkerThreads`.
+The runtime also shares one CPU execution budget between Worker callbacks and
+native `JobSystem` work. `RuntimeConfig::maxCpuThreads == 0` reserves one logical
+CPU for main/render; an explicit positive value overrides it. Pool defaults use
+this budget rather than independently consuming every logical CPU.
+The nested `Worker` facade accepts module URL strings; inline `Blob` and classic
+script sources remain main-isolate-only. `WorkerPool` always uses module URLs.
 
-Worker modules install one task handler:
+Worker modules register named task handlers:
 
 ```js
-import { exposeWorkerTask, transferResult } from 'mystral/worker-pool';
+import { exposeWorkerTasks, transferResult } from 'mystral/worker-pool';
 
-exposeWorkerTask(({ data, begin, end, round, workerIndex, workerCount }) => {
-  // Mutate only the assigned shared-memory partition.
-  return { begin, end };
-  // For binary output: return transferResult({ bytes }, [bytes]);
+exposeWorkerTasks({
+  update({ data, begin, end, round, workerIndex, workerCount }) {
+    // Mutate only the assigned shared-memory partition.
+    return { begin, end };
+    // For binary output: return transferResult({ bytes }, [bytes]);
+  },
 });
 ```
+
+Several systems can share the same persistent isolates:
+
+```js
+import { exposeWorkerTasks } from 'mystral/worker-pool';
+
+exposeWorkerTasks({
+  economy: updateEconomy,
+  demography: updateDemography,
+  characterAI: evaluateCharacters,
+});
+```
+
+Dynamic scheduling changes execution order, not the required result. Give each
+chunk disjoint output, derive randomness from stable inputs such as
+`(tick, systemId, entityId)`, and commit structural commands in a stable owner
+order. Per-chunk transferable buffers are rejected; shared tables and command
+lanes are the intended bulk-output path.
+
+All round APIs accept `signal: AbortSignal`. A queued abort rejects immediately.
+For an active round, the owner publishes cancellation through the shared control
+buffer, Workers stop claiming new chunks, and the Promise rejects only after the
+safe barrier. The handler context includes `isCancelled()` so expensive chunks
+can return early without abandoning shared-state ownership. This is cooperative
+cancellation; `await pool.close()` force-interrupts and joins the pool when a
+barrier cannot be awaited.
+
+TypeScript projects can load `types/mystral.d.ts` directly; the root package also
+advertises it through its `types` field.
+
+## Native tasks inside a Worker
+
+The virtual `mystral/native-tasks` module exports `runNativeTask(name, data)`.
+The public C++ registry is declared in
+`include/mystral/workers/native_task.h`:
+
+```cpp
+workers::getNativeTaskRegistry().registerTask(
+    "game.path-batch",
+    [](std::string_view wirePayload, const async::JobContext& context) {
+        // Parse handles, run C++ or call a Rust FFI kernel, then return wire data.
+        if (context.isCancelled()) {
+            return workers::NativeTaskResult::failure("cancelled");
+        }
+        return workers::NativeTaskResult::success(outputWirePayload);
+    });
+```
+
+Submission uses the runtime priority JobSystem. A completion mailbox belongs to
+the calling Worker, wakes that Worker's condition variable, and resolves the
+Promise only on its own V8 thread. Worker shutdown closes the mailbox, cancels
+queued work from the same generation, and safely ignores late native completion.
+The bridge deliberately accepts no ordinary `ArrayBuffer` attachments; use
+value data or shared handles so native lifetime remains explicit.
 
 ## Integrating an existing CharacterStore
 
@@ -321,11 +418,12 @@ Recommended division of responsibility for a main-owned simulation:
 - Each mutable region has one writer during a simulation phase.
 - Workers report completion or compact commands through `SharedQueue`/`postMessage`; the main thread applies structural changes at a safe point.
 
-If the game instead owns authoritative state in a simulation Worker, keep entity
+If the game owns authoritative state in a simulation Worker, keep entity
 creation, deletion, packed-reference allocation, and structural changes in that
 Worker. The render main isolate still owns WebGPU resources and consumes only
-projections. A pool inside the simulation Worker is the future topology described
-above, not a capability of the current release.
+projections. The simulation Worker may use a pool for stable data-parallel phases;
+task Workers return results or compact commands, and the simulation owner applies
+structural changes after the pool barrier.
 
 If entity references encode index, generation, or namespace bits, continue validating them through the allocator/store contract. Sharing the underlying arrays must not bypass stale-reference checks.
 
@@ -339,10 +437,11 @@ These rules are part of the implementation contract:
 4. Never resize, release, or replace a region while Workers may still attach to or use it.
 5. Keep rendering and WebGPU ownership on the main thread until a separate, verified graphics-thread contract exists.
 6. Treat `SharedQueue` as SPSC.
-7. Treat messages as the documented structured subset, not complete browser
+7. Give each `SharedCommandBuffer` lane exactly one Worker writer and drain only after the barrier.
+8. Treat messages as the documented structured subset, not complete browser
    structured clone; transfer lists still contain only plain `ArrayBuffer` values.
-8. Version schemas when their binary layout changes.
-9. Terminate/join Workers before destroying their engine or shared registries.
+9. Version schemas when their binary layout changes.
+10. Terminate/join Workers before destroying their engine or shared registries.
 
 Shared memory removes serialization and copying cost for bulk state, but introduces data races, false sharing, cache-coherency traffic, fixed-capacity planning, and more difficult debugging. Parallel execution is only faster when each task contains enough work to amortize scheduling and synchronization.
 
@@ -359,12 +458,29 @@ show the worst retained queue even when it drained before sampling ended. Use th
 measurements together with frame/tick time; Worker utilization by itself does not
 prove a faster game loop. Any rejected message means a producer reached
 backpressure and must raise an intentional limit, reduce traffic, batch work, or
-use a shared queue.
+use a shared queue. CPU-budget limit/current/peak values are included in runtime
+stats and benchmark profiler output so oversubscription control is observable.
 
 The fixed shared-memory benchmark uses 200,000 rows, four Workers, ten warmup samples, and fifty measured samples. It initializes baseline and parallel tables identically, assigns exclusive row partitions, and validates checksum equality before reporting median, p95, and p99.
 
 ```bash
 mystral run benchmarks/worker-shared.mjs
+```
+
+The nested benchmark uses the same workload but places the pool inside an
+authoritative simulation Worker and includes the main-to-simulation round trip:
+
+```bash
+mystral run benchmarks/worker-nested.mjs --no-sdl
+```
+
+The scheduler-v2 benchmark deliberately clusters expensive rows in the last
+static partition, then compares fixed partitioning with dynamically claimed
+512-row chunks using the mutation-only atomic barrier, and validates equal
+checksums:
+
+```bash
+mystral run benchmarks/worker-scheduler-v2.mjs --no-sdl
 ```
 
 The transferable-buffer benchmark moves the same buffer from the main isolate to a Worker and back. It covers 64 KiB, 1 MiB, and 8 MiB payloads, checks sender detachment and sentinel bytes on every round, and reports round-trip median/p95/p99, effective bidirectional throughput, and heap snapshots as JSON:
@@ -395,7 +511,7 @@ cmake --build build --parallel
 ctest --test-dir build -R mystral-worker-shared-smoke --output-on-failure
 ```
 
-Then run both fixed benchmarks with the built `mystral` executable. The native smoke test verifies both virtual modules, schema mismatch rejection, explicit table grow/shrink migration, shared-queue full/wrap behavior, cross-isolate attachment and mutation, transferable-buffer detach/round-trip behavior, real timers and cancellation, deterministic WorkerPool partitions/barriers, input/output backpressure, oversized-message rejection, forced interruption of an infinite loop, `close()`, startup failure, rapid registry shutdown, and clean teardown on V8.
+Then run the fixed benchmarks with the built `mystral` executable. The native smoke test verifies the virtual modules, schema mismatch rejection, explicit table migration, SharedQueue full/wrap behavior, deterministic SharedCommandBuffer lanes, cross-isolate attachment and mutation, transferable-buffer detach/round-trip behavior, real timers and cancellation, static and dynamically scheduled WorkerPool barriers, named and queued rounds, native broadcast, reductions, nested error propagation and cascade interruption, global CPU/worker/depth limits, isolate-aware native task success/failure, backpressure, forced interruption, startup failure, rapid shutdown, and clean teardown on V8.
 
 ## Safe extension guide
 

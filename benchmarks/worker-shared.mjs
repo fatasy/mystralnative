@@ -60,17 +60,17 @@ for (let round = 0; round < TOTAL_ROUNDS; round++) {
 
 const parallelSamples = [];
 
-const pool = new WorkerPool('./benchmarks/worker-shared-worker.mjs', {
-    size: WORKERS,
-    name: 'benchmark',
-});
-
 async function runParallelBenchmark() {
+    const pool = await WorkerPool.create('./benchmarks/worker-shared-worker.mjs', {
+        size: WORKERS,
+        name: 'benchmark',
+    });
     for (let round = 0; round < TOTAL_ROUNDS; round++) {
         const startedAt = performance.now();
-        await pool.run(
+        await pool.parallelFor(
+            'update',
             { characters: parallel.handle() },
-            { length: CAPACITY },
+            { length: CAPACITY, schedule: 'static' },
         );
         const elapsed = performance.now() - startedAt;
         if (round >= WARMUP_ROUNDS) parallelSamples.push(elapsed);
@@ -94,12 +94,11 @@ async function runParallelBenchmark() {
         },
     };
     console.log('[WorkerBenchmark] ' + JSON.stringify(result));
-    pool.terminate();
+    await pool.close();
     process.exit(result.checksum.match ? 0 : 1);
 }
 
 runParallelBenchmark().catch(error => {
     console.error('[WorkerBenchmark] WorkerPool failed: ' + error.message);
-    pool.terminate();
     process.exit(1);
 });

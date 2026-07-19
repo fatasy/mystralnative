@@ -16,7 +16,8 @@ Mystral Native.js implements standard Web APIs for graphics, audio, networking, 
 | URL / URLSearchParams | Full | URL parsing and query string handling |
 | Worker | Full | Native OS thread with an independent JS engine |
 | WorkerPool / transferable ArrayBuffer | Full | Deterministic barriers and binary ownership transfer |
-| SharedBuffer / SharedTable / SharedQueue | Full | Zero-copy shared game state via `mystral/shared` |
+| SharedBuffer / SharedTable / SharedQueue / SharedCommandBuffer | Full | Zero-copy shared game state via `mystral/shared` |
+| Native tasks from Workers | Full | Isolate-aware C++/Rust-adapter jobs via `mystral/native-tasks` |
 | Blob | Full | Binary data containers |
 | TextEncoder / TextDecoder | Full | UTF-8 encoding/decoding |
 | Gamepad | Full | Controller support |
@@ -98,6 +99,25 @@ const shaderModule = device.createShaderModule({
     `
 });
 ```
+
+The Promise-based GPU operations support normal `async`/`await`. On Dawn,
+pipeline compilation, queue completion, and buffer mapping are backed by native
+asynchronous callbacks instead of blocking the JavaScript isolate:
+
+```javascript
+const pipeline = await device.createComputePipelineAsync({
+    layout: "auto",
+    compute: { module: shaderModule, entryPoint: "main" }
+});
+
+device.queue.submit([commandBuffer]);
+await device.queue.onSubmittedWorkDone();
+await readback.mapAsync(GPUMapMode.READ);
+```
+
+`createImageBitmap()` is also Promise-based and decodes images on the shared
+native job system. See [Performance & Memory](/docs/guides/performance) for usage
+and scheduling guidance.
 
 ## Canvas 2D
 
@@ -436,30 +456,38 @@ must handle rather than a silently dropped message.
 Worker stuck in a pure JavaScript loop cannot block normal runtime shutdown or
 hot reload.
 
-### Deterministic WorkerPool
+### Game-oriented WorkerPool
 
-`mystral/worker-pool` keeps a fixed set of Workers alive, divides a numeric range
-into stable contiguous partitions, and resolves each round only after every
-Worker reaches the barrier. Results are always returned in Worker-index order.
+`mystral/worker-pool` keeps a fixed set of Workers alive. Its named task API
+supports bounded queued rounds, static partitions, dynamically claimed chunks,
+one-serialization native broadcast, and deterministic owner-side reductions.
 
-The current implementation can construct a pool only in the main runtime
-isolate. Calling `new WorkerPool(...)` from inside a Worker throws. A simulation
-that is itself Worker-owned must remain single-writer until nested pool ownership,
-cascade shutdown, error propagation, and profiler attribution are implemented in
-the runtime; moving game authority to the main isolate solely to bypass this
-limit is not equivalent.
+`WorkerPool.create()` can be called in the main isolate or inside a first-level
+Worker. The default runtime depth supports the intended simulation topology:
+main/render at depth 0, an authoritative simulation Worker at depth 1, and the
+pool's task Workers at depth 2. Pool Workers cannot create another generation of
+Workers. The complete Worker tree shares one runtime worker limit and one
+`SharedBufferRegistry`; terminating a parent interrupts and joins all descendants
+before destroying the parent's JavaScript isolate.
+
+Inside a Worker, nested `Worker` construction accepts module URL strings. Inline
+`Blob` and classic-script sources remain available only from the main isolate.
+`WorkerPool` already uses module URLs, so this does not restrict pool ownership.
 
 ```javascript
 // simulation-pool.worker.mjs
-import { exposeWorkerTask } from 'mystral/worker-pool';
+import { exposeWorkerTasks } from 'mystral/worker-pool';
 import { CharacterRows } from './CharacterRows.mjs';
 
-exposeWorkerTask(({ data, begin, end }) => {
-    const characters = CharacterRows.attach(data.characters);
-    for (let row = begin; row < end; row++) {
-        characters.birthDay[row] -= 1;
-    }
-    return { updated: end - begin };
+exposeWorkerTasks({
+    demography({ data, begin, end, isCancelled }) {
+        const characters = CharacterRows.attach(data.characters);
+        for (let row = begin; row < end; row++) {
+            if ((row & 255) === 0 && isCancelled()) return;
+            characters.birthDay[row] -= 1;
+        }
+        return end - begin;
+    },
 });
 ```
 
@@ -467,21 +495,67 @@ exposeWorkerTask(({ data, begin, end }) => {
 // main.mjs
 import { WorkerPool } from 'mystral/worker-pool';
 
-const pool = new WorkerPool('./simulation-pool.worker.mjs', {
+const pool = await WorkerPool.create('./simulation-pool.worker.mjs', {
     size: 4,
     name: 'simulation',
 });
 
-const results = await pool.run(
+const cancellation = new AbortController();
+await pool.forEach(
+    'demography',
     { characters: characters.handle() },
-    { length: characters.length },
+    {
+        length: characters.length,
+        grainSize: 512,
+        signal: cancellation.signal,
+    },
 );
-pool.terminate();
+await pool.close();
 ```
 
-Only one round can be active per pool. If the range is not divisible by the pool
-size, lower Worker indexes receive one extra row. A task error rejects the round
-and terminates the pool so partially completed state cannot be silently reused.
+`WorkerPool.create()` waits until every task module loaded, registered its
+handlers, and acknowledged its pool index. Direct construction is intentionally
+unsupported, so code cannot receive a partially initialized pool. Startup rejects
+after 30 seconds by default rather than waiting forever when a task module fails
+to register handlers; `startupTimeoutMs` changes that bound.
+
+`parallelFor()`, `forEach()`, and `runNativeTask()` return Promises and can be
+used directly with `await`. Task handlers may also be `async`; their Worker does
+not publish a result or enter the round barrier until the returned Promise
+settles.
+
+`parallelFor()` defaults to dynamic scheduling. Workers claim chunks through a
+shared atomic counter, which prevents one expensive contiguous partition from
+holding the barrier. `schedule: 'static'` selects fixed partitions and stable
+Worker-index result order. Built-in
+reducers are `sum`, `count`, `min`, and `max`; a local reducer function is also
+accepted and always consumes chunk results in chunk-index order.
+
+Every task is registered by name with `exposeWorkerTasks()` and invoked by name.
+Up to 64 waiting rounds are queued by default (`maxQueuedRounds` changes the
+bound); a full queue rejects instead of growing without limit. A task error
+rejects the active and queued rounds and closes the pool so partially completed
+state is not reused.
+
+Dynamic rounds containing only value data and shared handles use the native
+broadcast path: the parent serializes the task once, then the registry publishes
+the same immutable payload to every child queue. Per-chunk transferable
+`ArrayBuffer` results are intentionally unsupported; write bulk output to shared
+storage or return small reduction values.
+
+`forEach()` is the mutation-only API. It avoids collecting per-chunk values:
+every Worker decrements a shared atomic barrier and only the last Worker
+publishes one completion message for the whole round. Use it when correctness is
+represented by writes to shared state or single-writer command lanes. Its
+options accept an `AbortSignal`. Aborting a queued round
+removes and rejects it immediately. Aborting an active round sets a shared
+atomic cancellation flag, stops additional chunk claims, waits for current
+handlers and the pool barrier, then rejects. Handlers receive `isCancelled()`
+for optional checks inside a large chunk. Cancellation is cooperative; use
+`close()` when an executing isolate must be interrupted forcibly.
+
+The package publishes TypeScript declarations from `types/mystral.d.ts`,
+including task contexts, options, reducers, lifecycle methods, and result types.
 
 ### Shared game state
 
@@ -543,6 +617,56 @@ buffer. Payload fields can be `u8`, `i8`, `u16`, `i16`, `u32`, `i32`, `f32`, or
 `f64`. Queue publication uses `Atomics`, while rows assigned exclusively to one
 Worker can use normal TypedArray writes.
 
+`SharedCommandBuffer.define()` creates one fixed-capacity lane per Worker. Each
+Worker writes only to its own lane, avoiding multi-producer contention. After the
+pool barrier, the simulation owner drains all lanes and may provide a stable key:
+
+```javascript
+import { SharedCommandBuffer } from 'mystral/shared';
+
+const Commands = SharedCommandBuffer.define('game.commands/v1', {
+    entity: 'u32',
+    kind: 'u16',
+    value: 'f32',
+});
+const commands = Commands.create({ workerCount: pool.size, laneCapacity: 4096 });
+
+// Worker: commands.push(workerIndex, { entity, kind, value });
+// Simulation owner, after the barrier:
+const stableCommands = commands.drain({ sortBy: ['entity', 'kind'] });
+```
+
+Use a unique or sufficiently discriminating `sortBy` key when dynamic scheduling
+must produce identical commit order across runs. `push()` returns `false` when a
+lane is full. `clear()`, `size`, `handle()`, `attach()`, and `release()` follow
+the same explicit lifetime model as the other shared primitives.
+
+### Native tasks from Workers
+
+Every Worker exposes the virtual `mystral/native-tasks` module. It submits a
+registered C++ handler to the native priority `JobSystem` and resolves the
+Promise back inside the calling isolate:
+
+```javascript
+import { runNativeTask } from 'mystral/native-tasks';
+
+const result = await runNativeTask('game.path-batch', {
+    requests: requestTable.handle(),
+});
+```
+
+Native threads never access V8 handles. The bridge accepts value data and shared
+handles, but rejects `ArrayBuffer` attachments. The native handler receives the
+versioned wire payload and returns a wire payload or an error through
+`NativeTaskResult`. Closing a Worker cancels its queued native generation and a
+weak mailbox discards late completion safely. A Rust kernel can be called behind
+a registered C++ adapter without changing Worker ownership.
+
+The runtime-wide CPU execution budget is shared by Worker JavaScript and native
+jobs. By default it reserves one logical CPU for main/render; embedders can set
+`RuntimeConfig::maxCpuThreads`. This prevents persistent V8 Workers and the
+native JobSystem from independently saturating all logical CPUs.
+
 ### Tradeoffs
 
 - JavaScript objects and closures are private to their isolate.
@@ -556,7 +680,9 @@ Worker can use normal TypedArray writes.
 
 Run the fixed shared-memory benchmark with `mystral run benchmarks/worker-shared.mjs`
 and the ownership-transfer benchmark with
-`mystral run benchmarks/worker-transfer.mjs --no-sdl`.
+`mystral run benchmarks/worker-transfer.mjs --no-sdl`. Compare fixed and dynamic
+scheduling on an intentionally skewed workload with
+`mystral run benchmarks/worker-scheduler-v2.mjs --no-sdl`.
 
 ## Next Steps
 

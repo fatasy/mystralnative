@@ -1,6 +1,9 @@
 #include "mystral/workers/worker_thread.h"
 
+#include "mystral/async/job_system.h"
 #include "mystral/js/module_system.h"
+#include "mystral/workers/native_task.h"
+#include "mystral/workers/worker_registry.h"
 
 #include <algorithm>
 #include <cctype>
@@ -14,6 +17,19 @@
 #include <utility>
 
 namespace mystral::workers {
+
+bool WorkerRuntimeState::tryAcquireWorker() {
+    uint32_t current = activeWorkers.load();
+    while (current < maxWorkers) {
+        if (activeWorkers.compare_exchange_weak(current, current + 1)) return true;
+    }
+    return false;
+}
+
+void WorkerRuntimeState::releaseWorker() {
+    uint32_t current = activeWorkers.load();
+    while (current > 0 && !activeWorkers.compare_exchange_weak(current, current - 1)) {}
+}
 
 namespace {
 
@@ -91,7 +107,10 @@ WorkerThread::WorkerThread(int id,
                            std::string rootDir,
                            std::string name,
                            std::shared_ptr<SharedBufferRegistry> sharedBuffers,
-                           WorkerQueueLimits queueLimits)
+                           WorkerQueueLimits queueLimits,
+                           std::shared_ptr<WorkerRuntimeState> runtimeState,
+                           uint32_t depth,
+                           std::function<void()> outputReadyCallback)
     : id_(id)
     , engineType_(engineType)
     , sourceKind_(sourceKind)
@@ -99,7 +118,34 @@ WorkerThread::WorkerThread(int id,
     , rootDir_(std::move(rootDir))
     , name_(std::move(name))
     , sharedBuffers_(std::move(sharedBuffers))
-    , queueLimits_(queueLimits) {}
+    , runtimeState_(std::move(runtimeState))
+    , queueLimits_(queueLimits)
+    , depth_(depth)
+    , outputReadyCallback_(std::move(outputReadyCallback)) {
+    if (!runtimeState_) runtimeState_ = std::make_shared<WorkerRuntimeState>();
+    if (depth_ < runtimeState_->maxDepth) {
+        childRegistry_ = std::make_unique<WorkerRegistry>(
+            engineType_,
+            rootDir_,
+            sharedBuffers_,
+            runtimeState_,
+            depth_,
+            [this]() {
+                {
+                    std::lock_guard<std::mutex> lock(inputMutex_);
+                    childActivity_.store(true);
+                }
+                inputCondition_.notify_one();
+            });
+    }
+    nativeTaskMailbox_ = std::make_shared<NativeTaskMailbox>([this]() {
+        {
+            std::lock_guard<std::mutex> lock(inputMutex_);
+            nativeTaskActivity_.store(true);
+        }
+        inputCondition_.notify_one();
+    });
+}
 
 WorkerThread::~WorkerThread() {
     terminate();
@@ -155,8 +201,9 @@ WorkerPostStatus WorkerThread::postMessage(
     return WorkerPostStatus::Posted;
 }
 
-void WorkerThread::terminate() {
+void WorkerThread::requestStop() {
     terminated_ = true;
+    if (nativeTaskMailbox_) nativeTaskMailbox_->close();
     WorkerState currentState = state_.load();
     while (currentState != WorkerState::Stopped && currentState != WorkerState::Failed &&
            !state_.compare_exchange_weak(currentState, WorkerState::Stopping)) {}
@@ -165,6 +212,11 @@ void WorkerThread::terminate() {
         if (engine_) engine_->requestTermination();
     }
     inputCondition_.notify_all();
+    async::notifyCpuBudgetWaiters();
+}
+
+void WorkerThread::terminate() {
+    requestStop();
     if (thread_.joinable() && thread_.get_id() != std::this_thread::get_id()) {
         thread_.join();
     }
@@ -202,6 +254,34 @@ WorkerThreadStats WorkerThread::stats() const {
         result.queuedOutputBytes = outputQueuedBytes_;
         result.peakQueuedOutputBytes = peakOutputQueuedBytes_;
     }
+    result.maxDepth = depth_;
+    if (childRegistry_) {
+        const auto child = childRegistry_->stats();
+        result.descendantCreatedWorkers = child.createdWorkers;
+        result.descendantActiveWorkers = child.activeWorkers;
+        result.maxDepth = std::max(result.maxDepth, child.maxDepth);
+        result.processedMessages += child.processedMessages;
+        result.processedTimerCallbacks += child.processedTimerCallbacks;
+        result.busyNanoseconds += child.busyNanoseconds;
+        result.rejectedInputMessages += child.rejectedInputMessages;
+        result.rejectedOutputMessages += child.rejectedOutputMessages;
+        result.rejectedInputTooLarge += child.rejectedInputTooLarge;
+        result.rejectedInputQueueFull += child.rejectedInputQueueFull;
+        result.rejectedOutputTooLarge += child.rejectedOutputTooLarge;
+        result.rejectedOutputQueueFull += child.rejectedOutputQueueFull;
+        result.queuedInputMessages += child.queuedInputMessages;
+        result.queuedInputBytes += child.queuedInputBytes;
+        result.queuedOutputMessages += child.queuedOutputMessages;
+        result.queuedOutputBytes += child.queuedOutputBytes;
+        result.peakQueuedInputBytes = std::max(
+            result.peakQueuedInputBytes, static_cast<size_t>(child.peakQueuedInputBytes));
+        result.peakQueuedOutputBytes = std::max(
+            result.peakQueuedOutputBytes, static_cast<size_t>(child.peakQueuedOutputBytes));
+        result.largestInputMessageBytes = std::max(
+            result.largestInputMessageBytes, static_cast<size_t>(child.largestInputMessageBytes));
+        result.largestOutputMessageBytes = std::max(
+            result.largestOutputMessageBytes, static_cast<size_t>(child.largestOutputMessageBytes));
+    }
     return result;
 }
 
@@ -225,27 +305,30 @@ WorkerPostStatus WorkerThread::enqueueOutput(
     WorkerMessage::Type type,
     std::string payload,
     std::vector<js::TransferredArrayBuffer> transfers) {
-    std::lock_guard<std::mutex> lock(outputMutex_);
-    const auto measured = messageBytes(payload, transfers);
-    recordMaximum(largestOutputMessageBytes_, measured.value);
-    const size_t byteSize = measured.value;
-    if (type != WorkerMessage::Type::Ready && type != WorkerMessage::Type::Exited) {
-        if (measured.overflow || byteSize > queueLimits_.maxMessageBytes) {
-            rejectedOutputMessages_.fetch_add(1);
-            rejectedOutputTooLarge_.fetch_add(1);
-            return WorkerPostStatus::MessageTooLarge;
+    {
+        std::lock_guard<std::mutex> lock(outputMutex_);
+        const auto measured = messageBytes(payload, transfers);
+        recordMaximum(largestOutputMessageBytes_, measured.value);
+        const size_t byteSize = measured.value;
+        if (type != WorkerMessage::Type::Ready && type != WorkerMessage::Type::Exited) {
+            if (measured.overflow || byteSize > queueLimits_.maxMessageBytes) {
+                rejectedOutputMessages_.fetch_add(1);
+                rejectedOutputTooLarge_.fetch_add(1);
+                return WorkerPostStatus::MessageTooLarge;
+            }
+            if (outputQueue_.size() >= queueLimits_.maxMessages ||
+                outputQueuedBytes_ > queueLimits_.maxQueuedBytes ||
+                byteSize > queueLimits_.maxQueuedBytes - outputQueuedBytes_) {
+                rejectedOutputMessages_.fetch_add(1);
+                rejectedOutputQueueFull_.fetch_add(1);
+                return WorkerPostStatus::QueueFull;
+            }
         }
-        if (outputQueue_.size() >= queueLimits_.maxMessages ||
-            outputQueuedBytes_ > queueLimits_.maxQueuedBytes ||
-            byteSize > queueLimits_.maxQueuedBytes - outputQueuedBytes_) {
-            rejectedOutputMessages_.fetch_add(1);
-            rejectedOutputQueueFull_.fetch_add(1);
-            return WorkerPostStatus::QueueFull;
-        }
+        outputQueuedBytes_ += byteSize;
+        outputQueue_.push({type, std::move(payload), std::move(transfers)});
+        peakOutputQueuedBytes_ = std::max(peakOutputQueuedBytes_, outputQueuedBytes_);
     }
-    outputQueuedBytes_ += byteSize;
-    outputQueue_.push({type, std::move(payload), std::move(transfers)});
-    peakOutputQueuedBytes_ = std::max(peakOutputQueuedBytes_, outputQueuedBytes_);
+    if (outputReadyCallback_) outputReadyCallback_();
     return WorkerPostStatus::Posted;
 }
 
@@ -303,6 +386,8 @@ std::vector<int> WorkerThread::collectDueTimers() {
 }
 
 bool WorkerThread::dispatchTimer(js::Engine* engine, int id) {
+    auto cpuLease = async::acquireCpuBudget(&terminated_);
+    if (!cpuLease) return true;
     const auto startedAt = std::chrono::steady_clock::now();
     engine->beginFrame();
     auto dispatch = engine->getGlobalProperty("__mystralWorkerDispatchTimer");
@@ -323,6 +408,8 @@ bool WorkerThread::dispatchTimer(js::Engine* engine, int id) {
 }
 
 bool WorkerThread::dispatchMessage(js::Engine* engine, const WorkerPayload& message) {
+    auto cpuLease = async::acquireCpuBudget(&terminated_);
+    if (!cpuLease) return true;
     const auto startedAt = std::chrono::steady_clock::now();
     engine->beginFrame();
     auto dispatch = engine->getGlobalProperty("__mystralWorkerDispatch");
@@ -354,9 +441,46 @@ bool WorkerThread::dispatchMessage(js::Engine* engine, const WorkerPayload& mess
     return succeeded;
 }
 
+bool WorkerThread::dispatchChildMessages(js::Engine* engine) {
+    if (!childRegistry_) return true;
+    auto cpuLease = async::acquireCpuBudget(&terminated_);
+    if (!cpuLease) return true;
+    std::string error;
+    engine->beginFrame();
+    const bool succeeded = dispatchWorkerRegistryMessages(engine, childRegistry_.get(), &error);
+    engine->clearFrameHandles();
+    if (!succeeded && !terminated_.load()) {
+        enqueueOutput(WorkerMessage::Type::Error,
+            error.empty() ? "Nested Worker message handler failed" : std::move(error));
+    }
+    return succeeded;
+}
+
+bool WorkerThread::dispatchNativeTaskMessages(js::Engine* engine) {
+    if (!nativeTaskMailbox_) return true;
+    auto cpuLease = async::acquireCpuBudget(&terminated_);
+    if (!cpuLease) return true;
+    std::string error;
+    engine->beginFrame();
+    const bool succeeded = dispatchNativeTaskCompletions(
+        engine, nativeTaskMailbox_, &error);
+    engine->clearFrameHandles();
+    if (!succeeded && !terminated_.load()) {
+        enqueueOutput(WorkerMessage::Type::Error,
+            error.empty() ? "Native task completion handler failed" : std::move(error));
+    }
+    return succeeded;
+}
+
 bool WorkerThread::setupWorkerGlobals(js::Engine* engine) {
     installSharedBufferBindings(engine, sharedBuffers_);
     if (!engine->evalScript(sharedApiSource(), "mystral-shared.js")) return false;
+    if (!installNativeTaskBindings(engine, nativeTaskMailbox_)) return false;
+    if (!engine->evalScript(nativeTaskApiSource(), "mystral-native-tasks.js")) return false;
+    if (childRegistry_) {
+        if (!installWorkerRegistryBindings(engine, childRegistry_.get())) return false;
+        if (!engine->evalScript(nestedWorkerFacadeSource(), "nested-worker-global.js")) return false;
+    }
 
     engine->setGlobalProperty("__workerPostMessage",
         engine->newFunction("__workerPostMessage",
@@ -520,6 +644,11 @@ void WorkerThread::threadMain() {
         return;
     }
 
+    auto startupCpuLease = async::acquireCpuBudget(&terminated_);
+    if (!startupCpuLease) {
+        finishThread(nullptr, WorkerState::Stopped);
+        return;
+    }
     auto engine = js::createEngine(engineType_);
     if (!engine) {
         enqueueOutput(WorkerMessage::Type::Error, "Failed to create JavaScript engine for Worker");
@@ -541,6 +670,8 @@ void WorkerThread::threadMain() {
     if (!setupWorkerGlobals(engine.get())) {
         const std::string error = engine->getException();
         if (!terminated_.load()) enqueueOutput(WorkerMessage::Type::Error, error);
+        if (nativeTaskMailbox_) nativeTaskMailbox_->close();
+        if (childRegistry_) childRegistry_->shutdown();
         js::setModuleSystem(nullptr);
         currentWorkerEngine = nullptr;
         currentWorker = nullptr;
@@ -567,7 +698,14 @@ void WorkerThread::threadMain() {
         }
     }
 
+    startupCpuLease = {};
+
     while (loaded && !terminated_.load()) {
+        childActivity_.store(false);
+        nativeTaskActivity_.store(false);
+        dispatchChildMessages(engine.get());
+        dispatchNativeTaskMessages(engine.get());
+
         const auto dueTimers = collectDueTimers();
         if (!dueTimers.empty()) {
             for (int timerId : dueTimers) {
@@ -582,17 +720,20 @@ void WorkerThread::threadMain() {
             if (inputQueue_.empty()) {
                 if (timers_.empty()) {
                     inputCondition_.wait(lock, [this]() {
-                        return terminated_.load() || !inputQueue_.empty();
+                        return terminated_.load() || childActivity_.load() ||
+                            nativeTaskActivity_.load() || !inputQueue_.empty();
                     });
                 } else {
                     auto nextDue = timers_.begin()->second.due;
                     for (const auto& [_, timer] : timers_) nextDue = std::min(nextDue, timer.due);
                     inputCondition_.wait_until(lock, nextDue, [this]() {
-                        return terminated_.load() || !inputQueue_.empty();
+                        return terminated_.load() || childActivity_.load() ||
+                            nativeTaskActivity_.load() || !inputQueue_.empty();
                     });
                 }
             }
             if (terminated_.load()) break;
+            if ((childActivity_.load() || nativeTaskActivity_.load()) && inputQueue_.empty()) continue;
             if (inputQueue_.empty()) continue;
             pending = std::move(inputQueue_.front());
             const auto measured = messageBytes(pending.serialized, pending.transfers);
@@ -605,6 +746,8 @@ void WorkerThread::threadMain() {
     }
 
     timers_.clear();
+    if (nativeTaskMailbox_) nativeTaskMailbox_->close();
+    if (childRegistry_) childRegistry_->shutdown();
     moduleSystem.clearCaches();
     js::setModuleSystem(nullptr);
     currentWorkerEngine = nullptr;

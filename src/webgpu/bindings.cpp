@@ -19,11 +19,17 @@
  */
 
 #include "mystral/js/engine.h"
+#include "mystral/async/job_system.h"
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <deque>
 #include <cstring>
 #include <cstdlib>
+#include <functional>
 #include <iostream>
+#include <limits>
+#include <mutex>
 #include <vector>
 #include <unordered_map>
 #include <unordered_set>
@@ -108,6 +114,191 @@ static WGPUQueue g_queue = nullptr;
 static WGPUSurface g_surface = nullptr;
 static WGPUInstance g_instance = nullptr;
 static js::Engine* g_engine = nullptr;
+
+struct PendingPromise {
+    js::Engine* engine = nullptr;
+    js::JSValueHandle resolve;
+    js::JSValueHandle reject;
+    uint64_t session = 0;
+    bool active = true;
+};
+
+static std::mutex g_asyncCompletionMutex;
+static std::deque<std::function<void()>> g_asyncCompletions;
+static std::unordered_set<PendingPromise*> g_pendingPromises;
+static uint64_t g_asyncSession = 1;
+static uint64_t g_imageDecodeGeneration = (uint64_t{1} << 63) | 1;
+
+static PendingPromise* createPendingPromise(js::JSValueHandle& promise) {
+    auto factory = g_engine->getGlobalProperty("__mystralCreateDeferred");
+    auto deferred = g_engine->call(factory, g_engine->newUndefined(), {});
+    if (!deferred.ptr) return nullptr;
+
+    auto* pending = new PendingPromise{
+        g_engine,
+        g_engine->getProperty(deferred, "resolve"),
+        g_engine->getProperty(deferred, "reject"),
+        g_asyncSession,
+        true,
+    };
+    promise = g_engine->getProperty(deferred, "promise");
+    pending->engine->protect(pending->resolve);
+    pending->engine->protect(pending->reject);
+    g_pendingPromises.insert(pending);
+    return pending;
+}
+
+static js::JSValueHandle makeError(js::Engine* engine, const std::string& message) {
+    auto errorConstructor = engine->getGlobalProperty("Error");
+    return engine->call(
+        errorConstructor,
+        engine->newUndefined(),
+        {engine->newString(message.c_str())});
+}
+
+static void settlePendingPromise(PendingPromise* pending,
+                                 bool success,
+                                 js::JSValueHandle value,
+                                 const std::string& error = {}) {
+    if (!pending) return;
+    if (pending->active && pending->session == g_asyncSession &&
+        pending->engine == g_engine) {
+        auto* engine = pending->engine;
+        if (success) {
+            engine->call(pending->resolve, engine->newUndefined(), {value});
+        } else {
+            engine->call(
+                pending->reject,
+                engine->newUndefined(),
+                {makeError(engine, error.empty() ? "WebGPU async operation failed" : error)});
+        }
+        engine->unprotect(pending->resolve);
+        engine->unprotect(pending->reject);
+        pending->active = false;
+    }
+    g_pendingPromises.erase(pending);
+    delete pending;
+}
+
+static js::JSValueHandle rejectedPromise(const std::string& message) {
+    js::JSValueHandle promise;
+    auto* pending = createPendingPromise(promise);
+    if (!pending) {
+        g_engine->throwException(message.c_str());
+        return g_engine->newUndefined();
+    }
+    settlePendingPromise(pending, false, {}, message);
+    return promise;
+}
+
+static js::JSValueHandle resolvedPromise(js::JSValueHandle value) {
+    js::JSValueHandle promise;
+    auto* pending = createPendingPromise(promise);
+    if (!pending) return g_engine->newUndefined();
+    settlePendingPromise(pending, true, value);
+    return promise;
+}
+
+static void enqueueAsyncCompletion(std::function<void()> completion) {
+    std::lock_guard<std::mutex> lock(g_asyncCompletionMutex);
+    g_asyncCompletions.push_back(std::move(completion));
+}
+
+void processAsyncCompletions() {
+    // endDawnFrame already advances the device during normal rendering. Poll
+    // here only while a JS-visible operation is pending; this also keeps
+    // promises moving when the runtime is paused and no frame is produced.
+    if (!g_pendingPromises.empty()) {
+#if defined(MYSTRAL_WEBGPU_DAWN)
+        if (g_instance) wgpuInstanceProcessEvents(g_instance);
+        if (g_device) wgpuDeviceTick(g_device);
+#elif defined(MYSTRAL_WEBGPU_WGPU)
+        if (g_device) wgpuDevicePoll(g_device, false, nullptr);
+#endif
+    }
+
+    std::deque<std::function<void()>> completions;
+    {
+        std::lock_guard<std::mutex> lock(g_asyncCompletionMutex);
+        completions.swap(g_asyncCompletions);
+    }
+    for (auto& completion : completions) completion();
+}
+
+static void abandonPendingPromises() {
+    for (auto* pending : g_pendingPromises) {
+        if (!pending->active) continue;
+        pending->engine->unprotect(pending->resolve);
+        pending->engine->unprotect(pending->reject);
+        pending->active = false;
+    }
+}
+
+struct DecodedImageData {
+    std::vector<uint8_t> encoded;
+    std::vector<uint8_t> rgba;
+    int width = 0;
+    int height = 0;
+    std::string error;
+};
+
+static void decodeImageData(const async::JobContext& job, DecodedImageData& image) {
+    if (job.isCancelled()) return;
+    if (image.encoded.empty() ||
+        image.encoded.size() > static_cast<size_t>((std::numeric_limits<int>::max)())) {
+        image.error = "Image data is empty or too large to decode";
+        return;
+    }
+
+    const auto* input = image.encoded.data();
+    const size_t inputSize = image.encoded.size();
+    const bool isWebP = inputSize >= 12 &&
+        input[0] == 'R' && input[1] == 'I' && input[2] == 'F' && input[3] == 'F' &&
+        input[8] == 'W' && input[9] == 'E' && input[10] == 'B' && input[11] == 'P';
+
+    unsigned char* decoded = nullptr;
+    if (isWebP) {
+#ifdef MYSTRAL_HAS_WEBP
+        decoded = WebPDecodeRGBA(input, inputSize, &image.width, &image.height);
+        if (!decoded) image.error = "Failed to decode WebP image";
+#else
+        image.error = "WebP image detected but libwebp support is not compiled in";
+#endif
+    } else {
+        int channels = 0;
+        decoded = stbi_load_from_memory(
+            input,
+            static_cast<int>(inputSize),
+            &image.width,
+            &image.height,
+            &channels,
+            4);
+        if (!decoded) {
+            const char* reason = stbi_failure_reason();
+            image.error = std::string("Failed to decode image") +
+                (reason ? std::string(": ") + reason : std::string());
+        }
+    }
+
+    if (!decoded) return;
+    if (image.width <= 0 || image.height <= 0 ||
+        static_cast<size_t>(image.width) >
+            (std::numeric_limits<size_t>::max)() / 4 / static_cast<size_t>(image.height)) {
+        image.error = "Decoded image dimensions are invalid";
+    } else if (!job.isCancelled()) {
+        const size_t byteCount =
+            static_cast<size_t>(image.width) * static_cast<size_t>(image.height) * 4;
+        image.rgba.assign(decoded, decoded + byteCount);
+    }
+
+    if (isWebP) {
+#ifdef MYSTRAL_HAS_WEBP
+        WebPFree(decoded);
+#endif
+    } else {
+        stbi_image_free(decoded);
+    }
+}
 
 // ============================================================================
 // Limits & features reflection helpers
@@ -783,6 +974,7 @@ struct BufferInfo {
     void* mappedData;
     uint64_t mappedSize;
     WGPUMapMode mapMode;  // Track whether mapped for read or write
+    bool mapPending;
 };
 static std::unordered_map<uint64_t, BufferInfo> g_bufferRegistry;
 static uint64_t g_nextBufferId = 1;
@@ -850,35 +1042,236 @@ static void releaseComputePipeline(uint64_t id) {
     g_computePipelineRegistry.erase(it);
 }
 
+static js::JSValueHandle wrapRenderPipeline(WGPURenderPipeline pipeline) {
+    const uint64_t pipelineId = g_nextRenderPipelineId++;
+    g_renderPipelineRegistry[pipelineId] = pipeline;
+
+    auto jsPipeline = g_engine->newObject();
+    g_engine->setPrivateData(jsPipeline, pipeline);
+    g_engine->setProperty(jsPipeline, "_pipelineId", g_engine->newNumber((double)pipelineId));
+    g_engine->setProperty(jsPipeline, "_type", g_engine->newString("renderPipeline"));
+    g_engine->setProperty(jsPipeline, "getBindGroupLayout",
+        g_engine->newFunction("getBindGroupLayout", [pipelineId](void*, const std::vector<js::JSValueHandle>& args) {
+            auto it = g_renderPipelineRegistry.find(pipelineId);
+            if (it == g_renderPipelineRegistry.end() || !it->second) {
+                std::cerr << "[WebGPU] getBindGroupLayout: Render pipeline not found" << std::endl;
+                return g_engine->newUndefined();
+            }
+
+            const uint32_t groupIndex = args.empty() ? 0 : (uint32_t)g_engine->toNumber(args[0]);
+            WGPUBindGroupLayout layout = wgpuRenderPipelineGetBindGroupLayout(it->second, groupIndex);
+            if (!layout) return g_engine->newUndefined();
+
+            auto jsLayout = g_engine->newObject();
+            g_engine->setPrivateData(jsLayout, layout);
+            g_engine->setProperty(jsLayout, "_type", g_engine->newString("bindGroupLayout"));
+            if (gcReleaseEnabled()) {
+                g_engine->registerRelease(jsLayout, [layout]() { wgpuBindGroupLayoutRelease(layout); });
+            }
+            return jsLayout;
+        }));
+    if (gcReleaseEnabled()) {
+        g_engine->registerRelease(jsPipeline, [pipelineId]() { releaseRenderPipeline(pipelineId); });
+    }
+    if (g_verboseLogging) {
+        std::cout << "[WebGPU] Render pipeline created (id=" << pipelineId << ")" << std::endl;
+    }
+    return jsPipeline;
+}
+
+static js::JSValueHandle wrapComputePipeline(WGPUComputePipeline pipeline) {
+    const uint64_t pipelineId = g_nextComputePipelineId++;
+    g_computePipelineRegistry[pipelineId] = pipeline;
+
+    auto jsPipeline = g_engine->newObject();
+    g_engine->setPrivateData(jsPipeline, pipeline);
+    g_engine->setProperty(jsPipeline, "_pipelineId", g_engine->newNumber((double)pipelineId));
+    g_engine->setProperty(jsPipeline, "_type", g_engine->newString("computePipeline"));
+    g_engine->setProperty(jsPipeline, "getBindGroupLayout",
+        g_engine->newFunction("getBindGroupLayout", [pipelineId](void*, const std::vector<js::JSValueHandle>& args) {
+            auto it = g_computePipelineRegistry.find(pipelineId);
+            if (it == g_computePipelineRegistry.end() || !it->second) {
+                std::cerr << "[WebGPU] getBindGroupLayout: Compute pipeline not found" << std::endl;
+                return g_engine->newUndefined();
+            }
+
+            const uint32_t groupIndex = args.empty() ? 0 : (uint32_t)g_engine->toNumber(args[0]);
+            WGPUBindGroupLayout layout = wgpuComputePipelineGetBindGroupLayout(it->second, groupIndex);
+            if (!layout) return g_engine->newUndefined();
+
+            auto jsLayout = g_engine->newObject();
+            g_engine->setPrivateData(jsLayout, layout);
+            g_engine->setProperty(jsLayout, "_type", g_engine->newString("bindGroupLayout"));
+            if (gcReleaseEnabled()) {
+                g_engine->registerRelease(jsLayout, [layout]() { wgpuBindGroupLayoutRelease(layout); });
+            }
+            return jsLayout;
+        }));
+    if (gcReleaseEnabled()) {
+        g_engine->registerRelease(jsPipeline, [pipelineId]() { releaseComputePipeline(pipelineId); });
+    }
+    if (g_verboseLogging) {
+        std::cout << "[WebGPU] Compute pipeline created (id=" << pipelineId << ")" << std::endl;
+    }
+    return jsPipeline;
+}
+
 // Dawn resource cleanup is handled via Engine::registerRelease(), which sets up
 // V8 weak callbacks. When the JS wrapper object is garbage collected (no more
 // JS references), the callback fires and releases the Dawn resource.
 // This is the same pattern Chrome uses for WebGPU resource lifecycle.
 
-// Buffer map callback data (global for static callback)
-struct BufferMapData {
-    bool completed = false;
-    WGPUBufferMapAsyncStatus_Compat status = WGPUBufferMapAsyncStatus_Unknown_Compat;
-    std::string errorMessage;
+struct BufferMapAsyncContext {
+    PendingPromise* promise = nullptr;
+    uint64_t bufferId = 0;
+    WGPUMapMode mode = WGPUMapMode_None;
 };
-static BufferMapData g_bufferMapData;
 
-#if WGPU_BUFFER_MAP_USES_CALLBACK_INFO
-// Dawn buffer map callback (4 params)
-static void onBufferMapped(WGPUMapAsyncStatus status, WGPUStringView message, void* userdata1, void* userdata2) {
-    auto* data = (BufferMapData*)userdata1;
-    data->status = status;
-    data->completed = true;
-    if (message.data && message.length > 0) {
-        data->errorMessage = std::string(message.data, message.length);
-    }
+// Buffer map completion is delivered back to JavaScript on the runtime thread.
+#if defined(MYSTRAL_WEBGPU_DAWN)
+static void onBufferMapped(WGPUMapAsyncStatus status,
+                           WGPUStringView message,
+                           void* userdata1,
+                           void*) {
+    auto* context = static_cast<BufferMapAsyncContext*>(userdata1);
+    const std::string error = message.data && message.length > 0
+        ? std::string(message.data, message.length)
+        : std::string();
+    enqueueAsyncCompletion([context, status, error]() {
+        auto* pending = context->promise;
+        if (!pending->active || pending->session != g_asyncSession) {
+            settlePendingPromise(pending, false, {});
+            delete context;
+            return;
+        }
+
+        auto buffer = g_bufferRegistry.find(context->bufferId);
+        if (buffer == g_bufferRegistry.end()) {
+            settlePendingPromise(pending, false, {}, "GPUBuffer was destroyed while mapping");
+        } else {
+            buffer->second.mapPending = false;
+            if (status == WGPUMapAsyncStatus_Success) {
+                buffer->second.isMapped = true;
+                buffer->second.mapMode = context->mode;
+                settlePendingPromise(pending, true, g_engine->newUndefined());
+            } else {
+                settlePendingPromise(
+                    pending,
+                    false,
+                    {},
+                    error.empty() ? "GPUBuffer mapping failed" : error);
+            }
+        }
+        delete context;
+    });
+}
+
+static void onQueueWorkDone(WGPUQueueWorkDoneStatus status,
+                            WGPUStringView message,
+                            void* userdata1,
+                            void*) {
+    auto* pending = static_cast<PendingPromise*>(userdata1);
+    const std::string error = message.data && message.length > 0
+        ? std::string(message.data, message.length)
+        : std::string();
+    enqueueAsyncCompletion([pending, status, error]() {
+        if (!pending->active || pending->session != g_asyncSession || pending->engine != g_engine) {
+            settlePendingPromise(pending, false, {});
+            return;
+        }
+        if (status == WGPUQueueWorkDoneStatus_Success) {
+            settlePendingPromise(pending, true, g_engine->newUndefined());
+        } else {
+            settlePendingPromise(
+                pending,
+                false,
+                {},
+                error.empty() ? "GPU queue work failed" : error);
+        }
+    });
+}
+
+static void onRenderPipelineCreated(WGPUCreatePipelineAsyncStatus status,
+                                    WGPURenderPipeline pipeline,
+                                    WGPUStringView message,
+                                    void* userdata1,
+                                    void*) {
+    auto* pending = static_cast<PendingPromise*>(userdata1);
+    const std::string error = message.data && message.length > 0
+        ? std::string(message.data, message.length)
+        : std::string();
+    enqueueAsyncCompletion([pending, status, pipeline, error]() {
+        if (!pending->active || pending->session != g_asyncSession || pending->engine != g_engine) {
+            if (pipeline) wgpuRenderPipelineRelease(pipeline);
+            settlePendingPromise(pending, false, {});
+            return;
+        }
+        if (status == WGPUCreatePipelineAsyncStatus_Success && pipeline) {
+            settlePendingPromise(pending, true, wrapRenderPipeline(pipeline));
+        } else {
+            if (pipeline) wgpuRenderPipelineRelease(pipeline);
+            settlePendingPromise(
+                pending,
+                false,
+                {},
+                error.empty() ? "Failed to create render pipeline asynchronously" : error);
+        }
+    });
+}
+
+static void onComputePipelineCreated(WGPUCreatePipelineAsyncStatus status,
+                                     WGPUComputePipeline pipeline,
+                                     WGPUStringView message,
+                                     void* userdata1,
+                                     void*) {
+    auto* pending = static_cast<PendingPromise*>(userdata1);
+    const std::string error = message.data && message.length > 0
+        ? std::string(message.data, message.length)
+        : std::string();
+    enqueueAsyncCompletion([pending, status, pipeline, error]() {
+        if (!pending->active || pending->session != g_asyncSession || pending->engine != g_engine) {
+            if (pipeline) wgpuComputePipelineRelease(pipeline);
+            settlePendingPromise(pending, false, {});
+            return;
+        }
+        if (status == WGPUCreatePipelineAsyncStatus_Success && pipeline) {
+            settlePendingPromise(pending, true, wrapComputePipeline(pipeline));
+        } else {
+            if (pipeline) wgpuComputePipelineRelease(pipeline);
+            settlePendingPromise(
+                pending,
+                false,
+                {},
+                error.empty() ? "Failed to create compute pipeline asynchronously" : error);
+        }
+    });
 }
 #else
-// wgpu-native buffer map callback (2 params)
 static void onBufferMapped(WGPUBufferMapAsyncStatus status, void* userdata) {
-    auto* data = (BufferMapData*)userdata;
-    data->status = status;
-    data->completed = true;
+    auto* context = static_cast<BufferMapAsyncContext*>(userdata);
+    enqueueAsyncCompletion([context, status]() {
+        auto* pending = context->promise;
+        if (!pending->active || pending->session != g_asyncSession || pending->engine != g_engine) {
+            settlePendingPromise(pending, false, {});
+            delete context;
+            return;
+        }
+
+        auto buffer = g_bufferRegistry.find(context->bufferId);
+        if (buffer == g_bufferRegistry.end()) {
+            settlePendingPromise(pending, false, {}, "GPUBuffer was destroyed while mapping");
+        } else {
+            buffer->second.mapPending = false;
+            if (status == WGPUBufferMapAsyncStatus_Success_Compat) {
+                buffer->second.isMapped = true;
+                buffer->second.mapMode = context->mode;
+                settlePendingPromise(pending, true, g_engine->newUndefined());
+            } else {
+                settlePendingPromise(pending, false, {}, "GPUBuffer mapping failed");
+            }
+        }
+        delete context;
+    });
 }
 #endif
 
@@ -1045,6 +1438,21 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
     g_device = (WGPUDevice)wgpuDevice;
     g_queue = (WGPUQueue)wgpuQueue;
     g_surface = (WGPUSurface)wgpuSurface;
+
+    if (!engine->evalScript(R"JS(
+globalThis.__mystralCreateDeferred = function() {
+    let resolve;
+    let reject;
+    const promise = new Promise(function(onResolve, onReject) {
+        resolve = onResolve;
+        reject = onReject;
+    });
+    return { promise, resolve, reject };
+};
+)JS", "webgpu-async.js")) {
+        std::cerr << "[WebGPU] Failed to initialize async Promise support" << std::endl;
+        return false;
+    }
 
     // Set canvas dimensions from window size
     g_canvasWidth = width;
@@ -2228,10 +2636,21 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
                                 g_forcedFrameFlushes++;
                                 flushDeferredQueueWork();
                             }
-                            // For now, return a Promise that resolves immediately
-                            // Dawn's wgpuQueueOnSubmittedWorkDone is callback-based, which is complex to integrate
-                            // Since we're running single-threaded and submit() is synchronous, work is already done
+#if defined(MYSTRAL_WEBGPU_DAWN)
+                            js::JSValueHandle promise;
+                            auto* pending = createPendingPromise(promise);
+                            if (!pending) return g_engine->newUndefined();
+
+                            WGPUQueueWorkDoneCallbackInfo callbackInfo = {};
+                            callbackInfo.mode = WGPUCallbackMode_AllowSpontaneous;
+                            callbackInfo.callback = onQueueWorkDone;
+                            callbackInfo.userdata1 = pending;
+                            wgpuQueueOnSubmittedWorkDone(g_queue, callbackInfo);
+                            return promise;
+#else
+                            // Compatibility fallback for the legacy wgpu-native API.
                             return g_engine->evalWithResult("Promise.resolve()", "<onSubmittedWorkDone>");
+#endif
                         })
                     );
 
@@ -2291,7 +2710,7 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
                             uint64_t bufferId = g_nextBufferId++;
                             // mappedAtCreation buffers are mapped for write
                             WGPUMapMode initialMapMode = mappedAtCreation ? WGPUMapMode_Write : WGPUMapMode_None;
-                            g_bufferRegistry[bufferId] = {buffer, (uint64_t)size, (WGPUBufferUsage)(uint32_t)usage, mappedAtCreation, nullptr, 0, initialMapMode};
+                            g_bufferRegistry[bufferId] = {buffer, (uint64_t)size, (WGPUBufferUsage)(uint32_t)usage, mappedAtCreation, nullptr, 0, initialMapMode, false};
 
                             auto jsBuffer = g_engine->newObject();
                             g_engine->setPrivateData(jsBuffer, buffer);
@@ -2309,14 +2728,17 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
                                     auto it = g_bufferRegistry.find(bufferId);
                                     if (it == g_bufferRegistry.end()) {
                                         std::cerr << "[WebGPU] mapAsync: Buffer " << bufferId << " not found" << std::endl;
-                                        return g_engine->evalWithResult("Promise.reject(new Error('Buffer not found'))", "mapAsync-error");
+                                        return rejectedPromise("GPUBuffer not found");
                                     }
 
                                     auto& bufferInfo = it->second;
 
                                     // Already mapped (mappedAtCreation)?
                                     if (bufferInfo.isMapped) {
-                                        return g_engine->evalWithResult("Promise.resolve()", "mapAsync-already-mapped");
+                                        return rejectedPromise("GPUBuffer is already mapped");
+                                    }
+                                    if (bufferInfo.mapPending) {
+                                        return rejectedPromise("GPUBuffer already has a pending mapAsync operation");
                                     }
 
                                     // Get mode (default to READ)
@@ -2328,7 +2750,15 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
                                     }
 
                                     uint64_t offset = args.size() > 1 ? (uint64_t)g_engine->toNumber(args[1]) : 0;
-                                    uint64_t mapSize = args.size() > 2 ? (uint64_t)g_engine->toNumber(args[2]) : bufferInfo.size;
+                                    if (offset > bufferInfo.size) {
+                                        return rejectedPromise("GPUBuffer map range is out of bounds");
+                                    }
+                                    uint64_t mapSize = args.size() > 2
+                                        ? (uint64_t)g_engine->toNumber(args[2])
+                                        : bufferInfo.size - offset;
+                                    if (mapSize > bufferInfo.size - offset) {
+                                        return rejectedPromise("GPUBuffer map range is out of bounds");
+                                    }
 
                                     // Debug: Log buffer info
                                     bool hasMapRead = (bufferInfo.usage & WGPUBufferUsage_MapRead) != 0;
@@ -2343,74 +2773,30 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
                                         flushDeferredQueueWork();
                                     }
 
-                                    // Ensure all pending GPU work is processed before attempting to map
-                                    // This is critical for buffers that were just used in a copy operation
-                                    for (int prePoll = 0; prePoll < 100; prePoll++) {
-#if defined(MYSTRAL_WEBGPU_WGPU)
-                                        wgpuDevicePoll(g_device, false, nullptr);
-#else
-                                        if (g_instance) {
-                                            wgpuInstanceProcessEvents(g_instance);
-                                        }
-                                        if (g_device) {
-                                            wgpuDeviceTick(g_device);
-                                        }
-#endif
+                                    js::JSValueHandle promise;
+                                    auto* pending = createPendingPromise(promise);
+                                    if (!pending) {
+                                        return g_engine->newUndefined();
                                     }
 
-                                    // Synchronous mapping: use global callback + device poll
-                                    g_bufferMapData.completed = false;
-                                    g_bufferMapData.status = WGPUBufferMapAsyncStatus_Unknown_Compat;
-                                    g_bufferMapData.errorMessage.clear();
-
-#if WGPU_BUFFER_MAP_USES_CALLBACK_INFO
-                                    // Dawn uses CallbackInfo struct with 4-param callback
-                                    // Use AllowSpontaneous mode so callback can be invoked at any time
-                                    WGPUBufferMapCallbackInfo mapCallbackInfo = {};
-                                    mapCallbackInfo.mode = WGPUCallbackMode_AllowSpontaneous;
-                                    mapCallbackInfo.callback = onBufferMapped;
-                                    mapCallbackInfo.userdata1 = &g_bufferMapData;
-                                    mapCallbackInfo.userdata2 = nullptr;
-
-                                    wgpuBufferMapAsync(bufferInfo.buffer, mode, offset, mapSize, mapCallbackInfo);
+                                    bufferInfo.mapPending = true;
+                                    auto* context = new BufferMapAsyncContext{pending, bufferId, mode};
+#if defined(MYSTRAL_WEBGPU_DAWN)
+                                    WGPUBufferMapCallbackInfo callbackInfo = {};
+                                    callbackInfo.mode = WGPUCallbackMode_AllowSpontaneous;
+                                    callbackInfo.callback = onBufferMapped;
+                                    callbackInfo.userdata1 = context;
+                                    wgpuBufferMapAsync(bufferInfo.buffer, mode, offset, mapSize, callbackInfo);
 #else
-                                    // wgpu-native uses separate callback and userdata
-                                    wgpuBufferMapAsync(bufferInfo.buffer, mode, offset, mapSize, onBufferMapped, &g_bufferMapData);
+                                    wgpuBufferMapAsync(
+                                        bufferInfo.buffer,
+                                        mode,
+                                        offset,
+                                        mapSize,
+                                        onBufferMapped,
+                                        context);
 #endif
-
-                                    // Poll device until mapping completes
-                                    // Add small sleep to avoid busy-looping and let GPU work complete
-                                    int pollCount = 0;
-                                    while (!g_bufferMapData.completed && pollCount < 10000) {
-#if defined(MYSTRAL_WEBGPU_WGPU)
-                                        wgpuDevicePoll(g_device, true, nullptr);
-#else
-                                        if (g_instance) {
-                                            wgpuInstanceProcessEvents(g_instance);
-                                        }
-                                        if (g_device) {
-                                            wgpuDeviceTick(g_device);
-                                        }
-#endif
-                                        // Small sleep every 100 iterations to avoid busy loop
-                                        if (pollCount % 100 == 0) {
-                                            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                                        }
-                                        pollCount++;
-                                    }
-
-                                    if (g_bufferMapData.status == WGPUBufferMapAsyncStatus_Success_Compat) {
-                                        bufferInfo.isMapped = true;
-                                        bufferInfo.mapMode = mode;  // Store whether mapped for read or write
-                                        return g_engine->evalWithResult("Promise.resolve()", "mapAsync-success");
-                                    } else {
-                                        std::cerr << "[WebGPU] mapAsync: Failed with status " << g_bufferMapData.status;
-                                        if (!g_bufferMapData.errorMessage.empty()) {
-                                            std::cerr << " - " << g_bufferMapData.errorMessage;
-                                        }
-                                        std::cerr << std::endl;
-                                        return g_engine->evalWithResult("Promise.reject(new Error('Buffer map failed'))", "mapAsync-failed");
-                                    }
+                                    return promise;
                                 })
                             );
 
@@ -2537,8 +2923,8 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
                     );
 
                     // device.createRenderPipeline(descriptor)
-                    g_engine->setProperty(device, "createRenderPipeline",
-                        g_engine->newFunction("createRenderPipeline", [](void* ctx, const std::vector<js::JSValueHandle>& args) {
+                    auto createRenderPipelineBinding = [](bool asyncCreation) {
+                        return g_engine->newFunction("createRenderPipeline", [asyncCreation](void* ctx, const std::vector<js::JSValueHandle>& args) {
                             if (args.empty()) {
                                 g_engine->throwException("createRenderPipeline requires a descriptor");
                                 return g_engine->newUndefined();
@@ -2946,66 +3332,38 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
                                 }
                             }
 
-                            // Create pipeline
+#if defined(MYSTRAL_WEBGPU_DAWN)
+                            if (asyncCreation) {
+                                js::JSValueHandle promise;
+                                auto* pending = createPendingPromise(promise);
+                                if (!pending) return g_engine->newUndefined();
+
+                                WGPUCreateRenderPipelineAsyncCallbackInfo callbackInfo = {};
+                                callbackInfo.mode = WGPUCallbackMode_AllowSpontaneous;
+                                callbackInfo.callback = onRenderPipelineCreated;
+                                callbackInfo.userdata1 = pending;
+                                wgpuDeviceCreateRenderPipelineAsync(g_device, &pipelineDesc, callbackInfo);
+                                return promise;
+                            }
+#else
+                            (void)asyncCreation;
+#endif
+
                             WGPURenderPipeline pipeline = wgpuDeviceCreateRenderPipeline(g_device, &pipelineDesc);
                             if (!pipeline) {
                                 g_engine->throwException("Failed to create render pipeline");
                                 return g_engine->newUndefined();
                             }
-
-                            // Register pipeline for getBindGroupLayout
-                            uint64_t pipelineId = g_nextRenderPipelineId++;
-                            g_renderPipelineRegistry[pipelineId] = pipeline;
-
-                            auto jsPipeline = g_engine->newObject();
-                            g_engine->setPrivateData(jsPipeline, pipeline);
-                            g_engine->setProperty(jsPipeline, "_pipelineId", g_engine->newNumber((double)pipelineId));
-                            g_engine->setProperty(jsPipeline, "_type", g_engine->newString("renderPipeline"));
-
-                            // Add getBindGroupLayout method using captured pipelineId
-                            g_engine->setProperty(jsPipeline, "getBindGroupLayout",
-                                g_engine->newFunction("getBindGroupLayout", [pipelineId](void* ctx, const std::vector<js::JSValueHandle>& args) {
-                                    auto it = g_renderPipelineRegistry.find(pipelineId);
-                                    if (it == g_renderPipelineRegistry.end() || !it->second) {
-                                        std::cerr << "[WebGPU] getBindGroupLayout: Render pipeline not found" << std::endl;
-                                        return g_engine->newUndefined();
-                                    }
-
-                                    uint32_t groupIndex = args.empty() ? 0 : (uint32_t)g_engine->toNumber(args[0]);
-                                    WGPUBindGroupLayout layout = wgpuRenderPipelineGetBindGroupLayout(it->second, groupIndex);
-
-                                    if (!layout) {
-                                        std::cerr << "[WebGPU] getBindGroupLayout: Failed to get layout for group " << groupIndex << std::endl;
-                                        return g_engine->newUndefined();
-                                    }
-
-                                    auto jsLayout = g_engine->newObject();
-                                    g_engine->setPrivateData(jsLayout, layout);
-                                    g_engine->setProperty(jsLayout, "_type", g_engine->newString("bindGroupLayout"));
-                                    if (gcReleaseEnabled()) {
-                                        g_engine->registerRelease(jsLayout, [layout]() {
-                                            wgpuBindGroupLayoutRelease(layout);
-                                        });
-                                    }
-
-                                    return jsLayout;
-                                })
-                            );
-
-                            if (gcReleaseEnabled()) {
-                                g_engine->registerRelease(jsPipeline, [pipelineId]() {
-                                    releaseRenderPipeline(pipelineId);
-                                });
-                            }
-
-                            if (g_verboseLogging) std::cout << "[WebGPU] Render pipeline created (id=" << pipelineId << ")" << std::endl;
-                            return jsPipeline;
-                        })
-                    );
+                            auto jsPipeline = wrapRenderPipeline(pipeline);
+                            return asyncCreation ? resolvedPromise(jsPipeline) : jsPipeline;
+                        });
+                    };
+                    g_engine->setProperty(device, "createRenderPipeline", createRenderPipelineBinding(false));
+                    g_engine->setProperty(device, "createRenderPipelineAsync", createRenderPipelineBinding(true));
 
                     // device.createComputePipeline(descriptor)
-                    g_engine->setProperty(device, "createComputePipeline",
-                        g_engine->newFunction("createComputePipeline", [](void* ctx, const std::vector<js::JSValueHandle>& args) {
+                    auto createComputePipelineBinding = [](bool asyncCreation) {
+                        return g_engine->newFunction("createComputePipeline", [asyncCreation](void* ctx, const std::vector<js::JSValueHandle>& args) {
                             if (args.empty()) {
                                 g_engine->throwException("createComputePipeline requires a descriptor");
                                 return g_engine->newUndefined();
@@ -3051,61 +3409,34 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
                                 WGPU_SET_ENTRY_POINT_AUTO(pipelineDesc.compute);
                             }
 
+#if defined(MYSTRAL_WEBGPU_DAWN)
+                            if (asyncCreation) {
+                                js::JSValueHandle promise;
+                                auto* pending = createPendingPromise(promise);
+                                if (!pending) return g_engine->newUndefined();
+
+                                WGPUCreateComputePipelineAsyncCallbackInfo callbackInfo = {};
+                                callbackInfo.mode = WGPUCallbackMode_AllowSpontaneous;
+                                callbackInfo.callback = onComputePipelineCreated;
+                                callbackInfo.userdata1 = pending;
+                                wgpuDeviceCreateComputePipelineAsync(g_device, &pipelineDesc, callbackInfo);
+                                return promise;
+                            }
+#else
+                            (void)asyncCreation;
+#endif
+
                             WGPUComputePipeline pipeline = wgpuDeviceCreateComputePipeline(g_device, &pipelineDesc);
                             if (!pipeline) {
                                 g_engine->throwException("Failed to create compute pipeline");
                                 return g_engine->newUndefined();
                             }
-
-                            // Register pipeline for getBindGroupLayout
-                            uint64_t pipelineId = g_nextComputePipelineId++;
-                            g_computePipelineRegistry[pipelineId] = pipeline;
-
-                            auto jsPipeline = g_engine->newObject();
-                            g_engine->setPrivateData(jsPipeline, pipeline);
-                            g_engine->setProperty(jsPipeline, "_pipelineId", g_engine->newNumber((double)pipelineId));
-                            g_engine->setProperty(jsPipeline, "_type", g_engine->newString("computePipeline"));
-
-                            // Add getBindGroupLayout method using captured pipelineId
-                            g_engine->setProperty(jsPipeline, "getBindGroupLayout",
-                                g_engine->newFunction("getBindGroupLayout", [pipelineId](void* ctx, const std::vector<js::JSValueHandle>& args) {
-                                    auto it = g_computePipelineRegistry.find(pipelineId);
-                                    if (it == g_computePipelineRegistry.end() || !it->second) {
-                                        std::cerr << "[WebGPU] getBindGroupLayout: Compute pipeline not found" << std::endl;
-                                        return g_engine->newUndefined();
-                                    }
-
-                                    uint32_t groupIndex = args.empty() ? 0 : (uint32_t)g_engine->toNumber(args[0]);
-                                    WGPUBindGroupLayout layout = wgpuComputePipelineGetBindGroupLayout(it->second, groupIndex);
-
-                                    if (!layout) {
-                                        std::cerr << "[WebGPU] getBindGroupLayout: Failed to get layout for group " << groupIndex << std::endl;
-                                        return g_engine->newUndefined();
-                                    }
-
-                                    auto jsLayout = g_engine->newObject();
-                                    g_engine->setPrivateData(jsLayout, layout);
-                                    g_engine->setProperty(jsLayout, "_type", g_engine->newString("bindGroupLayout"));
-                                    if (gcReleaseEnabled()) {
-                                        g_engine->registerRelease(jsLayout, [layout]() {
-                                            wgpuBindGroupLayoutRelease(layout);
-                                        });
-                                    }
-
-                                    return jsLayout;
-                                })
-                            );
-
-                            if (gcReleaseEnabled()) {
-                                g_engine->registerRelease(jsPipeline, [pipelineId]() {
-                                    releaseComputePipeline(pipelineId);
-                                });
-                            }
-
-                            if (g_verboseLogging) std::cout << "[WebGPU] Compute pipeline created (id=" << pipelineId << ")" << std::endl;
-                            return jsPipeline;
-                        })
-                    );
+                            auto jsPipeline = wrapComputePipeline(pipeline);
+                            return asyncCreation ? resolvedPromise(jsPipeline) : jsPipeline;
+                        });
+                    };
+                    g_engine->setProperty(device, "createComputePipeline", createComputePipelineBinding(false));
+                    g_engine->setProperty(device, "createComputePipelineAsync", createComputePipelineBinding(true));
 
                     // device.createCommandEncoder(descriptor?)
                     g_engine->setProperty(device, "createCommandEncoder",
@@ -5003,23 +5334,6 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
                     );
                     g_engine->setProperty(device, "lost", deviceLostPromise);
 
-                    // createRenderPipelineAsync / createComputePipelineAsync —
-                    // three.js' compileAsync path uses these; alias them to the
-                    // sync variants wrapped in a resolved Promise (JS glue so the
-                    // pipeline object travels through the Promise unchanged)
-                    g_engine->setGlobalProperty("__mystral_device_tmp", device);
-                    g_engine->eval(R"(
-                        (function(d) {
-                            d.createRenderPipelineAsync = function(desc) {
-                                return Promise.resolve(d.createRenderPipeline(desc));
-                            };
-                            d.createComputePipelineAsync = function(desc) {
-                                return Promise.resolve(d.createComputePipeline(desc));
-                            };
-                        })(globalThis.__mystral_device_tmp);
-                        delete globalThis.__mystral_device_tmp;
-                    )", "pipeline-async-setup");
-
                     // Return the device directly
                     // await on a non-Promise just returns the value
                     return device;
@@ -5101,84 +5415,77 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, voi
     //
     // Note: PNG/JPEG supported via stb_image. WebP supported via libwebp (when MYSTRAL_HAS_WEBP defined).
 
-    // Native helper that decodes image data synchronously
-    engine->setGlobalProperty("__decodeImageData",
-        engine->newFunction("__decodeImageData", [](void* ctx, const std::vector<js::JSValueHandle>& args) {
+    // Native helper: copy the encoded bytes on the runtime thread, decode on
+    // the shared job system, then create the JS result back on this thread.
+    engine->setGlobalProperty("__decodeImageDataAsync",
+        engine->newFunction("__decodeImageDataAsync", [](void* ctx, const std::vector<js::JSValueHandle>& args) {
             if (args.empty()) {
-                g_engine->throwException("__decodeImageData requires an ArrayBuffer argument");
-                return g_engine->newUndefined();
+                return rejectedPromise("Image decode requires an ArrayBuffer argument");
             }
 
-            // Get ArrayBuffer data
             size_t inputSize = 0;
             void* inputData = g_engine->getArrayBufferData(args[0], &inputSize);
-
             if (!inputData || inputSize == 0) {
-                g_engine->throwException("__decodeImageData: invalid ArrayBuffer");
-                return g_engine->newUndefined();
+                return rejectedPromise("Image decode received an invalid ArrayBuffer");
             }
 
-            const unsigned char* inputBytes = (const unsigned char*)inputData;
-            int width = 0, height = 0;
-            unsigned char* data = nullptr;
-            bool isWebP = false;
+            auto image = std::make_shared<DecodedImageData>();
+            const auto* bytes = static_cast<const uint8_t*>(inputData);
+            image->encoded.assign(bytes, bytes + inputSize);
 
-            // Check if this is a WebP image (starts with "RIFF" and has "WEBP" at offset 8)
-            if (inputSize >= 12 &&
-                inputBytes[0] == 'R' && inputBytes[1] == 'I' &&
-                inputBytes[2] == 'F' && inputBytes[3] == 'F' &&
-                inputBytes[8] == 'W' && inputBytes[9] == 'E' &&
-                inputBytes[10] == 'B' && inputBytes[11] == 'P') {
-                isWebP = true;
+            js::JSValueHandle promise;
+            auto* pending = createPendingPromise(promise);
+            if (!pending) return g_engine->newUndefined();
+
+            auto handle = async::getJobSystem().submit(
+                async::JobPriority::Streaming,
+                g_imageDecodeGeneration,
+                [image](const async::JobContext& job) {
+                    decodeImageData(job, *image);
+                },
+                [image, pending](async::JobStatus status) {
+                    if (!pending->active || pending->session != g_asyncSession || pending->engine != g_engine) {
+                        settlePendingPromise(pending, false, {});
+                        return;
+                    }
+                    if (status == async::JobStatus::Cancelled) {
+                        settlePendingPromise(pending, false, {}, "Image decode was cancelled");
+                        return;
+                    }
+                    if (status == async::JobStatus::Failed && image->error.empty()) {
+                        image->error = "Image decode job failed";
+                    }
+                    if (!image->error.empty() || image->rgba.empty()) {
+                        settlePendingPromise(
+                            pending,
+                            false,
+                            {},
+                            image->error.empty() ? "Image decode produced no pixels" : image->error);
+                        return;
+                    }
+
+                    auto result = g_engine->newObject();
+                    auto pixels = g_engine->newArrayBuffer(image->rgba.data(), image->rgba.size());
+                    g_engine->setProperty(result, "width", g_engine->newNumber(image->width));
+                    g_engine->setProperty(result, "height", g_engine->newNumber(image->height));
+                    g_engine->setProperty(result, "_data", pixels);
+                    g_engine->setProperty(result, "_closed", g_engine->newBoolean(false));
+                    if (g_verboseLogging) {
+                        std::cout << "[createImageBitmap] Decoded "
+                                  << image->width << "x" << image->height
+                                  << " image asynchronously" << std::endl;
+                    }
+                    settlePendingPromise(pending, true, result);
+                });
+
+            if (!handle) {
+                settlePendingPromise(
+                    pending,
+                    false,
+                    {},
+                    "Image decode queue is full or shutting down");
             }
-
-            if (isWebP) {
-#ifdef MYSTRAL_HAS_WEBP
-                // Decode WebP using libwebp
-                data = WebPDecodeRGBA(inputBytes, inputSize, &width, &height);
-                if (!data) {
-                    g_engine->throwException("Failed to decode WebP image");
-                    return g_engine->newUndefined();
-                }
-                if (g_verboseLogging) std::cout << "[createImageBitmap] Decoded WebP " << width << "x" << height << " image" << std::endl;
-#else
-                g_engine->throwException("WebP image detected but libwebp support not compiled in. Rebuild with MYSTRAL_HAS_WEBP.");
-                return g_engine->newUndefined();
-#endif
-            } else {
-                // Decode using stb_image (PNG, JPEG, etc.)
-                int channels;
-                data = stbi_load_from_memory(inputBytes, (int)inputSize, &width, &height, &channels, 4);
-                if (!data) {
-                    std::string error = std::string("Failed to decode image: ") + stbi_failure_reason();
-                    g_engine->throwException(error.c_str());
-                    return g_engine->newUndefined();
-                }
-                if (g_verboseLogging) std::cout << "[createImageBitmap] Decoded " << width << "x" << height << " image" << std::endl;
-            }
-
-            // Create ImageBitmap-like object
-            auto result = g_engine->newObject();
-
-            // Create ArrayBuffer with RGBA pixel data
-            size_t dataSize = width * height * 4;
-            auto arrayBuffer = g_engine->newArrayBuffer(data, dataSize);
-
-            g_engine->setProperty(result, "width", g_engine->newNumber(width));
-            g_engine->setProperty(result, "height", g_engine->newNumber(height));
-            g_engine->setProperty(result, "_data", arrayBuffer);  // Internal pixel data
-            g_engine->setProperty(result, "_closed", g_engine->newBoolean(false));
-
-            // Free decoded data (we copied it to ArrayBuffer)
-            if (isWebP) {
-#ifdef MYSTRAL_HAS_WEBP
-                WebPFree(data);
-#endif
-            } else {
-                stbi_image_free(data);
-            }
-
-            return result;
+            return promise;
         })
     );
 
@@ -5206,8 +5513,8 @@ async function createImageBitmap(source, options) {
 
     if (source instanceof ArrayBuffer) {
         arrayBuffer = source;
-    } else if (source instanceof Uint8Array) {
-        arrayBuffer = source.buffer;
+    } else if (ArrayBuffer.isView(source)) {
+        arrayBuffer = source.buffer.slice(source.byteOffset, source.byteOffset + source.byteLength);
     } else if (source && typeof source.arrayBuffer === 'function') {
         // Blob or Response
         arrayBuffer = await source.arrayBuffer();
@@ -5219,7 +5526,7 @@ async function createImageBitmap(source, options) {
     }
 
     // Decode using native function
-    const decoded = __decodeImageData(arrayBuffer);
+    const decoded = await __decodeImageDataAsync(arrayBuffer);
 
     if (!decoded) {
         throw new Error('createImageBitmap: failed to decode image');
@@ -5635,6 +5942,11 @@ globalThis.OffscreenCanvas = OffscreenCanvas;
             set("activeComputePipelines", g_computePipelineRegistry.size());
             set("activeOffscreenCanvases", g_offscreenCanvases.size());
             set("activeCanvas2DContexts", canvas::canvas2DContextCount());
+            set("pendingAsyncOperations", g_pendingPromises.size());
+            {
+                std::lock_guard<std::mutex> lock(g_asyncCompletionMutex);
+                set("queuedAsyncCompletions", g_asyncCompletions.size());
+            }
 
             auto bridge = g_engine->newObject();
             for (size_t index = 0; index < g_profiledBridgeMetrics.size(); index++) {
@@ -5780,9 +6092,20 @@ void releaseReloadResources() {
 }
 
 void resetSessionBindings() {
-    // These handles belong to the JavaScript engine being replaced. The
-    // engine destructor owns their protected persistents; only clear the
-    // native cache here so the next engine creates methods in its context.
+    // Stop JS settlement first. Native callbacks may still arrive, but their
+    // contexts remain valid and will only perform native cleanup.
+    abandonPendingPromises();
+    ++g_asyncSession;
+
+    const uint64_t imageGeneration = g_imageDecodeGeneration++;
+    if (async::getJobSystem().isRunning()) {
+        async::getJobSystem().cancelGeneration(imageGeneration);
+        async::getJobSystem().waitIdle();
+        async::getJobSystem().processCompletions();
+    }
+
+    processAsyncCompletions();
+
     g_transientMethods = {};
     g_engine = nullptr;
 }

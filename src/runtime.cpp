@@ -187,6 +187,7 @@ namespace webgpu {
     void setOffscreenTexture(void* texture, void* textureView);
     void beginDawnFrame();
     void endDawnFrame();
+    void processAsyncCompletions();
     void releaseReloadResources();
     void resetSessionBindings();
 }
@@ -430,10 +431,20 @@ public:
         std::cout << "[Mystral] Using JS engine: " << jsEngine_->getName() << std::endl;
 
         sharedBuffers_ = std::make_shared<workers::SharedBufferRegistry>();
+        workerRuntimeState_ = std::make_shared<workers::WorkerRuntimeState>();
+        workerRuntimeState_->maxDepth = config_.maxWorkerDepth;
+        workerRuntimeState_->maxWorkers = config_.maxWorkerThreads;
+        const uint32_t hardwareThreads = (std::max)(1u, std::thread::hardware_concurrency());
+        const uint32_t cpuThreads = config_.maxCpuThreads > 0
+            ? config_.maxCpuThreads
+            : (std::max)(1u, hardwareThreads - 1);
+        async::configureCpuBudget(cpuThreads);
+        workerRuntimeState_->maxParallelism = cpuThreads;
         workerRegistry_ = std::make_unique<workers::WorkerRegistry>(
             jsEngine_->getType(),
             std::filesystem::current_path().string(),
-            sharedBuffers_);
+            sharedBuffers_,
+            workerRuntimeState_);
 
         // Set up requestAnimationFrame
         setupAnimationFrame();
@@ -543,6 +554,10 @@ public:
         // Clean up audio resources FIRST before touching JS objects
         // (Audio callback thread may be accessing JS handles)
         audio::cleanupAudioBindings();
+
+        // Cancel and drain WebGPU/image async work while its JavaScript engine
+        // and the native device are both still alive.
+        webgpu::resetSessionBindings();
 
         fs::getAsyncFileReader().shutdown();
         async::getJobSystem().cancelGeneration(jsGeneration_);
@@ -1139,6 +1154,7 @@ public:
         if (paused_ && stepFramesRemaining_ == 0) {
             // Release native job results even while JavaScript callbacks are paused.
             async::getJobSystem().processCompletions();
+            webgpu::processAsyncCompletions();
             return running_;
         }
 
@@ -1181,6 +1197,10 @@ public:
         processPendingDracoCallbacks();
 
         processWorkerMessages();
+
+        // Dawn callbacks may run on internal threads. Their JavaScript Promise
+        // settlement is marshalled here so V8 is only touched by this thread.
+        webgpu::processAsyncCompletions();
 
         // Process microtask queue for promises
         processMicrotasks();
@@ -1285,6 +1305,10 @@ public:
         report.workersCreated = workerEnd.createdWorkers >= profilerWorkerStart_.createdWorkers
             ? workerEnd.createdWorkers - profilerWorkerStart_.createdWorkers
             : 0;
+        report.nestedWorkersCreated =
+            workerEnd.nestedCreatedWorkers >= profilerWorkerStart_.nestedCreatedWorkers
+                ? workerEnd.nestedCreatedWorkers - profilerWorkerStart_.nestedCreatedWorkers
+                : 0;
         report.workerMessagesProcessed = workerEnd.processedMessages >= profilerWorkerStart_.processedMessages
             ? workerEnd.processedMessages - profilerWorkerStart_.processedMessages
             : 0;
@@ -1321,6 +1345,7 @@ public:
         report.workerOutputQueuePeakBytes = workerEnd.peakQueuedOutputBytes;
         report.workerLargestInputMessageBytes = workerEnd.largestInputMessageBytes;
         report.workerLargestOutputMessageBytes = workerEnd.largestOutputMessageBytes;
+        report.workerMaxDepth = workerEnd.maxDepth;
         report.sharedMemoryStartBytes = profilerSharedMemoryStartBytes_;
         report.sharedMemoryEndBytes = sharedBuffers_ ? sharedBuffers_->allocatedBytes() : 0;
 
@@ -1335,6 +1360,10 @@ public:
         report.jobInFlightEnd = jobEnd.inFlight;
         report.jobInFlightPeak = jobEnd.inFlightHighWater;
         report.jobWorkerCount = jobEnd.workerCount;
+        const auto cpuBudget = async::cpuBudgetStats();
+        report.cpuBudgetThreads = cpuBudget.limit;
+        report.cpuBudgetActiveEnd = cpuBudget.active;
+        report.cpuBudgetPeakActive = cpuBudget.peakActive;
         const auto copyJobLatency = [](const async::JobLatencySummary& source) {
             RuntimeProfileStatistics result;
             result.minMs = source.minMs;
@@ -2009,7 +2038,13 @@ private:
                     : workers::WorkerRegistryStats{};
                 jsEngine_->setProperty(result, "workersActive", jsEngine_->newNumber(static_cast<double>(workerStats.activeWorkers)));
                 jsEngine_->setProperty(result, "workersCreated", jsEngine_->newNumber(static_cast<double>(workerStats.createdWorkers)));
+                jsEngine_->setProperty(result, "nestedWorkersCreated", jsEngine_->newNumber(static_cast<double>(workerStats.nestedCreatedWorkers)));
+                jsEngine_->setProperty(result, "workerMaxDepth", jsEngine_->newNumber(static_cast<double>(workerStats.maxDepth)));
                 jsEngine_->setProperty(result, "sharedMemoryBytes", jsEngine_->newNumber(static_cast<double>(sharedBuffers_ ? sharedBuffers_->allocatedBytes() : 0)));
+                const auto cpuBudget = async::cpuBudgetStats();
+                jsEngine_->setProperty(result, "cpuBudgetThreads", jsEngine_->newNumber(static_cast<double>(cpuBudget.limit)));
+                jsEngine_->setProperty(result, "cpuBudgetActive", jsEngine_->newNumber(static_cast<double>(cpuBudget.active)));
+                jsEngine_->setProperty(result, "cpuBudgetPeakActive", jsEngine_->newNumber(static_cast<double>(cpuBudget.peakActive)));
                 return result;
             })
         );
@@ -2583,6 +2618,11 @@ if (typeof TextEncoder === 'undefined') {
 // fetch cannot cancel an in-flight request, but it honors an aborted signal
 // by rejecting the fetch promise (see fetch() below).
 if (typeof AbortSignal === 'undefined') {
+    const makeAbortError = function (name, message) {
+        const error = new Error(message);
+        error.name = name;
+        return error;
+    };
     class AbortSignal {
         constructor() {
             this.aborted = false;
@@ -2609,12 +2649,16 @@ if (typeof AbortSignal === 'undefined') {
             return true;
         }
         throwIfAborted() {
-            if (this.aborted) throw (this.reason !== undefined ? this.reason : new Error('AbortError'));
+            if (this.aborted) throw (this.reason !== undefined
+                ? this.reason
+                : makeAbortError('AbortError', 'The operation was aborted'));
         }
         _fireAbort(reason) {
             if (this.aborted) return;
             this.aborted = true;
-            this.reason = (reason !== undefined ? reason : new Error('AbortError'));
+            this.reason = (reason !== undefined
+                ? reason
+                : makeAbortError('AbortError', 'The operation was aborted'));
             this.dispatchEvent({ type: 'abort', target: this });
         }
         static abort(reason) {
@@ -2624,7 +2668,9 @@ if (typeof AbortSignal === 'undefined') {
         }
         static timeout(ms) {
             const signal = new AbortSignal();
-            setTimeout(function () { signal._fireAbort(new Error('TimeoutError')); }, ms);
+            setTimeout(function () {
+                signal._fireAbort(makeAbortError('TimeoutError', 'The operation timed out'));
+            }, ms);
             return signal;
         }
         static any(signals) {
@@ -3235,94 +3281,9 @@ globalThis.Response = Response;
             std::cerr << "[Mystral] Failed to initialize shared memory API" << std::endl;
         }
 
-        jsEngine_->setGlobalProperty("__mystralWorkerCreate",
-            jsEngine_->newFunction("__mystralWorkerCreate",
-                [this](void*, const std::vector<js::JSValueHandle>& args) {
-                    if (!workerRegistry_ || args.size() < 2) {
-                        jsEngine_->throwException("Worker requires a script source");
-                        return jsEngine_->newNumber(-1);
-                    }
-                    auto kind = jsEngine_->toNumber(args[0]) == 0
-                        ? workers::WorkerSourceKind::Script
-                        : workers::WorkerSourceKind::Module;
-                    std::string source = jsEngine_->toString(args[1]);
-                    std::string name;
-                    if (args.size() > 2 && !jsEngine_->isUndefined(args[2])) {
-                        name = jsEngine_->toString(args[2]);
-                    }
-                    if (source.empty()) {
-                        jsEngine_->throwException("Worker script source is empty");
-                        return jsEngine_->newNumber(-1);
-                    }
-                    workers::WorkerQueueLimits queueLimits;
-                    const auto readLimit = [this, &args](
-                        size_t index, size_t& target, const char* option) {
-                        if (args.size() <= index || jsEngine_->isUndefined(args[index])) return true;
-                        constexpr double maxSafeInteger = 9'007'199'254'740'991.0;
-                        const double value = jsEngine_->toNumber(args[index]);
-                        if (!std::isfinite(value) || value < 1.0 || value > maxSafeInteger ||
-                            std::floor(value) != value) {
-                            const std::string message =
-                                std::string("Worker ") + option + " must be a positive safe integer";
-                            jsEngine_->throwException(message.c_str());
-                            return false;
-                        }
-                        target = static_cast<size_t>(value);
-                        return true;
-                    };
-                    if (!readLimit(3, queueLimits.maxMessages, "maxMessages") ||
-                        !readLimit(4, queueLimits.maxMessageBytes, "maxMessageBytes") ||
-                        !readLimit(5, queueLimits.maxQueuedBytes, "maxQueuedBytes")) {
-                        return jsEngine_->newNumber(-1);
-                    }
-                    if (queueLimits.maxMessageBytes > queueLimits.maxQueuedBytes) {
-                        jsEngine_->throwException(
-                            "Worker maxMessageBytes cannot exceed maxQueuedBytes");
-                        return jsEngine_->newNumber(-1);
-                    }
-                    return jsEngine_->newNumber(
-                        workerRegistry_->createWorker(kind, source, name, queueLimits));
-                }));
-
-        jsEngine_->setGlobalProperty("__mystralWorkerPostMessage",
-            jsEngine_->newFunction("__mystralWorkerPostMessage",
-                [this](void*, const std::vector<js::JSValueHandle>& args) {
-                    if (!workerRegistry_ || args.size() < 2) {
-                        return jsEngine_->newNumber(static_cast<int>(workers::WorkerPostStatus::NotFound));
-                    }
-                    int id = static_cast<int>(jsEngine_->toNumber(args[0]));
-                    std::vector<js::TransferredArrayBuffer> transfers;
-                    if (args.size() > 2 && !jsEngine_->isUndefined(args[2]) && !jsEngine_->isNull(args[2])) {
-                        if (!jsEngine_->isArray(args[2])) {
-                            return jsEngine_->newNumber(
-                                static_cast<int>(workers::WorkerPostStatus::InvalidTransfer));
-                        }
-                        const auto lengthValue = jsEngine_->getProperty(args[2], "length");
-                        const auto length = static_cast<uint32_t>(jsEngine_->toNumber(lengthValue));
-                        transfers.reserve(length);
-                        for (uint32_t index = 0; index < length; index++) {
-                            js::TransferredArrayBuffer transferred;
-                            if (!jsEngine_->transferArrayBuffer(
-                                    jsEngine_->getPropertyIndex(args[2], index), transferred)) {
-                                return jsEngine_->newNumber(
-                                    static_cast<int>(workers::WorkerPostStatus::InvalidTransfer));
-                            }
-                            transfers.push_back(std::move(transferred));
-                        }
-                    }
-                    return jsEngine_->newNumber(static_cast<int>(
-                        workerRegistry_->postToWorker(
-                            id, jsEngine_->toString(args[1]), std::move(transfers))));
-                }));
-
-        jsEngine_->setGlobalProperty("__mystralWorkerTerminate",
-            jsEngine_->newFunction("__mystralWorkerTerminate",
-                [this](void*, const std::vector<js::JSValueHandle>& args) {
-                    if (workerRegistry_ && !args.empty()) {
-                        workerRegistry_->terminateWorker(static_cast<int>(jsEngine_->toNumber(args[0])));
-                    }
-                    return jsEngine_->newUndefined();
-                }));
+        if (!workers::installWorkerRegistryBindings(jsEngine_.get(), workerRegistry_.get())) {
+            std::cerr << "[Mystral] Failed to initialize native Worker bindings" << std::endl;
+        }
 
         // URL and URLSearchParams polyfills plus the native Worker facade.
         const char* urlPolyfill = R"JS(
@@ -4242,47 +4203,11 @@ globalThis.__mystralNativeDecodeDracoAsync = function(buffer, attrs) {
 
     void processWorkerMessages() {
         if (!workerRegistry_ || !jsEngine_) return;
-
-        auto dispatch = jsEngine_->getGlobalProperty("__mystralDispatchWorkerMessage");
-        if (!jsEngine_->isFunction(dispatch)) return;
-
-        workerRegistry_->drainMessages(
-            [this, dispatch](int id, const workers::WorkerMessage& message) {
-                const char* type = "message";
-                if (message.type == workers::WorkerMessage::Type::Error) type = "error";
-                else if (message.type == workers::WorkerMessage::Type::Ready) type = "ready";
-                else if (message.type == workers::WorkerMessage::Type::Exited) type = "exit";
-
-                auto transfers = jsEngine_->newArray(message.transfers.size());
-                for (uint32_t index = 0; index < message.transfers.size(); index++) {
-                    auto transferredBuffer =
-                        jsEngine_->newTransferredArrayBuffer(message.transfers[index]);
-                    jsEngine_->setPropertyIndex(transfers, index, transferredBuffer);
-                    jsEngine_->releaseValue(transferredBuffer);
-                }
-
-                auto idValue = jsEngine_->newNumber(id);
-                auto typeValue = jsEngine_->newString(type);
-                auto payloadValue = jsEngine_->newString(message.payload.c_str());
-                auto thisArg = jsEngine_->newUndefined();
-                auto result = jsEngine_->call(dispatch, thisArg, {
-                    idValue,
-                    typeValue,
-                    payloadValue,
-                    transfers,
-                });
-                jsEngine_->releaseValue(result);
-                jsEngine_->releaseValue(thisArg);
-                jsEngine_->releaseValue(payloadValue);
-                jsEngine_->releaseValue(typeValue);
-                jsEngine_->releaseValue(idValue);
-                jsEngine_->releaseValue(transfers);
-                if (jsEngine_->hasException()) {
-                    std::cerr << "[Worker] Main-thread message handler failed: "
-                              << jsEngine_->getException() << std::endl;
-                }
-            });
-        jsEngine_->releaseValue(dispatch);
+        std::string error;
+        if (!workers::dispatchWorkerRegistryMessages(
+                jsEngine_.get(), workerRegistry_.get(), &error)) {
+            std::cerr << "[Worker] Main-thread message handler failed: " << error << std::endl;
+        }
     }
 
     void processMicrotasks() {
@@ -4310,6 +4235,7 @@ globalThis.__mystralNativeDecodeDracoAsync = function(buffer, attrs) {
     std::unique_ptr<js::Engine> jsEngine_;
     std::unique_ptr<js::ModuleSystem> moduleSystem_;
     std::shared_ptr<workers::SharedBufferRegistry> sharedBuffers_;
+    std::shared_ptr<workers::WorkerRuntimeState> workerRuntimeState_;
     std::unique_ptr<workers::WorkerRegistry> workerRegistry_;
     storage::LocalStorage localStorage_;
 

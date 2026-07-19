@@ -84,6 +84,11 @@ bool ModuleResolver::resolve(const std::string& specifier,
         out.format = ModuleFormat::ESM;
         return true;
     }
+    if (normalized == "mystral/native-tasks" || normalized == "mystral:native-tasks") {
+        out.resolved = {"mystral:native-tasks", true};
+        out.format = ModuleFormat::ESM;
+        return true;
+    }
     if (normalized == "mystral/agent" || normalized == "mystral:agent") {
         out.resolved = {"mystral:agent", true};
         out.format = ModuleFormat::ESM;
@@ -128,6 +133,11 @@ bool ModuleResolver::resolveResolvedPath(const std::string& resolvedPath,
     }
     if (normalized == "mystral:worker-pool") {
         out.resolved = {"mystral:worker-pool", true};
+        out.format = ModuleFormat::ESM;
+        return true;
+    }
+    if (normalized == "mystral:native-tasks") {
+        out.resolved = {"mystral:native-tasks", true};
         out.format = ModuleFormat::ESM;
         return true;
     }
@@ -595,6 +605,7 @@ bool ModuleResolver::readFile(const ResolvedPath& path, std::string& out, std::s
             "export const SharedBuffer = api.SharedBuffer;\n"
             "export const SharedTable = api.SharedTable;\n"
             "export const SharedQueue = api.SharedQueue;\n"
+            "export const SharedCommandBuffer = api.SharedCommandBuffer;\n"
             "export default api;\n";
         return true;
     }
@@ -603,9 +614,16 @@ bool ModuleResolver::readFile(const ResolvedPath& path, std::string& out, std::s
             "const api = globalThis.__mystralWorkerPool;\n"
             "if (!api) throw new Error('Mystral WorkerPool API is not initialized');\n"
             "export const WorkerPool = api.WorkerPool;\n"
-            "export const exposeWorkerTask = api.exposeWorkerTask;\n"
+            "export const exposeWorkerTasks = api.exposeWorkerTasks;\n"
             "export const transferResult = api.transferResult;\n"
-            "export const deterministicPartitions = api.deterministicPartitions;\n"
+            "export default api;\n";
+        return true;
+    }
+    if (path.path == "mystral:native-tasks") {
+        out =
+            "const api = globalThis.__mystralNativeTasks;\n"
+            "if (!api) throw new Error('Mystral native task API is not initialized');\n"
+            "export const runNativeTask = api.runNativeTask;\n"
             "export default api;\n";
         return true;
     }
