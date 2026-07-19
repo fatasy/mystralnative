@@ -6,7 +6,7 @@ Mystral Native.js implements standard Web APIs for graphics, audio, networking, 
 
 | API | Status | Notes |
 |-----|--------|-------|
-| WebGPU | Full | Core graphics API via Dawn or wgpu-native |
+| WebGPU | Full | Core graphics API via Dawn |
 | Canvas 2D | Full | Skia-based implementation |
 | Web Audio | Full | SDL3-based audio |
 | fetch | Full | HTTP/HTTPS and file:// protocols |
@@ -22,10 +22,61 @@ Mystral Native.js implements standard Web APIs for graphics, audio, networking, 
 | TextEncoder / TextDecoder | Full | UTF-8 encoding/decoding |
 | Gamepad | Full | Controller support |
 | requestAnimationFrame | Full | Frame timing |
+| Native game loop | Full | Fixed simulation timestep via `mystral/game-loop` |
 | setTimeout/setInterval | Full | Timing functions |
 | ES Modules | Full | import/export |
 | TypeScript | Full | Via SWC transpilation |
 | GLTF/GLB Loading | Full | Including Draco mesh compression |
+
+## Native Game Loop
+
+Use `mystral/game-loop` when simulation cadence must be independent from
+rendering cadence. The runtime owns the monotonic clock, fixed-step accumulator,
+pause, time scale, manual stepping, and bounded catch-up. Rendering continues to
+use `requestAnimationFrame`.
+
+```javascript
+import { gameLoop } from 'mystral/game-loop';
+
+gameLoop.configure({
+  simulationHz: 20,
+  maxCatchUpTicks: 4,
+  maxFrameDeltaMs: 250,
+});
+
+gameLoop.setTickHandler(({ tick, deltaSeconds }) => {
+  updateWorld(tick, deltaSeconds);
+});
+
+gameLoop.start();
+
+function render() {
+  const { interpolationAlpha } = gameLoop.getState();
+  renderInterpolatedWorld(interpolationAlpha);
+  requestAnimationFrame(render);
+}
+requestAnimationFrame(render);
+```
+
+The tick handler is deliberately synchronous: an authoritative tick must finish
+before the next tick starts. To run simulation in a `Worker`, synchronously send
+the tick command from the handler and consume shared snapshots or worker messages
+from rendering. Do not make the handler `async` or return a Promise; the runtime
+pauses the scheduler if that happens.
+
+`maxCatchUpTicks` bounds work after a slow frame. Excess accumulated time is
+discarded and reported as `ticksDropped`, while actual tick IDs remain contiguous.
+This prevents a catch-up spiral without pretending skipped game logic ran.
+
+```javascript
+gameLoop.setTimeScale(5); // five times normal simulation time
+gameLoop.pause();
+gameLoop.step(1);         // executes on the next native frame
+gameLoop.resume();
+
+console.log(gameLoop.getState());
+console.log(gameLoop.getStats());
+```
 
 ## Semantic Agent Adapters
 
@@ -70,7 +121,7 @@ returns a `dispose()` function that removes its registrations.
 
 ## WebGPU
 
-Full WebGPU API implementation via Dawn or wgpu-native.
+Full WebGPU API implementation via Dawn.
 
 ```javascript
 // Request adapter

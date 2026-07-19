@@ -8,7 +8,7 @@
 console.log("iOS GLTF Viewer starting...");
 
 // Skybox shader - renders the environment cube as background
-// Uses vertex buffer instead of array indexing (wgpu-native/naga limitation)
+// Uses a vertex buffer for broad shader compatibility.
 const skyboxShaderCode = /* wgsl */`
     struct SceneUniforms {
         viewMatrix: mat4x4f,

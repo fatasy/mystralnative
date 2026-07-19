@@ -17,7 +17,7 @@ namespace webgpu {
  * WebGPU Context
  *
  * Manages WebGPU initialization and provides access to the device/queue.
- * Works with both wgpu-native and Dawn backends (they share webgpu.h API).
+ * Uses Dawn through its webgpu.h C API.
  */
 class Context {
 public:

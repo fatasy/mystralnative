@@ -28,11 +28,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # macOS ARM64 - V8 + wgpu
-          - os: macos-15
-            arch: arm64
-            webgpu: wgpu
-            name: macOS-arm64-v8-wgpu
           # macOS ARM64 - V8 + Dawn
           - os: macos-15
             arch: arm64
@@ -74,12 +69,6 @@ jobs:
       - name: Configure CMake
         run: |
           CMAKE_ARGS="-B build -DCMAKE_BUILD_TYPE=Release -DMYSTRAL_BUILD_NATIVE_TESTS=ON"
-          # WebGPU backend
-          if [ "${{ matrix.webgpu }}" == "wgpu" ]; then
-            CMAKE_ARGS="$CMAKE_ARGS -DMYSTRAL_USE_WGPU=ON -DMYSTRAL_USE_DAWN=OFF"
-          elif [ "${{ matrix.webgpu }}" == "dawn" ]; then
-            CMAKE_ARGS="$CMAKE_ARGS -DMYSTRAL_USE_WGPU=OFF -DMYSTRAL_USE_DAWN=ON"
-          fi
           echo "Running: cmake $CMAKE_ARGS"
           cmake $CMAKE_ARGS
 
@@ -122,9 +111,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Linux x64 - V8 + wgpu
-          - webgpu: wgpu
-            name: linux-x64-v8-wgpu
           # Linux x64 - V8 + Dawn
           - webgpu: dawn
             name: linux-x64-v8-dawn
@@ -195,12 +181,6 @@ jobs:
       - name: Configure CMake
         run: |
           CMAKE_ARGS="-B build -DCMAKE_BUILD_TYPE=Release -DMYSTRAL_BUILD_NATIVE_TESTS=ON"
-          # WebGPU backend
-          if [ "${{ matrix.webgpu }}" == "wgpu" ]; then
-            CMAKE_ARGS="$CMAKE_ARGS -DMYSTRAL_USE_WGPU=ON -DMYSTRAL_USE_DAWN=OFF"
-          elif [ "${{ matrix.webgpu }}" == "dawn" ]; then
-            CMAKE_ARGS="$CMAKE_ARGS -DMYSTRAL_USE_WGPU=OFF -DMYSTRAL_USE_DAWN=ON"
-          fi
           echo "Running: cmake $CMAKE_ARGS"
           cmake $CMAKE_ARGS
 
@@ -221,89 +201,6 @@ jobs:
           # Include SDL3 shared library
           cp third_party/sdl3/installed/lib/libSDL3.so* artifacts/ || true
           cd artifacts && zip -r ../mystral-${{ matrix.name }}.zip .
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: mystral-${{ matrix.name }}
-          path: mystral-${{ matrix.name }}.zip
-
-  # =============================================================================
-  # Windows Builds - wgpu
-  # =============================================================================
-  build-windows-wgpu:
-    if: ${{ inputs.build_filter == 'all' || inputs.build_filter == 'windows-only' }}
-    runs-on: windows-2022
-    timeout-minutes: 10
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: windows-x64-v8-wgpu
-
-    name: Build - ${{ matrix.name }}
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-
-      - name: Cache dependencies
-        uses: actions/cache@v4
-        id: cache-deps
-        with:
-          path: third_party
-          key: deps-windows-x64-wgpu-v10-${{ hashFiles('scripts/download-deps.mjs') }}
-
-      - name: Download base dependencies
-        if: steps.cache-deps.outputs.cache-hit != 'true'
-        shell: bash
-        run: |
-          export PATH="/c/Program Files/7-Zip:$PATH"
-          node scripts/download-deps.mjs
-
-      - name: Install vcpkg dependencies
-        run: |
-          # Use static triplet for wgpu builds (/MT)
-          vcpkg install curl:x64-windows-static zlib:x64-windows-static
-          vcpkg integrate install
-
-      - name: Configure CMake
-        run: |
-          $CMAKE_ARGS = @("-B", "build", "-DCMAKE_BUILD_TYPE=Release", "-DMYSTRAL_BUILD_NATIVE_TESTS=ON")
-
-          # WebGPU backend - wgpu with static CRT (/MT)
-          $CMAKE_ARGS += "-DMYSTRAL_USE_WGPU=ON", "-DMYSTRAL_USE_DAWN=OFF"
-          $CMAKE_ARGS += "-DVCPKG_TARGET_TRIPLET=x64-windows-static"
-          $CMAKE_ARGS += "-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded"
-          $CMAKE_ARGS += "-DCMAKE_TOOLCHAIN_FILE=$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
-
-          Write-Host "Running: cmake $CMAKE_ARGS"
-          cmake @CMAKE_ARGS
-
-      - name: Build
-        run: cmake --build build --config Release
-
-      - name: Test CLI
-        shell: bash
-        run: ./build/Release/mystral.exe --version || echo "Build complete"
-
-      - name: Test native runtime smoke tests
-        run: ctest --test-dir build -C Release -R "mystral-.*-smoke" --output-on-failure
-
-      - name: Package artifacts
-        shell: bash
-        run: |
-          mkdir -p artifacts
-          cp build/Release/mystral.exe artifacts/ || cp build/mystral.exe artifacts/
-          cp build/Release/mystral-runtime.lib artifacts/ || cp build/mystral-runtime.lib artifacts/ || true
-          cp build/Release/*.dll artifacts/ 2>/dev/null || true
-          # Include SDL3 DLL
-          cp third_party/sdl3/bin/SDL3.dll artifacts/ || true
-          cd artifacts && 7z a ../mystral-${{ matrix.name }}.zip .
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -381,7 +278,7 @@ jobs:
 
       - name: Install vcpkg dependencies
         run: |
-          # Use static triplet for all Windows builds (both wgpu and Dawn use /MT now)
+          # Use the static triplet to match the Dawn/Skia build.
           vcpkg install curl:x64-windows-static zlib:x64-windows-static
           vcpkg integrate install
 
@@ -389,8 +286,6 @@ jobs:
         run: |
           $CMAKE_ARGS = @("-B", "build", "-DCMAKE_BUILD_TYPE=Release", "-DMYSTRAL_BUILD_NATIVE_TESTS=ON")
 
-          # WebGPU backend - Dawn with static CRT (/MT)
-          $CMAKE_ARGS += "-DMYSTRAL_USE_WGPU=OFF", "-DMYSTRAL_USE_DAWN=ON"
           $CMAKE_ARGS += "-DVCPKG_TARGET_TRIPLET=x64-windows-static"
           $CMAKE_ARGS += "-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded"
           $CMAKE_ARGS += "-DCMAKE_TOOLCHAIN_FILE=$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
@@ -431,7 +326,7 @@ jobs:
   summary:
     name: Build Summary
     runs-on: ubuntu-latest
-    needs: [build-macos, build-linux, build-windows-wgpu, build-windows-dawn]
+    needs: [build-macos, build-linux, build-windows-dawn]
     if: always()
 
     steps:
@@ -449,11 +344,8 @@ jobs:
 
           # Check each expected artifact
           for config in \
-            "macOS-arm64-v8-wgpu" \
             "macOS-arm64-v8-dawn" \
-            "linux-x64-v8-wgpu" \
             "linux-x64-v8-dawn" \
-            "windows-x64-v8-wgpu" \
             "windows-x64-v8-dawn"
           do
             # Parse config name

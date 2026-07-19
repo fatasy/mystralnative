@@ -1408,6 +1408,8 @@ static std::string makeBenchmarkJson(
     appendProfileStatisticsJson(out, report.asyncWork);
     out << ",\"callbacks\":";
     appendProfileStatisticsJson(out, report.callbacks);
+    out << ",\"simulation\":";
+    appendProfileStatisticsJson(out, report.simulation);
     out << ",\"animationFrame\":";
     appendProfileStatisticsJson(out, report.animationFrame);
     out << ",\"cleanup\":";
@@ -1416,6 +1418,13 @@ static std::string makeBenchmarkJson(
         << "\"8.33ms\":" << report.framesOver8_33Ms
         << ",\"16.67ms\":" << report.framesOver16_67Ms
         << ",\"33.33ms\":" << report.framesOver33_33Ms
+        << "},\"gameLoop\":{"
+        << "\"ticksExecuted\":" << report.gameTicksExecuted
+        << ",\"ticksDropped\":" << report.gameTicksDropped
+        << ",\"catchUpFrames\":" << report.gameCatchUpFrames
+        << ",\"clockClampFrames\":" << report.gameClockClampFrames
+        << ",\"handlerFailures\":" << report.gameTickHandlerFailures
+        << ",\"maxTicksPerFrame\":" << report.gameMaxTicksPerFrame
         << "},\"workers\":{"
         << "\"created\":" << report.workersCreated
         << ",\"nestedCreated\":" << report.nestedWorkersCreated
@@ -1502,6 +1511,7 @@ static void printBenchmarkSummary(
     printPhase("events", report.events);
     printPhase("async", report.asyncWork);
     printPhase("callbacks", report.callbacks);
+    printPhase("simulation", report.simulation);
     printPhase("animationFrame", report.animationFrame);
     printPhase("cleanup", report.cleanup);
     printPhase("jobQueueWait", report.jobQueueWait);
@@ -1511,6 +1521,12 @@ static void printBenchmarkSummary(
               << " >16.67ms=" << report.framesOver16_67Ms
               << " >33.33ms=" << report.framesOver33_33Ms << "\n"
               << "Throughput: " << std::fixed << std::setprecision(1) << throughputFps << " frames/s\n"
+              << "Game loop: ticks=" << report.gameTicksExecuted
+              << " dropped=" << report.gameTicksDropped
+              << " catchUpFrames=" << report.gameCatchUpFrames
+              << " clockClamps=" << report.gameClockClampFrames
+              << " failures=" << report.gameTickHandlerFailures
+              << " maxTicks/frame=" << report.gameMaxTicksPerFrame << "\n"
               << "Workers: created=" << report.workersCreated
               << " nested=" << report.nestedWorkersCreated
               << " depth=" << report.workerMaxDepth

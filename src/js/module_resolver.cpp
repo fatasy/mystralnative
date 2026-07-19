@@ -89,6 +89,11 @@ bool ModuleResolver::resolve(const std::string& specifier,
         out.format = ModuleFormat::ESM;
         return true;
     }
+    if (normalized == "mystral/game-loop" || normalized == "mystral:game-loop") {
+        out.resolved = {"mystral:game-loop", true};
+        out.format = ModuleFormat::ESM;
+        return true;
+    }
     if (normalized == "mystral/agent" || normalized == "mystral:agent") {
         out.resolved = {"mystral:agent", true};
         out.format = ModuleFormat::ESM;
@@ -138,6 +143,11 @@ bool ModuleResolver::resolveResolvedPath(const std::string& resolvedPath,
     }
     if (normalized == "mystral:native-tasks") {
         out.resolved = {"mystral:native-tasks", true};
+        out.format = ModuleFormat::ESM;
+        return true;
+    }
+    if (normalized == "mystral:game-loop") {
+        out.resolved = {"mystral:game-loop", true};
         out.format = ModuleFormat::ESM;
         return true;
     }
@@ -625,6 +635,14 @@ bool ModuleResolver::readFile(const ResolvedPath& path, std::string& out, std::s
             "if (!api) throw new Error('Mystral native task API is not initialized');\n"
             "export const runNativeTask = api.runNativeTask;\n"
             "export default api;\n";
+        return true;
+    }
+    if (path.path == "mystral:game-loop") {
+        out =
+            "const gameLoop = globalThis.__mystralGameLoop;\n"
+            "if (!gameLoop) throw new Error('Mystral game loop API is not initialized');\n"
+            "export { gameLoop };\n"
+            "export default gameLoop;\n";
         return true;
     }
     if (path.path == "mystral:agent") {

@@ -504,8 +504,6 @@ Recommended V8 + Dawn build:
 
 ```bash
 cmake -B build \
-  -DMYSTRAL_USE_DAWN=ON \
-  -DMYSTRAL_USE_WGPU=OFF \
   -DMYSTRAL_BUILD_NATIVE_TESTS=ON
 cmake --build build --parallel
 ctest --test-dir build -R mystral-worker-shared-smoke --output-on-failure

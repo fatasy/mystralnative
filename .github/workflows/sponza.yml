@@ -61,9 +61,7 @@ jobs:
 
       - name: Configure CMake (V8 + Dawn)
         run: |
-          cmake -B build -DCMAKE_BUILD_TYPE=Release \
-            -DMYSTRAL_USE_DAWN=ON \
-            -DMYSTRAL_USE_WGPU=OFF
+          cmake -B build -DCMAKE_BUILD_TYPE=Release
 
       - name: Build
         run: cmake --build build --config Release -j$(sysctl -n hw.ncpu)
@@ -232,9 +230,7 @@ jobs:
 
       - name: Configure CMake (V8 + Dawn)
         run: |
-          cmake -B build -DCMAKE_BUILD_TYPE=Release \
-            -DMYSTRAL_USE_DAWN=ON \
-            -DMYSTRAL_USE_WGPU=OFF
+          cmake -B build -DCMAKE_BUILD_TYPE=Release
 
       - name: Build
         run: cmake --build build --config Release -j$(nproc)
@@ -323,8 +319,6 @@ jobs:
           $CMAKE_ARGS = @(
             "-B", "build",
             "-DCMAKE_BUILD_TYPE=Release",
-            "-DMYSTRAL_USE_DAWN=ON",
-            "-DMYSTRAL_USE_WGPU=OFF",
             "-DVCPKG_TARGET_TRIPLET=x64-windows-static",
             "-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded",
             "-DCMAKE_TOOLCHAIN_FILE=$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"

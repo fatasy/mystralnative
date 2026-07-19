@@ -79,10 +79,8 @@ curl -fsSL https://bun.sh/install | bash
 bun install
 bun run deps:download
 
-# Configure with V8 + Dawn (recommended)
-cmake -B build \
-  -DMYSTRAL_USE_DAWN=ON \
-  -DMYSTRAL_USE_WGPU=OFF
+# Configure with V8 + Dawn
+cmake -B build
 
 # Build
 cmake --build build --parallel
@@ -275,8 +273,8 @@ Compile Options:
         │                │           │        │
         ▼                ▼           ▼        ▼
    ┌─────────┐    ┌───────────┐  ┌─────┐  ┌──────┐  ┌───────┐
-   │   V8    │    │   Dawn/   │  │SDL3 │  │libcurl│  │ libuv │
-   │         │    │ wgpu-native│  │     │  │      │  │       │
+   │   V8    │    │   Dawn    │  │SDL3 │  │libcurl│  │ libuv │
+   │         │    │           │  │     │  │      │  │       │
    └─────────┘    └───────────┘  └─────┘  └──────┘  └───────┘
 ```
 
@@ -303,25 +301,17 @@ Compile Options:
 
 | Platform | JS Engine | WebGPU Backend |
 |----------|-----------|----------------|
-| macOS (arm64) | V8 | Dawn, wgpu-native |
-| Windows | V8 | Dawn, wgpu-native |
-| Linux | V8 | Dawn, wgpu-native |
+| macOS (arm64) | V8 | Dawn |
+| Windows | V8 | Dawn |
+| Linux | V8 | Dawn |
 
 macOS Intel, iOS, and Android are not currently supported by the V8-only runtime.
 
 ## Build Options
 
-**Recommended for development (full shader compatibility):**
+**Development build:**
 ```bash
-cmake -B build \
-  -DMYSTRAL_USE_DAWN=ON \
-  -DMYSTRAL_USE_WGPU=OFF
-```
-
-Choose your WebGPU backend:
-```bash
-cmake -B build -DMYSTRAL_USE_DAWN=ON     # Recommended — Chrome's implementation
-cmake -B build -DMYSTRAL_USE_WGPU=ON     # Rust WebGPU implementation
+cmake -B build
 ```
 
 ## Embedding in Your App
@@ -352,7 +342,7 @@ All dependencies are downloaded automatically as prebuilt binaries:
 
 | Dependency | Purpose |
 |------------|---------|
-| Dawn / wgpu-native | WebGPU implementation |
+| Dawn | WebGPU implementation |
 | SDL3 | Windowing, input, audio |
 | V8 | JavaScript engine |
 | Skia | Canvas 2D rendering |

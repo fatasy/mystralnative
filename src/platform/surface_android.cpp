@@ -1,7 +1,7 @@
 /**
  * Android Surface Creation (Vulkan via ANativeWindow)
  *
- * On Android, wgpu-native/Dawn creates Vulkan surfaces from ANativeWindow
+ * On Android, Dawn creates Vulkan surfaces from ANativeWindow
  * handles obtained through SDL3's Android backend.
  */
 

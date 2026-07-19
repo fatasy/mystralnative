@@ -240,6 +240,25 @@ The Promise continuations still run on the main JavaScript isolate. Only native
 decode/compile/wait work runs concurrently; JavaScript game-state mutation must
 still use Workers or `WorkerPool` when it needs parallel CPU execution.
 
+### Fixed simulation timing
+
+For game logic, prefer the native fixed-step scheduler over deriving simulation
+time directly from `requestAnimationFrame`:
+
+```javascript
+import { gameLoop } from 'mystral/game-loop';
+
+gameLoop.configure({ simulationHz: 20, maxCatchUpTicks: 4 });
+gameLoop.setTickHandler((tick) => simulate(tick.deltaSeconds));
+gameLoop.start();
+```
+
+The CLI profiler reports the scheduler as a separate `simulation` phase and adds
+`gameLoop` counters for executed/dropped ticks, catch-up frames, clock clamps,
+handler failures, and the maximum ticks executed in one rendered frame. A rising
+`ticksDropped` value means the configured simulation workload cannot keep pace
+with the requested tick rate or time scale.
+
 ### Frame Time
 
 Log frame timing to identify bottlenecks:

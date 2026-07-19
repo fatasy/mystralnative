@@ -9,27 +9,11 @@
 #include <thread>
 #include <vector>
 
-#if defined(MYSTRAL_WEBGPU_WGPU) || defined(MYSTRAL_WEBGPU_DAWN)
 #include "webgpu/webgpu.h"
 #include "mystral/webgpu_compat.h"
-#endif
 
 extern "C" int stbi_write_png(
     const char* filename, int w, int h, int comp, const void* data, int stride_in_bytes);
-
-#if defined(MYSTRAL_WEBGPU_WGPU)
-extern "C" {
-typedef struct WGPUWrappedSubmissionIndex {
-    WGPUQueue queue;
-    uint64_t submissionIndex;
-} WGPUWrappedSubmissionIndex;
-
-WGPUBool wgpuDevicePoll(
-    WGPUDevice device,
-    WGPUBool wait,
-    WGPUWrappedSubmissionIndex const* wrappedSubmissionIndex);
-}
-#endif
 
 namespace mystral {
 namespace webgpu {
@@ -43,21 +27,11 @@ struct BufferMapData {
     uint8_t _pad2[12] = {}; // Extra padding to absorb any overwrites
 };
 
-#if WGPU_BUFFER_MAP_USES_CALLBACK_INFO
-// Dawn buffer map callback
 static void onBufferMapped(WGPUMapAsyncStatus status, WGPUStringView message, void* userdata1, void* userdata2) {
     auto* data = static_cast<BufferMapData*>(userdata1);
     data->status = status;
     data->completed = true;
 }
-#else
-// wgpu-native buffer map callback
-static void onBufferMapped(WGPUBufferMapAsyncStatus status, void* userdata) {
-    auto* data = static_cast<BufferMapData*>(userdata);
-    data->status = status;
-    data->completed = true;
-}
-#endif
 
 // Forward declarations for bindings.cpp functions
 void* getCurrentRenderedTexture();
@@ -96,27 +70,14 @@ bool Context::saveScreenshot(const char* filename) {
     // Map the screenshot buffer (it was already populated during submit)
     BufferMapData mapData;
 
-#if WGPU_BUFFER_MAP_USES_CALLBACK_INFO
-    // Dawn uses CallbackInfo struct with required callback mode
     WGPUBufferMapCallbackInfo mapCallbackInfo = {};
     mapCallbackInfo.mode = WGPUCallbackMode_AllowProcessEvents;
     mapCallbackInfo.callback = onBufferMapped;
     mapCallbackInfo.userdata1 = &mapData;
     mapCallbackInfo.userdata2 = nullptr;
     wgpuBufferMapAsync(screenshotBuffer, WGPUMapMode_Read, 0, bufferSize, mapCallbackInfo);
-#else
-    // wgpu-native uses separate callback and userdata
-    wgpuBufferMapAsync(screenshotBuffer, WGPUMapMode_Read, 0, bufferSize, onBufferMapped, &mapData);
-#endif
 
-    // Use wgpuDevicePoll/Tick to wait for the buffer mapping to complete
-#if defined(MYSTRAL_WEBGPU_WGPU)
-    int maxIterations = 100;
-    while (!mapData.completed && maxIterations-- > 0) {
-        wgpuDevicePoll(device_, true, nullptr);
-    }
-#else
-    // Dawn: Use device tick and instance process events
+    // Use Dawn event processing to wait for the buffer mapping to complete.
     int maxIterations = 5000;
     while (!mapData.completed && maxIterations-- > 0) {
         wgpuDeviceTick(device_);
@@ -125,7 +86,6 @@ bool Context::saveScreenshot(const char* filename) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
     }
-#endif
 
     if (!mapData.completed) {
         std::cerr << "[Screenshot] Buffer mapping timed out" << std::endl;
@@ -215,23 +175,13 @@ bool Context::captureFrame(std::vector<uint8_t>& outData, uint32_t& outWidth, ui
     // Map the screenshot buffer
     BufferMapData mapData;
 
-#if WGPU_BUFFER_MAP_USES_CALLBACK_INFO
     WGPUBufferMapCallbackInfo mapCallbackInfo = {};
     mapCallbackInfo.mode = WGPUCallbackMode_AllowProcessEvents;
     mapCallbackInfo.callback = onBufferMapped;
     mapCallbackInfo.userdata1 = &mapData;
     mapCallbackInfo.userdata2 = nullptr;
     wgpuBufferMapAsync(screenshotBuffer, WGPUMapMode_Read, 0, bufferSize, mapCallbackInfo);
-#else
-    wgpuBufferMapAsync(screenshotBuffer, WGPUMapMode_Read, 0, bufferSize, onBufferMapped, &mapData);
-#endif
 
-#if defined(MYSTRAL_WEBGPU_WGPU)
-    int maxIterations = 100;
-    while (!mapData.completed && maxIterations-- > 0) {
-        wgpuDevicePoll(device_, true, nullptr);
-    }
-#else
     int maxIterations = 5000;
     while (!mapData.completed && maxIterations-- > 0) {
         wgpuDeviceTick(device_);
@@ -240,7 +190,6 @@ bool Context::captureFrame(std::vector<uint8_t>& outData, uint32_t& outWidth, ui
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
     }
-#endif
 
     if (!mapData.completed || mapData.status != WGPUBufferMapAsyncStatus_Success_Compat) {
         return false;

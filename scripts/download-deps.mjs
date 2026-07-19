@@ -8,13 +8,12 @@
  *   node scripts/download-deps.mjs --ios        # Download iOS deps (macOS only)
  *   node scripts/download-deps.mjs --android    # Download Android deps
  *   node scripts/download-deps.mjs --all        # Download everything (desktop + iOS + Android)
- *   node scripts/download-deps.mjs --only wgpu  # Download only wgpu-native
  *   node scripts/download-deps.mjs --only skia-ios  # Download only iOS Skia
  *   node scripts/download-deps.mjs --force      # Re-download even if exists
  *
- * Desktop deps: wgpu, sdl3, dawn, v8, stb, cgltf, webp, skia, swc
- * iOS deps: wgpu-ios, skia-ios (for cross-compilation from macOS)
- * Android deps: wgpu-android, sdl3-android
+ * Desktop deps: sdl3, dawn, v8, stb, cgltf, webp, skia, swc
+ * iOS deps: skia-ios (for cross-compilation from macOS)
+ * Android deps: sdl3-android
  */
 
 import { execSync } from 'child_process';
@@ -49,36 +48,6 @@ console.log(`Platform: ${platformName}-${archName}`);
 
 // Dependency versions and URLs
 const DEPS = {
-  wgpu: {
-    version: 'v22.1.0.5',
-    getUrl: () => {
-      // wgpu-native releases: https://github.com/gfx-rs/wgpu-native/releases
-      // Windows releases include toolchain suffix: wgpu-windows-x86_64-msvc-release.zip
-      const platform = platformName === 'macos' ? 'macos' : platformName;
-      const arch = archName;
-      if (platformName === 'windows') {
-        return `https://github.com/gfx-rs/wgpu-native/releases/download/${DEPS.wgpu.version}/wgpu-${platform}-${arch}-msvc-release.zip`;
-      }
-      return `https://github.com/gfx-rs/wgpu-native/releases/download/${DEPS.wgpu.version}/wgpu-${platform}-${arch}-release.zip`;
-    },
-    extractTo: 'wgpu',
-  },
-  'wgpu-ios': {
-    // wgpu-native iOS builds for cross-compilation from macOS
-    // Downloads both device (arm64) and simulator (arm64 + x86_64) builds
-    version: 'v22.1.0.5',
-    getUrl: () => {
-      // This is a special multi-file download - handled separately
-      return null;
-    },
-    extractTo: 'wgpu-ios',
-    // Individual archive URLs for iOS
-    archives: {
-      device: `https://github.com/gfx-rs/wgpu-native/releases/download/v22.1.0.5/wgpu-ios-aarch64-release.zip`,
-      simulatorArm64: `https://github.com/gfx-rs/wgpu-native/releases/download/v22.1.0.5/wgpu-ios-aarch64-simulator-release.zip`,
-      simulatorX64: `https://github.com/gfx-rs/wgpu-native/releases/download/v22.1.0.5/wgpu-ios-x86_64-simulator-release.zip`,
-    },
-  },
   sdl3: {
     // SDL3 source - we build it statically for all platforms to get a single binary
     version: '3.2.8',
@@ -398,20 +367,6 @@ const DEPS = {
   // ============================================================================
   // Android Dependencies
   // ============================================================================
-  'wgpu-android': {
-    // wgpu-native Android builds for cross-compilation
-    // Downloads aarch64 (ARM64) and x86_64 (emulator) builds
-    version: 'v22.1.0.5',
-    getUrl: () => {
-      // Multi-file download - handled separately
-      return null;
-    },
-    extractTo: 'wgpu-android',
-    archives: {
-      aarch64: `https://github.com/gfx-rs/wgpu-native/releases/download/v22.1.0.5/wgpu-android-aarch64-release.zip`,
-      x86_64: `https://github.com/gfx-rs/wgpu-native/releases/download/v22.1.0.5/wgpu-android-x86_64-release.zip`,
-    },
-  },
   'sdl3-android': {
     // SDL3 Android development package
     // Contains AAR with prefab structure for CMake integration
@@ -722,13 +677,13 @@ async function main() {
   const onlyIndex = args.indexOf('--only');
 
   // Desktop deps (downloaded by default)
-  const desktopDeps = ['wgpu', 'sdl3', 'dawn', 'v8', 'stb', 'cgltf', 'webp', 'skia', 'swc', 'libuv', 'draco', 'quiche'];
+  const desktopDeps = ['sdl3', 'dawn', 'v8', 'stb', 'cgltf', 'webp', 'skia', 'swc', 'libuv', 'draco', 'quiche'];
 
   // iOS deps (only downloaded with --only or --ios)
-  const iosDeps = ['wgpu-ios', 'skia-ios', 'quiche-ios'];
+  const iosDeps = ['skia-ios', 'quiche-ios'];
 
   // Android deps (only downloaded with --only or --android)
-  const androidDeps = ['wgpu-android', 'sdl3-android', 'quiche-android'];
+  const androidDeps = ['sdl3-android', 'quiche-android'];
 
   // Windows-specific deps (only downloaded with --only)
   // skia-win-static: Static Skia+Dawn build from library-builder with /MT

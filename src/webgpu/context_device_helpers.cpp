@@ -14,8 +14,6 @@ namespace mystral {
 namespace webgpu {
 namespace detail {
 
-#if defined(MYSTRAL_WEBGPU_DAWN)
-
 namespace {
 
 struct DawnDiskCache {
@@ -114,10 +112,6 @@ void attachDawnCache(WGPUDeviceDescriptor& deviceDesc,
     deviceDesc.nextInChain = &cacheDesc.chain;
 }
 
-#endif
-
-// Callbacks - different signatures for Dawn vs wgpu-native
-#if WGPU_USES_CALLBACK_INFO_PATTERN
 // Dawn callback signatures
 void onAdapterRequestEnded(WGPURequestAdapterStatus status, WGPUAdapter adapter, WGPUStringView message, void* userdata1, void* userdata2) {
     auto* data = static_cast<AdapterRequestData*>(userdata1);
@@ -154,46 +148,6 @@ void onDeviceError(WGPUDevice const* device, WGPUErrorType type, WGPUStringView 
     }
     std::cerr << "[WebGPU] Device error (" << typeStr << "): " << WGPU_PRINT_STRING_VIEW(message) << std::endl;
 }
-#else
-// wgpu-native callback signatures
-void onAdapterRequestEnded(WGPURequestAdapterStatus status, WGPUAdapter adapter, char const* message, void* userdata) {
-    auto* data = static_cast<AdapterRequestData*>(userdata);
-    if (status == WGPURequestAdapterStatus_Success) {
-        data->adapter = adapter;
-        std::cout << "[WebGPU] Adapter acquired successfully" << std::endl;
-    } else {
-        std::cerr << "[WebGPU] Failed to request adapter: " << (message ? message : "unknown error") << std::endl;
-    }
-    data->completed = true;
-}
-
-void onDeviceRequestEnded(WGPURequestDeviceStatus status, WGPUDevice device, char const* message, void* userdata) {
-    auto* data = static_cast<DeviceRequestData*>(userdata);
-    if (status == WGPURequestDeviceStatus_Success) {
-        data->device = device;
-        std::cout << "[WebGPU] Device acquired successfully" << std::endl;
-    } else {
-        std::cerr << "[WebGPU] Failed to request device: " << (message ? message : "unknown error") << std::endl;
-    }
-    data->completed = true;
-}
-
-void onDeviceError(WGPUErrorType type, char const* message, void* userdata) {
-    const char* typeStr = "Unknown";
-    switch (type) {
-        case WGPUErrorType_NoError: typeStr = "NoError"; break;
-        case WGPUErrorType_Validation: typeStr = "Validation"; break;
-        case WGPUErrorType_OutOfMemory: typeStr = "OutOfMemory"; break;
-        case WGPUErrorType_Internal: typeStr = "Internal"; break;
-        case WGPUErrorType_Unknown: typeStr = "Unknown"; break;
-        case WGPUErrorType_DeviceLost_Compat: typeStr = "DeviceLost"; break;
-        default: break;
-    }
-    std::cerr << "[WebGPU] Device error (" << typeStr << "): " << (message ? message : "no message") << std::endl;
-}
-#endif
-
-#if defined(MYSTRAL_WEBGPU_WGPU) || defined(MYSTRAL_WEBGPU_DAWN)
 /**
  * Enumerate every feature the adapter exposes so the device can be created
  * with all of them — matching what a browser page can opt into (three.js,
@@ -204,22 +158,13 @@ void onDeviceError(WGPUErrorType type, char const* message, void* userdata) {
  */
 std::vector<WGPUFeatureName> enumerateAdapterFeatures(WGPUAdapter adapter) {
     std::vector<WGPUFeatureName> features;
-#if defined(MYSTRAL_WEBGPU_DAWN)
     WGPUSupportedFeatures supported = {};
     wgpuAdapterGetFeatures(adapter, &supported);
     features.assign(supported.features, supported.features + supported.featureCount);
     wgpuSupportedFeaturesFreeMembers(supported);
-#else
-    size_t count = wgpuAdapterEnumerateFeatures(adapter, nullptr);
-    features.resize(count);
-    if (count > 0) {
-        wgpuAdapterEnumerateFeatures(adapter, features.data());
-    }
-#endif
     std::cout << "[WebGPU] Requesting " << features.size() << " adapter features" << std::endl;
     return features;
 }
-#endif
 
 }  // namespace detail
 }  // namespace webgpu

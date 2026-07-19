@@ -1,3 +1,59 @@
+declare module 'mystral/game-loop' {
+    export interface GameLoopOptions {
+        simulationHz?: number;
+        maxCatchUpTicks?: number;
+        maxFrameDeltaMs?: number;
+    }
+
+    export interface GameTick {
+        readonly tick: number;
+        readonly deltaMs: number;
+        readonly deltaSeconds: number;
+        readonly simulationTimeMs: number;
+    }
+
+    export interface GameLoopState {
+        readonly running: boolean;
+        readonly paused: boolean;
+        readonly tickCount: number;
+        readonly simulationTimeMs: number;
+        readonly interpolationAlpha: number;
+        readonly timeScale: number;
+        readonly pendingStepTicks: number;
+        readonly simulationHz: number;
+        readonly tickDeltaMs: number;
+        readonly maxCatchUpTicks: number;
+        readonly maxFrameDeltaMs: number;
+    }
+
+    export interface GameLoopStats {
+        readonly ticksExecuted: number;
+        readonly ticksDropped: number;
+        readonly catchUpFrames: number;
+        readonly clockClampFrames: number;
+        readonly handlerFailures: number;
+        readonly maxTicksPerFrame: number;
+    }
+
+    export type GameTickHandler = (tick: Readonly<GameTick>) => void;
+
+    export interface GameLoop {
+        configure(options?: GameLoopOptions): void;
+        setTickHandler(handler: GameTickHandler | null): void;
+        start(): void;
+        stop(): void;
+        pause(): void;
+        resume(): void;
+        step(count?: number): void;
+        setTimeScale(scale: number): void;
+        getState(): Readonly<GameLoopState>;
+        getStats(): Readonly<GameLoopStats>;
+    }
+
+    export const gameLoop: GameLoop;
+    export default gameLoop;
+}
+
 declare module 'mystral/worker-pool' {
     export type WorkerPoolSchedule = 'static' | 'dynamic';
     export type WorkerPoolBuiltInReducer = 'sum' | 'count' | 'min' | 'max';

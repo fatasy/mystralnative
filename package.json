@@ -11,7 +11,6 @@
   },
   "scripts": {
     "deps:download": "node scripts/download-deps.mjs",
-    "deps:download:wgpu": "node scripts/download-deps.mjs --only wgpu",
     "deps:download:sdl3": "node scripts/download-deps.mjs --only sdl3",
     "deps:download:dawn": "node scripts/download-deps.mjs --only dawn",
     "deps:download:v8": "node scripts/download-deps.mjs --only v8",

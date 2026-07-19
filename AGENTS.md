@@ -38,7 +38,7 @@ scene.addChild(model);
 
 ```bash
 # V8 + Dawn (recommended)
-cmake -B build -DMYSTRAL_USE_DAWN=ON -DMYSTRAL_USE_WGPU=OFF
+cmake -B build
 cmake --build build --parallel
 ```
 
@@ -46,7 +46,7 @@ cmake --build build --parallel
 
 1. **Draco compression** - Not supported. Use uncompressed GLTF/GLB files.
 2. **V8 Heap OOM** - Complex scenes may crash after ~1 minute. Increase heap size.
-3. **wgpu-native shaders** - Some WGSL features only work with Dawn builds.
+3. **Dawn shaders** - Keep the pinned Dawn version aligned across platforms.
 
 See `tasks/mystralnativeprelaunch.md` for full issue list.
 

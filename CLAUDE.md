@@ -79,9 +79,7 @@ The project uses CMake with several options:
 
 ```bash
 # Recommended: V8 + Dawn for full shader compatibility
-cmake -B build \
-  -DMYSTRAL_USE_DAWN=ON \
-  -DMYSTRAL_USE_WGPU=OFF
+cmake -B build
 
 cmake --build build --parallel
 ```

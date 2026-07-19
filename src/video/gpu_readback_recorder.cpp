@@ -9,10 +9,7 @@
  * - Encodes frames to WebP animation using libwebp
  * - Optionally converts to MP4 using FFmpeg
  *
- * NOTE: This implementation currently requires Dawn WebGPU backend due to use of
- * Dawn-specific APIs (WGPUBufferMapCallbackInfo, WGPUCallbackMode_AllowSpontaneous).
- * For wgpu-native builds, this returns nullptr and falls back to ScreenCaptureKit
- * on macOS or disables recording on other platforms.
+ * NOTE: This implementation uses Dawn callback APIs and requires WebP mux support.
  */
 
 #include "mystral/video/video_recorder.h"
@@ -711,8 +708,7 @@ std::unique_ptr<VideoRecorder> createGPUReadbackRecorder(
 
 #else  // !MYSTRAL_GPU_READBACK_RECORDER_AVAILABLE
 
-// Stub implementation for wgpu-native builds (doesn't have Dawn-specific callback APIs)
-// Falls back to ScreenCaptureKit on macOS or disables recording on other platforms
+// Stub implementation used when WebP mux support is unavailable.
 namespace mystral {
 namespace video {
 

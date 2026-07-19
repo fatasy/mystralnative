@@ -105,7 +105,6 @@ if [ "$SKIP_BUILD" = false ]; then
         exit 1
     fi
     if [ -d "third_party/dawn" ]; then
-        CMAKE_EXTRA_ARGS="$CMAKE_EXTRA_ARGS -DMYSTRAL_USE_DAWN=ON -DMYSTRAL_USE_WGPU=OFF"
         echo "  Dawn: ON"
     fi
     if [ -d "third_party/draco" ]; then

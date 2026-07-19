@@ -32,7 +32,7 @@ curl -L -o mystral.zip https://github.com/mystralengine/mystralnative/releases/l
 
 # Extract
 unzip mystral.zip
-cd mystral-linux-x64-v8-wgpu
+cd mystral-linux-x64-v8-dawn
 
 # Make executable
 chmod +x mystral
@@ -127,7 +127,6 @@ bun run build
 | JS Engine | WebGPU Backend | Notes |
 |-----------|----------------|-------|
 | V8 | Dawn | Recommended, Vulkan backend |
-| V8 | wgpu-native | Alternative Vulkan backend |
 
 ## GPU Drivers
 

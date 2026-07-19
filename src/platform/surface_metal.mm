@@ -17,7 +17,7 @@ namespace platform {
 /**
  * Get the CAMetalLayer from an SDL Metal view
  *
- * This is needed because wgpu-native's WGPUSurfaceDescriptorFromMetalLayer
+ * This is needed because Dawn's WGPUSurfaceSourceMetalLayer
  * requires a CAMetalLayer*, not an SDL_MetalView.
  *
  * @param metalView SDL_MetalView from SDL_Metal_CreateView

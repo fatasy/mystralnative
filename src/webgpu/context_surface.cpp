@@ -12,10 +12,8 @@
 #include <windows.h>
 #endif
 
-#if defined(MYSTRAL_WEBGPU_WGPU) || defined(MYSTRAL_WEBGPU_DAWN)
 #include "webgpu/webgpu.h"
 #include "mystral/webgpu_compat.h"
-#endif
 
 namespace mystral {
 namespace webgpu {
@@ -99,30 +97,16 @@ bool Context::createSurface(void* nativeHandle, int platformType) {
 
     AdapterRequestData adapterData;
 
-#if WGPU_USES_CALLBACK_INFO_PATTERN
-    // Dawn uses CallbackInfo struct with required callback mode
     WGPURequestAdapterCallbackInfo callbackInfo = {};
     callbackInfo.mode = WGPUCallbackMode_AllowProcessEvents;
     callbackInfo.callback = onAdapterRequestEnded;
     callbackInfo.userdata1 = &adapterData;
     callbackInfo.userdata2 = nullptr;
     wgpuInstanceRequestAdapter(instance_, &adapterOptions, callbackInfo);
-#else
-    // wgpu-native uses separate callback and userdata
-    wgpuInstanceRequestAdapter(instance_, &adapterOptions, onAdapterRequestEnded, &adapterData);
-#endif
 
-    // wgpu-native is synchronous for requestAdapter, but we should poll just in case
-#if defined(MYSTRAL_WEBGPU_WGPU)
     while (!adapterData.completed) {
         wgpuInstanceProcessEvents(instance_);
     }
-#elif defined(MYSTRAL_WEBGPU_DAWN)
-    // Dawn also needs event processing
-    while (!adapterData.completed) {
-        wgpuInstanceProcessEvents(instance_);
-    }
-#endif
 
     if (!adapterData.adapter) {
         std::cerr << "[WebGPU] Failed to get adapter" << std::endl;
@@ -153,16 +137,12 @@ bool Context::createSurface(void* nativeHandle, int platformType) {
     // Request device with required limits
     WGPUDeviceDescriptor deviceDesc = {};
     WGPU_SET_LABEL(deviceDesc, "Mystral Device");
-#if defined(MYSTRAL_WEBGPU_DAWN)
     WGPUDawnCacheDeviceDescriptor cacheDesc;
     attachDawnCache(deviceDesc, cacheDesc);
-#endif
 
     // Set up required limits - copy adapter limits and override what we need
     // WebGPU default is 32 bytes per sample, but deferred rendering needs ~40
     // Chrome defaults: https://www.w3.org/TR/webgpu/#limits
-#if defined(MYSTRAL_WEBGPU_DAWN)
-    // Dawn uses WGPULimits directly
     WGPULimits adapterLimits = {};
     wgpuAdapterGetLimits(adapter_, &adapterLimits);
 
@@ -177,23 +157,6 @@ bool Context::createSurface(void* nativeHandle, int platformType) {
     }
 
     deviceDesc.requiredLimits = &requiredLimits;
-#elif defined(MYSTRAL_WEBGPU_WGPU)
-    // wgpu-native uses WGPURequiredLimits wrapper
-    WGPUSupportedLimits adapterLimits = {};
-    wgpuAdapterGetLimits(adapter_, &adapterLimits);
-
-    // Start with adapter limits as baseline
-    WGPURequiredLimits requiredLimits = {};
-    requiredLimits.limits = adapterLimits.limits;
-
-    uint32_t neededBytesPerSample = 64;
-    if (adapterLimits.limits.maxColorAttachmentBytesPerSample >= neededBytesPerSample) {
-        requiredLimits.limits.maxColorAttachmentBytesPerSample = neededBytesPerSample;
-        std::cout << "[WebGPU] Requesting maxColorAttachmentBytesPerSample: " << neededBytesPerSample << std::endl;
-    }
-
-    deviceDesc.requiredLimits = &requiredLimits;
-#endif
 
     // Request every adapter feature (see enumerateAdapterFeatures)
     std::vector<WGPUFeatureName> requiredFeatures = enumerateAdapterFeatures(adapter_);
@@ -211,28 +174,16 @@ bool Context::createSurface(void* nativeHandle, int platformType) {
 
     DeviceRequestData deviceData;
 
-#if WGPU_USES_CALLBACK_INFO_PATTERN
-    // Dawn uses CallbackInfo struct with required callback mode
     WGPURequestDeviceCallbackInfo deviceCallbackInfo = {};
     deviceCallbackInfo.mode = WGPUCallbackMode_AllowProcessEvents;
     deviceCallbackInfo.callback = onDeviceRequestEnded;
     deviceCallbackInfo.userdata1 = &deviceData;
     deviceCallbackInfo.userdata2 = nullptr;
     wgpuAdapterRequestDevice(adapter_, &deviceDesc, deviceCallbackInfo);
-#else
-    // wgpu-native uses separate callback and userdata
-    wgpuAdapterRequestDevice(adapter_, &deviceDesc, onDeviceRequestEnded, &deviceData);
-#endif
 
-#if defined(MYSTRAL_WEBGPU_WGPU)
     while (!deviceData.completed) {
         wgpuInstanceProcessEvents(instance_);
     }
-#elif defined(MYSTRAL_WEBGPU_DAWN)
-    while (!deviceData.completed) {
-        wgpuInstanceProcessEvents(instance_);
-    }
-#endif
 
     if (!deviceData.device) {
         std::cerr << "[WebGPU] Failed to get device" << std::endl;
@@ -296,22 +247,16 @@ bool Context::createSurfaceWithDisplay(void* display, void* window, int platform
 
     AdapterRequestData adapterData;
 
-#if WGPU_USES_CALLBACK_INFO_PATTERN
     WGPURequestAdapterCallbackInfo callbackInfo = {};
     callbackInfo.mode = WGPUCallbackMode_AllowProcessEvents;
     callbackInfo.callback = onAdapterRequestEnded;
     callbackInfo.userdata1 = &adapterData;
     callbackInfo.userdata2 = nullptr;
     wgpuInstanceRequestAdapter(instance_, &adapterOptions, callbackInfo);
-#else
-    wgpuInstanceRequestAdapter(instance_, &adapterOptions, onAdapterRequestEnded, &adapterData);
-#endif
 
-#if defined(MYSTRAL_WEBGPU_WGPU) || defined(MYSTRAL_WEBGPU_DAWN)
     while (!adapterData.completed) {
         wgpuInstanceProcessEvents(instance_);
     }
-#endif
 
     if (!adapterData.adapter) {
         std::cerr << "[WebGPU] Failed to get adapter" << std::endl;
@@ -342,12 +287,9 @@ bool Context::createSurfaceWithDisplay(void* display, void* window, int platform
     // Request device with required limits - same as createSurface
     WGPUDeviceDescriptor deviceDesc = {};
     WGPU_SET_LABEL(deviceDesc, "Mystral Device");
-#if defined(MYSTRAL_WEBGPU_DAWN)
     WGPUDawnCacheDeviceDescriptor cacheDesc;
     attachDawnCache(deviceDesc, cacheDesc);
-#endif
 
-#if defined(MYSTRAL_WEBGPU_DAWN)
     WGPULimits adapterLimits = {};
     wgpuAdapterGetLimits(adapter_, &adapterLimits);
     WGPULimits requiredLimits = adapterLimits;
@@ -356,17 +298,6 @@ bool Context::createSurfaceWithDisplay(void* display, void* window, int platform
         requiredLimits.maxColorAttachmentBytesPerSample = neededBytesPerSample;
     }
     deviceDesc.requiredLimits = &requiredLimits;
-#elif defined(MYSTRAL_WEBGPU_WGPU)
-    WGPUSupportedLimits adapterLimits = {};
-    wgpuAdapterGetLimits(adapter_, &adapterLimits);
-    WGPURequiredLimits requiredLimits = {};
-    requiredLimits.limits = adapterLimits.limits;
-    uint32_t neededBytesPerSample = 64;
-    if (adapterLimits.limits.maxColorAttachmentBytesPerSample >= neededBytesPerSample) {
-        requiredLimits.limits.maxColorAttachmentBytesPerSample = neededBytesPerSample;
-    }
-    deviceDesc.requiredLimits = &requiredLimits;
-#endif
 
     // Request every adapter feature (see enumerateAdapterFeatures)
     std::vector<WGPUFeatureName> requiredFeatures = enumerateAdapterFeatures(adapter_);
@@ -381,22 +312,16 @@ bool Context::createSurfaceWithDisplay(void* display, void* window, int platform
 
     DeviceRequestData deviceData;
 
-#if WGPU_USES_CALLBACK_INFO_PATTERN
     WGPURequestDeviceCallbackInfo deviceCallbackInfo = {};
     deviceCallbackInfo.mode = WGPUCallbackMode_AllowProcessEvents;
     deviceCallbackInfo.callback = onDeviceRequestEnded;
     deviceCallbackInfo.userdata1 = &deviceData;
     deviceCallbackInfo.userdata2 = nullptr;
     wgpuAdapterRequestDevice(adapter_, &deviceDesc, deviceCallbackInfo);
-#else
-    wgpuAdapterRequestDevice(adapter_, &deviceDesc, onDeviceRequestEnded, &deviceData);
-#endif
 
-#if defined(MYSTRAL_WEBGPU_WGPU) || defined(MYSTRAL_WEBGPU_DAWN)
     while (!deviceData.completed) {
         wgpuInstanceProcessEvents(instance_);
     }
-#endif
 
     if (!deviceData.device) {
         std::cerr << "[WebGPU] Failed to get device" << std::endl;

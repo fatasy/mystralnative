@@ -17,6 +17,13 @@
 #include "mystral/workers/shared_buffer.h"
 #include "mystral/workers/worker_registry.h"
 #include "storage/local_storage.h"
+#include "game/game_loop_controller.h"
+#include "js/animation_frame.h"
+#include "js/runtime_sources.h"
+#include "js/runtime_timers.h"
+#include "js/runtime_io_bindings.h"
+#include "dom/dom_event_system.h"
+#include "debug/runtime_profiler.h"
 
 // Ray tracing bindings (conditional)
 #ifdef MYSTRAL_HAS_RAYTRACING
@@ -79,11 +86,7 @@
 #endif
 #include <cstdlib>
 #include <cstring>
-
-// External functions from bindings.cpp for async video capture
-namespace mystral { namespace webgpu {
-    extern void* getCurrentSurfaceTexture();
-}}
+#include "webgpu/bindings.h"
 
 // Platform-specific includes for crash handler
 #ifdef _WIN32
@@ -97,9 +100,7 @@ namespace mystral { namespace webgpu {
 #define MYSTRAL_STDERR_FD STDERR_FILENO
 #endif
 
-#if defined(MYSTRAL_WEBGPU_WGPU) || defined(MYSTRAL_WEBGPU_DAWN)
 #include <webgpu/webgpu.h>
-#endif
 
 // SDL3 for window property access (Android ANativeWindow, Windows HWND, etc.)
 #include <SDL3/SDL.h>
@@ -179,17 +180,6 @@ static std::string quoteJavaScriptString(const std::string& value) {
     }
     result.push_back('"');
     return result;
-}
-
-// Forward declaration for WebGPU bindings
-namespace webgpu {
-    bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuAdapter, void* wgpuDevice, void* wgpuQueue, void* wgpuSurface, uint32_t surfaceFormat, uint32_t width, uint32_t height, bool debug = false);
-    void setOffscreenTexture(void* texture, void* textureView);
-    void beginDawnFrame();
-    void endDawnFrame();
-    void processAsyncCompletions();
-    void releaseReloadResources();
-    void resetSessionBindings();
 }
 
 /**
@@ -387,7 +377,7 @@ public:
             if (xwindow) {
                 std::cout << "[Mystral] Using X11 display: " << xdisplay << " window: " << xwindow << std::endl;
                 // Pass both display and window pointer for proper X11 surface creation
-                // Dawn requires the display pointer, wgpu-native can work with just window
+                // Dawn requires the X11 display pointer together with the window.
                 if (!webgpu_->createSurfaceWithDisplay(xdisplay, reinterpret_cast<void*>(xwindow), webgpu::Context::PLATFORM_XLIB)) {
                     std::cerr << "[Mystral] Failed to create WebGPU surface" << std::endl;
                     return false;
@@ -447,10 +437,13 @@ public:
             workerRuntimeState_);
 
         // Set up requestAnimationFrame
-        setupAnimationFrame();
+        animationFrames_.install(jsEngine_.get());
+
+        // Set up the fixed-timestep game scheduler. Rendering remains on RAF.
+        gameLoop_.install(jsEngine_.get());
 
         // Set up setTimeout/setInterval
-        setupTimers();
+        timers_.install(jsEngine_.get());
 
         // Set up performance API
         setupPerformance();
@@ -459,7 +452,7 @@ public:
         setupProcess();
 
         // Set up fetch API
-        setupFetch();
+        ioBindings_.install(jsEngine_.get(), &jsGeneration_);
 
         // Set up WebTransport API (QUIC/HTTP3 via quiche; stubbed if not built)
         webtransport::initBindings(jsEngine_.get());
@@ -471,7 +464,7 @@ public:
         setupModules();
 
         // Set up DOM event system (document, window, addEventListener, etc.)
-        setupDOMEvents();
+        domEvents_.install(jsEngine_.get(), width_, height_, config_.noSdl);
 
         // Set up the opt-in semantic inspection/action bridge for agents.
         setupAgentBridge();
@@ -562,7 +555,7 @@ public:
         fs::getAsyncFileReader().shutdown();
         async::getJobSystem().cancelGeneration(jsGeneration_);
         async::getJobSystem().shutdown();
-        clearPendingFileCallbacks();
+        ioBindings_.clearFileCallbacks();
 
         // Clean up ray tracing resources
 #ifdef MYSTRAL_HAS_RAYTRACING
@@ -578,50 +571,15 @@ public:
         // Shut down WebTransport sessions (closes QUIC connections + uv handles)
         webtransport::shutdown();
 
-#ifdef MYSTRAL_USE_LIBUV_TIMERS
-        // Clean up libuv timers before shutting down the event loop
-        for (auto& [id, ctx] : uvTimers_) {
-            if (ctx) {
-                ctx->cancelled = true;
-                uv_timer_stop(&ctx->handle);
-                if (jsEngine_ && ctx->callbackProtected) {
-                    jsEngine_->unprotect(ctx->callback);
-                    ctx->callbackProtected = false;
-                }
-                if (!uv_is_closing(reinterpret_cast<uv_handle_t*>(&ctx->handle))) {
-                    uv_close(reinterpret_cast<uv_handle_t*>(&ctx->handle), onTimerClose);
-                }
-            }
-        }
-#endif
+        timers_.clear();
 
         // Shutdown libuv event loop (waits for pending handles to close)
         async::EventLoop::instance().shutdown();
-#ifdef MYSTRAL_USE_LIBUV_TIMERS
-        uvTimers_.clear();
-#endif
+        timers_.finishShutdown();
 
-        // Unprotect all RAF callbacks before clearing
-        if (jsEngine_) {
-            for (auto& raf : rafCallbacks_) {
-                jsEngine_->unprotect(raf.callback);
-            }
-        }
-        rafCallbacks_.clear();
-        clearDOMEventListeners();
-
-        // Unprotect all timer callbacks before clearing
-#ifndef MYSTRAL_USE_LIBUV_TIMERS
-        if (jsEngine_) {
-            for (auto& timer : timerCallbacks_) {
-                if (!timer.cancelled) {
-                    jsEngine_->unprotect(timer.callback);
-                }
-            }
-        }
-        timerCallbacks_.clear();
-#endif
-        cancelledTimerIds_.clear();
+        animationFrames_.reset();
+        gameLoop_.reset();
+        domEvents_.reset();
 
         if (moduleSystem_) {
             moduleSystem_->clearCaches();
@@ -821,7 +779,7 @@ public:
         async::getJobSystem().cancelGeneration(jsGeneration_);
         async::getJobSystem().waitIdle();
         async::getJobSystem().processCompletions();
-        clearPendingFileCallbacks();
+        ioBindings_.clearFileCallbacks();
 
         // Give the application one synchronous chance to release its scene,
         // renderer and JS-owned GPU wrappers before native callbacks vanish.
@@ -835,15 +793,12 @@ public:
         jsEngine_->setGlobalProperty("__laasHotDispose", jsEngine_->newUndefined());
 
         // Clear all pending timers
-        clearAllTimers();
+        timers_.clear();
 
-        // Clear all requestAnimationFrame callbacks
-        for (auto& raf : rafCallbacks_) {
-            jsEngine_->unprotect(raf.callback);
-        }
-        rafCallbacks_.clear();
+        animationFrames_.reset();
+        gameLoop_.reset();
 
-        clearDOMEventListeners();
+        domEvents_.reset();
 
         // Clear module caches so script is re-read from disk
         if (moduleSystem_) {
@@ -954,44 +909,6 @@ private:
         return now - reloadCandidateSince_ >= std::chrono::milliseconds(300);
     }
 
-    void clearAllTimers() {
-#ifdef MYSTRAL_USE_LIBUV_TIMERS
-        // Stop and clean up all libuv timers
-        for (auto& [id, ctx] : uvTimers_) {
-            if (ctx) {
-                ctx->cancelled = true;
-                uv_timer_stop(&ctx->handle);
-                if (ctx->callbackProtected) {
-                    jsEngine_->unprotect(ctx->callback);
-                    ctx->callbackProtected = false;
-                }
-                if (!uv_is_closing(reinterpret_cast<uv_handle_t*>(&ctx->handle))) {
-                    uv_close(reinterpret_cast<uv_handle_t*>(&ctx->handle), onTimerClose);
-                }
-            }
-        }
-        // Note: Don't clear uvTimers_ here - onTimerClose will do that
-        cancelledTimerIds_.clear();
-        {
-            std::lock_guard<std::mutex> lock(timerMutex_);
-            while (!pendingTimerCallbacks_.empty()) {
-                pendingTimerCallbacks_.pop();
-            }
-        }
-#else
-        // Clear std::chrono-based timers
-        for (auto& timer : timerCallbacks_) {
-            if (!timer.cancelled) {
-                jsEngine_->unprotect(timer.callback);
-            }
-        }
-        timerCallbacks_.clear();
-        cancelledTimerIds_.clear();
-#endif
-        // IDs remain monotonic: libuv close callbacks erase old timers on a
-        // later loop turn, so reusing IDs here could erase a new timer.
-    }
-
     bool recreateJavaScriptEngine() {
         // Bindings with native-side JS handles must detach before the engine
         // destroys its context. The Dawn context/device and SDL window remain.
@@ -1012,7 +929,7 @@ private:
             moduleSystem_.reset();
         }
 
-        clearPendingFileCallbacks();
+        ioBindings_.clearFileCallbacks();
 #ifdef MYSTRAL_HAS_DRACO
         {
             std::lock_guard<std::mutex> lock(dracoMutex_);
@@ -1020,7 +937,9 @@ private:
         }
 #endif
 
-        canvasElement_ = {};
+        animationFrames_.reset();
+        gameLoop_.reset();
+        domEvents_.reset();
         webgpu::resetSessionBindings();
         ++jsGeneration_;
         jsEngine_.reset();
@@ -1071,7 +990,8 @@ public:
 
             // In no-SDL (headless) mode, exit when there's no more work to do
             if (config_.noSdl) {
-                bool hasWork = !rafCallbacks_.empty() || hasActiveTimers() ||
+                bool hasWork = animationFrames_.hasCallbacks() || timers_.hasActive() ||
+                               gameLoop_.isRunning() ||
                                async::getJobSystem().stats().inFlight > 0 ||
                                (workerRegistry_ && workerRegistry_->size() > 0) ||
                                webtransport::hasActiveSessions();
@@ -1092,24 +1012,6 @@ public:
     }
 
     // Check if there are any active (non-cancelled) timers
-    bool hasActiveTimers() const {
-#ifdef MYSTRAL_USE_LIBUV_TIMERS
-        for (const auto& [id, ctx] : uvTimers_) {
-            if (ctx && !ctx->cancelled) {
-                return true;
-            }
-        }
-        return false;
-#else
-        for (const auto& timer : timerCallbacks_) {
-            if (!timer.cancelled) {
-                return true;
-            }
-        }
-        return false;
-#endif
-    }
-
     void renderFrame() {
         // Rendering is now driven by JavaScript through requestAnimationFrame
         // The JS code calls context.getCurrentTexture(), creates render passes,
@@ -1122,12 +1024,10 @@ public:
         // Debug commands run during this function, so profiling may start or
         // stop halfway through a frame. Sample only a complete profiling frame,
         // and cap fixed-size profiles even if the client sends profile.stop late.
-        const bool profilingFrame = profilerActive_ &&
-            (profilerExpectedFrames_ == 0 ||
-                profilerSamples_.size() < profilerExpectedFrames_);
+        const bool profilingFrame = profiler_.shouldSampleFrame();
         ProfileClock::time_point profileFrameStart;
         ProfileClock::time_point profilePhaseStart;
-        FrameProfileSample profileSample;
+        debug::RuntimeProfiler::FrameSample profileSample;
         if (profilingFrame) {
             profileFrameStart = ProfileClock::now();
             profilePhaseStart = profileFrameStart;
@@ -1145,9 +1045,9 @@ public:
         // This handles async HTTP requests, file I/O, and libuv-based timers
         async::EventLoop::instance().runOnce();
 
-        if (profilingFrame && profilerActive_) {
+        if (profilingFrame && profiler_.active()) {
             auto now = ProfileClock::now();
-            profileSample.eventsMs = millisecondsBetween(profilePhaseStart, now);
+            profileSample.eventsMs = debug::RuntimeProfiler::millisecondsBetween(profilePhaseStart, now);
             profilePhaseStart = now;
         }
 
@@ -1155,6 +1055,7 @@ public:
             // Release native job results even while JavaScript callbacks are paused.
             async::getJobSystem().processCompletions();
             webgpu::processAsyncCompletions();
+            gameLoop_.rebaseClock();
             return running_;
         }
 
@@ -1180,18 +1081,18 @@ public:
             reloadScript();
         }
 
-        if (profilingFrame && profilerActive_) {
+        if (profilingFrame && profiler_.active()) {
             auto now = ProfileClock::now();
-            profileSample.asyncWorkMs = millisecondsBetween(profilePhaseStart, now);
+            profileSample.asyncWorkMs = debug::RuntimeProfiler::millisecondsBetween(profilePhaseStart, now);
             profilePhaseStart = now;
         }
 
         // Execute timer callbacks (setTimeout, setInterval)
-        executeTimerCallbacks();
+        timers_.executeCallbacks();
 
         // Process any queued file callbacks that were deferred from previous frames
         // We process them here (after other callbacks) to ensure we're not in a nested callback stack
-        processPendingFileCallbacks();
+        ioBindings_.processFileCallbacks();
 
         // Process completed async Draco decode results
         processPendingDracoCallbacks();
@@ -1205,9 +1106,9 @@ public:
         // Process microtask queue for promises
         processMicrotasks();
 
-        if (profilingFrame && profilerActive_) {
+        if (profilingFrame && profiler_.active()) {
             auto now = ProfileClock::now();
-            profileSample.callbacksMs = millisecondsBetween(profilePhaseStart, now);
+            profileSample.callbacksMs = debug::RuntimeProfiler::millisecondsBetween(profilePhaseStart, now);
             profilePhaseStart = now;
         }
 
@@ -1216,12 +1117,21 @@ public:
         jsEngine_->beginFrame();
         webgpu::beginDawnFrame();
 
-        // Execute requestAnimationFrame callbacks (renders a frame)
-        executeAnimationFrameCallbacks();
+        // Advance the authoritative fixed-timestep simulation before rendering.
+        gameLoop_.advance();
 
-        if (profilingFrame && profilerActive_) {
+        if (profilingFrame && profiler_.active()) {
             auto now = ProfileClock::now();
-            profileSample.animationFrameMs = millisecondsBetween(profilePhaseStart, now);
+            profileSample.simulationMs = debug::RuntimeProfiler::millisecondsBetween(profilePhaseStart, now);
+            profilePhaseStart = now;
+        }
+
+        // Execute requestAnimationFrame callbacks (renders a frame)
+        animationFrames_.execute();
+
+        if (profilingFrame && profiler_.active()) {
+            auto now = ProfileClock::now();
+            profileSample.animationFrameMs = debug::RuntimeProfiler::millisecondsBetween(profilePhaseStart, now);
             profilePhaseStart = now;
         }
 
@@ -1229,11 +1139,11 @@ public:
         jsEngine_->clearFrameHandles();
         webgpu::endDawnFrame();
 
-        if (profilingFrame && profilerActive_) {
+        if (profilingFrame && profiler_.active()) {
             auto now = ProfileClock::now();
-            profileSample.cleanupMs = millisecondsBetween(profilePhaseStart, now);
-            profileSample.frameMs = millisecondsBetween(profileFrameStart, now);
-            profilerSamples_.push_back(profileSample);
+            profileSample.cleanupMs = debug::RuntimeProfiler::millisecondsBetween(profilePhaseStart, now);
+            profileSample.frameMs = debug::RuntimeProfiler::millisecondsBetween(profileFrameStart, now);
+            profiler_.addFrameSample(profileSample);
         }
 
         frameCount_++;
@@ -1268,143 +1178,15 @@ public:
     }
 
     void startProfiler(uint64_t expectedFrames) override {
-        profilerSamples_.clear();
-        profilerExpectedFrames_ = expectedFrames;
-        profilerSamples_.reserve(expectedFrames > 0
-            ? static_cast<size_t>(expectedFrames)
-            : 1024);
-        profilerMemoryStart_ = getMemorySnapshot();
-        profilerWorkerStart_ = workerRegistry_
-            ? workerRegistry_->stats()
-            : workers::WorkerRegistryStats{};
-        profilerSharedMemoryStartBytes_ = sharedBuffers_ ? sharedBuffers_->allocatedBytes() : 0;
-        profilerJobStart_ = async::getJobSystem().stats();
+        auto snapshot = captureProfilerSnapshot();
+        gameLoop_.resetHighWaterMarks();
+        snapshot.gameLoop = gameLoop_.stats();
         async::getJobSystem().resetHighWaterMarks();
-        profilerStartedAt_ = std::chrono::steady_clock::now();
-        profilerActive_ = true;
+        profiler_.start(expectedFrames, snapshot);
     }
 
     RuntimeProfileReport stopProfiler() override {
-        RuntimeProfileReport report;
-        if (!profilerActive_) {
-            return report;
-        }
-
-        const auto stoppedAt = std::chrono::steady_clock::now();
-        profilerActive_ = false;
-
-        report.sampledFrames = profilerSamples_.size();
-        report.wallTimeMs = millisecondsBetween(profilerStartedAt_, stoppedAt);
-        report.memoryStart = profilerMemoryStart_;
-        report.memoryEnd = getMemorySnapshot();
-        const auto workerEnd = workerRegistry_
-            ? workerRegistry_->stats()
-            : workers::WorkerRegistryStats{};
-        report.workersActiveStart = profilerWorkerStart_.activeWorkers;
-        report.workersActiveEnd = workerEnd.activeWorkers;
-        report.workersCreated = workerEnd.createdWorkers >= profilerWorkerStart_.createdWorkers
-            ? workerEnd.createdWorkers - profilerWorkerStart_.createdWorkers
-            : 0;
-        report.nestedWorkersCreated =
-            workerEnd.nestedCreatedWorkers >= profilerWorkerStart_.nestedCreatedWorkers
-                ? workerEnd.nestedCreatedWorkers - profilerWorkerStart_.nestedCreatedWorkers
-                : 0;
-        report.workerMessagesProcessed = workerEnd.processedMessages >= profilerWorkerStart_.processedMessages
-            ? workerEnd.processedMessages - profilerWorkerStart_.processedMessages
-            : 0;
-        report.workerTimerCallbacks =
-            workerEnd.processedTimerCallbacks >= profilerWorkerStart_.processedTimerCallbacks
-                ? workerEnd.processedTimerCallbacks - profilerWorkerStart_.processedTimerCallbacks
-                : 0;
-        const uint64_t rejectedAtStart = profilerWorkerStart_.rejectedInputMessages +
-            profilerWorkerStart_.rejectedOutputMessages;
-        const uint64_t rejectedAtEnd = workerEnd.rejectedInputMessages +
-            workerEnd.rejectedOutputMessages;
-        report.workerMessagesRejected = rejectedAtEnd >= rejectedAtStart
-            ? rejectedAtEnd - rejectedAtStart
-            : 0;
-        const auto counterDelta = [](uint64_t start, uint64_t end) {
-            return end >= start ? end - start : 0;
-        };
-        report.workerInputMessagesTooLarge = counterDelta(
-            profilerWorkerStart_.rejectedInputTooLarge, workerEnd.rejectedInputTooLarge);
-        report.workerInputQueueFull = counterDelta(
-            profilerWorkerStart_.rejectedInputQueueFull, workerEnd.rejectedInputQueueFull);
-        report.workerOutputMessagesTooLarge = counterDelta(
-            profilerWorkerStart_.rejectedOutputTooLarge, workerEnd.rejectedOutputTooLarge);
-        report.workerOutputQueueFull = counterDelta(
-            profilerWorkerStart_.rejectedOutputQueueFull, workerEnd.rejectedOutputQueueFull);
-        const uint64_t workerBusyNanoseconds =
-            workerEnd.busyNanoseconds >= profilerWorkerStart_.busyNanoseconds
-                ? workerEnd.busyNanoseconds - profilerWorkerStart_.busyNanoseconds
-                : 0;
-        report.workerBusyTimeMs = static_cast<double>(workerBusyNanoseconds) / 1'000'000.0;
-        report.workerInputQueueEndBytes = workerEnd.queuedInputBytes;
-        report.workerOutputQueueEndBytes = workerEnd.queuedOutputBytes;
-        report.workerInputQueuePeakBytes = workerEnd.peakQueuedInputBytes;
-        report.workerOutputQueuePeakBytes = workerEnd.peakQueuedOutputBytes;
-        report.workerLargestInputMessageBytes = workerEnd.largestInputMessageBytes;
-        report.workerLargestOutputMessageBytes = workerEnd.largestOutputMessageBytes;
-        report.workerMaxDepth = workerEnd.maxDepth;
-        report.sharedMemoryStartBytes = profilerSharedMemoryStartBytes_;
-        report.sharedMemoryEndBytes = sharedBuffers_ ? sharedBuffers_->allocatedBytes() : 0;
-
-        const auto jobEnd = async::getJobSystem().stats();
-        report.jobsSubmitted = counterDelta(profilerJobStart_.submitted, jobEnd.submitted);
-        report.jobsCompleted = counterDelta(profilerJobStart_.completed, jobEnd.completed);
-        report.jobsCancelled = counterDelta(profilerJobStart_.cancelled, jobEnd.cancelled);
-        report.jobsFailed = counterDelta(profilerJobStart_.failed, jobEnd.failed);
-        report.jobsRejected = counterDelta(profilerJobStart_.rejected, jobEnd.rejected);
-        report.jobQueueEnd = jobEnd.queued;
-        report.jobQueuePeak = jobEnd.queueHighWater;
-        report.jobInFlightEnd = jobEnd.inFlight;
-        report.jobInFlightPeak = jobEnd.inFlightHighWater;
-        report.jobWorkerCount = jobEnd.workerCount;
-        const auto cpuBudget = async::cpuBudgetStats();
-        report.cpuBudgetThreads = cpuBudget.limit;
-        report.cpuBudgetActiveEnd = cpuBudget.active;
-        report.cpuBudgetPeakActive = cpuBudget.peakActive;
-        const auto copyJobLatency = [](const async::JobLatencySummary& source) {
-            RuntimeProfileStatistics result;
-            result.minMs = source.minMs;
-            result.meanMs = source.meanMs;
-            result.p50Ms = source.p50Ms;
-            result.p95Ms = source.p95Ms;
-            result.p99Ms = source.p99Ms;
-            result.maxMs = source.maxMs;
-            return result;
-        };
-        report.jobQueueWait = copyJobLatency(async::summarizeJobLatency(
-            profilerJobStart_.queueWait,
-            jobEnd.queueWait));
-        report.jobExecution = copyJobLatency(async::summarizeJobLatency(
-            profilerJobStart_.execution,
-            jobEnd.execution));
-
-        std::vector<double> values;
-        values.reserve(profilerSamples_.size());
-        auto summarize = [&values, this](auto member) {
-            values.clear();
-            for (const auto& sample : profilerSamples_) {
-                values.push_back(sample.*member);
-            }
-            return summarizeProfileValues(values);
-        };
-
-        report.frame = summarize(&FrameProfileSample::frameMs);
-        report.events = summarize(&FrameProfileSample::eventsMs);
-        report.asyncWork = summarize(&FrameProfileSample::asyncWorkMs);
-        report.callbacks = summarize(&FrameProfileSample::callbacksMs);
-        report.animationFrame = summarize(&FrameProfileSample::animationFrameMs);
-        report.cleanup = summarize(&FrameProfileSample::cleanupMs);
-
-        for (const auto& sample : profilerSamples_) {
-            if (sample.frameMs > 8.333333) report.framesOver8_33Ms++;
-            if (sample.frameMs > 16.666667) report.framesOver16_67Ms++;
-            if (sample.frameMs > 33.333333) report.framesOver33_33Ms++;
-        }
-
-        return report;
+        return profiler_.stop(captureProfilerSnapshot());
     }
 
     void quit() override {
@@ -1424,6 +1206,7 @@ public:
         std::cout << "[Mystral] Resize: " << width << "x" << height << std::endl;
         width_ = width;
         height_ = height;
+        domEvents_.setSize(width, height);
 
         if (webgpu_) {
             webgpu_->resizeSurface(width, height);
@@ -1494,44 +1277,6 @@ public:
     }
 
 private:
-    struct FrameProfileSample {
-        double frameMs = 0.0;
-        double eventsMs = 0.0;
-        double asyncWorkMs = 0.0;
-        double callbacksMs = 0.0;
-        double animationFrameMs = 0.0;
-        double cleanupMs = 0.0;
-    };
-
-    template <typename Clock, typename DurationA, typename DurationB>
-    static double millisecondsBetween(
-        const std::chrono::time_point<Clock, DurationA>& start,
-        const std::chrono::time_point<Clock, DurationB>& end) {
-        return std::chrono::duration<double, std::milli>(end - start).count();
-    }
-
-    static RuntimeProfileStatistics summarizeProfileValues(std::vector<double>& values) {
-        RuntimeProfileStatistics stats;
-        if (values.empty()) {
-            return stats;
-        }
-
-        std::sort(values.begin(), values.end());
-        const double total = std::accumulate(values.begin(), values.end(), 0.0);
-        auto percentile = [&values](double fraction) {
-            const size_t rank = static_cast<size_t>(std::ceil(fraction * values.size()));
-            return values[std::max<size_t>(1, rank) - 1];
-        };
-
-        stats.minMs = values.front();
-        stats.meanMs = total / static_cast<double>(values.size());
-        stats.p50Ms = percentile(0.50);
-        stats.p95Ms = percentile(0.95);
-        stats.p99Ms = percentile(0.99);
-        stats.maxMs = values.back();
-        return stats;
-    }
-
     RuntimeMemorySnapshot getMemorySnapshot() const {
         RuntimeMemorySnapshot snapshot;
         if (!jsEngine_) {
@@ -1547,458 +1292,22 @@ private:
         return snapshot;
     }
 
-    void setupAnimationFrame() {
-        if (!jsEngine_) return;
-
-        // Create requestAnimationFrame
-        jsEngine_->setGlobalProperty("requestAnimationFrame",
-            jsEngine_->newFunction("requestAnimationFrame", [this](void* ctx, const std::vector<js::JSValueHandle>& args) {
-                if (args.empty()) {
-                    return jsEngine_->newNumber(-1);
-                }
-
-                // Store callback
-                int id = nextRafId_++;
-                jsEngine_->protect(args[0]);
-                rafCallbacks_.push_back({id, args[0]});
-
-                return jsEngine_->newNumber(id);
-            })
-        );
-
-        // Create cancelAnimationFrame
-        jsEngine_->setGlobalProperty("cancelAnimationFrame",
-            jsEngine_->newFunction("cancelAnimationFrame", [this](void* ctx, const std::vector<js::JSValueHandle>& args) {
-                if (args.empty()) {
-                    return jsEngine_->newUndefined();
-                }
-
-                int id = (int)jsEngine_->toNumber(args[0]);
-
-                // Remove callback with matching id
-                for (auto it = rafCallbacks_.begin(); it != rafCallbacks_.end(); ++it) {
-                    if (it->id == id) {
-                        jsEngine_->unprotect(it->callback);
-                        rafCallbacks_.erase(it);
-                        break;
-                    }
-                }
-
-                return jsEngine_->newUndefined();
-            })
-        );
+    debug::RuntimeProfilerSnapshot captureProfilerSnapshot() const {
+        debug::RuntimeProfilerSnapshot snapshot;
+        snapshot.memory = getMemorySnapshot();
+        snapshot.workers = workerRegistry_
+            ? workerRegistry_->stats()
+            : workers::WorkerRegistryStats{};
+        snapshot.sharedMemoryBytes = sharedBuffers_ ? sharedBuffers_->allocatedBytes() : 0;
+        snapshot.jobs = async::getJobSystem().stats();
+        snapshot.gameLoop = gameLoop_.stats();
+        return snapshot;
     }
-
-    void executeAnimationFrameCallbacks() {
-        if (rafCallbacks_.empty()) return;
-
-        // Get current time
-        auto now = std::chrono::high_resolution_clock::now();
-        double timestamp = std::chrono::duration<double, std::milli>(now.time_since_epoch()).count();
-
-        // Copy callbacks (they might add new ones during execution)
-        auto callbacks = std::move(rafCallbacks_);
-        rafCallbacks_.clear();
-
-        // Call each callback
-        for (auto& raf : callbacks) {
-            std::vector<js::JSValueHandle> args = {jsEngine_->newNumber(timestamp)};
-            jsEngine_->call(raf.callback, jsEngine_->newUndefined(), args);
-            jsEngine_->unprotect(raf.callback);
-        }
-    }
-
-    void setupTimers() {
-        if (!jsEngine_) return;
-
-#ifdef MYSTRAL_USE_LIBUV_TIMERS
-        // libuv-based timers for precise timing
-        setupLibuvTimers();
-#else
-        // Fallback to std::chrono-based timers
-        setupChronoTimers();
-#endif
-    }
-
-#ifdef MYSTRAL_USE_LIBUV_TIMERS
-    // libuv timer callback - queues the JS callback for main thread processing
-    static void onUvTimerCallback(uv_timer_t* handle) {
-        auto* ctx = static_cast<UvTimerContext*>(handle->data);
-        if (!ctx || ctx->cancelled) return;
-
-        // Queue the callback for processing on the main thread
-        {
-            std::lock_guard<std::mutex> lock(ctx->runtime->timerMutex_);
-            ctx->runtime->pendingTimerCallbacks_.push({
-                ctx->id,
-                ctx->callback,
-                ctx->intervalMs
-            });
-        }
-
-        // For setTimeout (intervalMs == 0), mark as cancelled so we don't fire again
-        if (ctx->intervalMs == 0) {
-            ctx->cancelled = true;
-        }
-    }
-
-    // Close callback for timer handles
-    static void onTimerClose(uv_handle_t* handle) {
-        auto* ctx = static_cast<UvTimerContext*>(handle->data);
-        if (ctx && ctx->runtime) {
-            // Now it's safe to remove from the map - handle is fully closed
-            ctx->runtime->uvTimers_.erase(ctx->id);
-        }
-    }
-
-    int createUvTimer(js::JSValueHandle callback, int delayMs, int intervalMs) {
-        uv_loop_t* loop = async::EventLoop::instance().handle();
-        if (!loop) {
-            std::cerr << "[Timer] EventLoop not available" << std::endl;
-            return -1;
-        }
-
-        int id = nextTimerId_++;
-        jsEngine_->protect(callback);
-
-        auto ctx = std::make_unique<UvTimerContext>();
-        ctx->id = id;
-        ctx->callback = callback;
-        ctx->intervalMs = intervalMs;
-        ctx->cancelled = false;
-        ctx->callbackProtected = true;
-        ctx->runtime = this;
-        ctx->handle.data = ctx.get();
-
-        int result = uv_timer_init(loop, &ctx->handle);
-        if (result != 0) {
-            std::cerr << "[Timer] Failed to init timer: " << uv_strerror(result) << std::endl;
-            jsEngine_->unprotect(callback);
-            return -1;
-        }
-
-        // Start the timer
-        // For setInterval, use repeat; for setTimeout, use 0 repeat
-        uint64_t repeat = (intervalMs > 0) ? (uint64_t)intervalMs : 0;
-        result = uv_timer_start(&ctx->handle, onUvTimerCallback, (uint64_t)delayMs, repeat);
-        if (result != 0) {
-            std::cerr << "[Timer] Failed to start timer: " << uv_strerror(result) << std::endl;
-            uv_close(reinterpret_cast<uv_handle_t*>(&ctx->handle), nullptr);
-            jsEngine_->unprotect(callback);
-            return -1;
-        }
-
-        uvTimers_[id] = std::move(ctx);
-        return id;
-    }
-
-    void cancelUvTimer(int id) {
-        auto it = uvTimers_.find(id);
-        if (it == uvTimers_.end()) return;
-
-        auto& ctx = it->second;
-        if (ctx && !ctx->cancelled) {
-            ctx->cancelled = true;
-            cancelledTimerIds_.insert(id);
-            uv_timer_stop(&ctx->handle);
-            if (ctx->callbackProtected) {
-                jsEngine_->unprotect(ctx->callback);
-                ctx->callbackProtected = false;
-            }
-            uv_close(reinterpret_cast<uv_handle_t*>(&ctx->handle), onTimerClose);
-        }
-    }
-
-    void setupLibuvTimers() {
-        // setTimeout
-        jsEngine_->setGlobalProperty("setTimeout",
-            jsEngine_->newFunction("setTimeout", [this](void* ctx, const std::vector<js::JSValueHandle>& args) {
-                if (args.empty()) {
-                    return jsEngine_->newNumber(-1);
-                }
-
-                int delay = 0;
-                if (args.size() > 1) {
-                    delay = (int)jsEngine_->toNumber(args[1]);
-                }
-                if (delay < 0) delay = 0;
-
-                int id = createUvTimer(args[0], delay, 0);
-                return jsEngine_->newNumber(id);
-            })
-        );
-
-        // clearTimeout
-        jsEngine_->setGlobalProperty("clearTimeout",
-            jsEngine_->newFunction("clearTimeout", [this](void* ctx, const std::vector<js::JSValueHandle>& args) {
-                if (args.empty()) {
-                    return jsEngine_->newUndefined();
-                }
-
-                int id = (int)jsEngine_->toNumber(args[0]);
-                cancelUvTimer(id);
-                return jsEngine_->newUndefined();
-            })
-        );
-
-        // setInterval
-        jsEngine_->setGlobalProperty("setInterval",
-            jsEngine_->newFunction("setInterval", [this](void* ctx, const std::vector<js::JSValueHandle>& args) {
-                if (args.empty()) {
-                    return jsEngine_->newNumber(-1);
-                }
-
-                int delay = 0;
-                if (args.size() > 1) {
-                    delay = (int)jsEngine_->toNumber(args[1]);
-                }
-                if (delay < 1) delay = 1;  // Minimum 1ms for intervals
-
-                int id = createUvTimer(args[0], delay, delay);
-                return jsEngine_->newNumber(id);
-            })
-        );
-
-        // clearInterval
-        jsEngine_->setGlobalProperty("clearInterval",
-            jsEngine_->newFunction("clearInterval", [this](void* ctx, const std::vector<js::JSValueHandle>& args) {
-                if (args.empty()) {
-                    return jsEngine_->newUndefined();
-                }
-
-                int id = (int)jsEngine_->toNumber(args[0]);
-                cancelUvTimer(id);
-                return jsEngine_->newUndefined();
-            })
-        );
-    }
-#endif // MYSTRAL_USE_LIBUV_TIMERS
-
-#ifndef MYSTRAL_USE_LIBUV_TIMERS
-    void setupChronoTimers() {
-        // setTimeout (fallback using std::chrono)
-        jsEngine_->setGlobalProperty("setTimeout",
-            jsEngine_->newFunction("setTimeout", [this](void* ctx, const std::vector<js::JSValueHandle>& args) {
-                if (args.empty()) {
-                    return jsEngine_->newNumber(-1);
-                }
-
-                int delay = 0;
-                if (args.size() > 1) {
-                    delay = (int)jsEngine_->toNumber(args[1]);
-                }
-
-                int id = nextTimerId_++;
-                jsEngine_->protect(args[0]);
-
-                auto targetTime = std::chrono::high_resolution_clock::now() +
-                                  std::chrono::milliseconds(delay);
-
-                timerCallbacks_.push_back({id, args[0], targetTime, 0, false});
-
-                return jsEngine_->newNumber(id);
-            })
-        );
-
-        // clearTimeout (fallback)
-        jsEngine_->setGlobalProperty("clearTimeout",
-            jsEngine_->newFunction("clearTimeout", [this](void* ctx, const std::vector<js::JSValueHandle>& args) {
-                if (args.empty()) {
-                    return jsEngine_->newUndefined();
-                }
-
-                int id = (int)jsEngine_->toNumber(args[0]);
-
-                for (auto& timer : timerCallbacks_) {
-                    if (timer.id == id && !timer.cancelled) {
-                        timer.cancelled = true;
-                        jsEngine_->unprotect(timer.callback);
-                        break;
-                    }
-                }
-
-                return jsEngine_->newUndefined();
-            })
-        );
-
-        // setInterval (fallback)
-        jsEngine_->setGlobalProperty("setInterval",
-            jsEngine_->newFunction("setInterval", [this](void* ctx, const std::vector<js::JSValueHandle>& args) {
-                if (args.empty()) {
-                    return jsEngine_->newNumber(-1);
-                }
-
-                int delay = 0;
-                if (args.size() > 1) {
-                    delay = (int)jsEngine_->toNumber(args[1]);
-                }
-                if (delay < 1) delay = 1;
-
-                int id = nextTimerId_++;
-                jsEngine_->protect(args[0]);
-
-                auto targetTime = std::chrono::high_resolution_clock::now() +
-                                  std::chrono::milliseconds(delay);
-
-                timerCallbacks_.push_back({id, args[0], targetTime, delay, false});
-
-                return jsEngine_->newNumber(id);
-            })
-        );
-
-        // clearInterval (fallback)
-        jsEngine_->setGlobalProperty("clearInterval",
-            jsEngine_->newFunction("clearInterval", [this](void* ctx, const std::vector<js::JSValueHandle>& args) {
-                if (args.empty()) {
-                    return jsEngine_->newUndefined();
-                }
-
-                int id = (int)jsEngine_->toNumber(args[0]);
-                cancelledTimerIds_.insert(id);
-
-                for (auto& timer : timerCallbacks_) {
-                    if (timer.id == id && !timer.cancelled) {
-                        timer.cancelled = true;
-                        jsEngine_->unprotect(timer.callback);
-                        break;
-                    }
-                }
-
-                return jsEngine_->newUndefined();
-            })
-        );
-    }
-#endif // !MYSTRAL_USE_LIBUV_TIMERS
 
     void setupAgentBridge() {
         if (!jsEngine_) return;
 
-        const char* source = R"JS(
-(() => {
-    const inspectors = new Map();
-    const actions = new Map();
-
-    function requireId(id, type) {
-        if (typeof id !== 'string' || id.length === 0) {
-            throw new TypeError(type + ' id must be a non-empty string');
-        }
-        return id;
-    }
-
-    function optionsOrEmpty(options) {
-        return options && typeof options === 'object' ? options : {};
-    }
-
-    function compareById(a, b) {
-        return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
-    }
-
-    const api = {
-        version: 1,
-
-        exposeInspector(id, inspect, options = {}) {
-            id = requireId(id, 'Inspector');
-            if (typeof inspect !== 'function') {
-                throw new TypeError('Inspector ' + id + ' must be a function');
-            }
-            options = optionsOrEmpty(options);
-            const record = {
-                id,
-                inspect,
-                label: options.label === undefined ? id : String(options.label),
-                kind: options.kind === undefined ? 'entity' : String(options.kind),
-                description: options.description === undefined ? '' : String(options.description)
-            };
-            inspectors.set(id, record);
-            return () => inspectors.get(id) === record && inspectors.delete(id);
-        },
-
-        exposeAction(id, run, options = {}) {
-            id = requireId(id, 'Action');
-            if (typeof run !== 'function') {
-                throw new TypeError('Action ' + id + ' must be a function');
-            }
-            options = optionsOrEmpty(options);
-            const record = {
-                id,
-                run,
-                description: options.description === undefined ? '' : String(options.description),
-                entityId: options.entityId === undefined ? null : String(options.entityId),
-                inputSchema: options.inputSchema === undefined ? null : options.inputSchema
-            };
-            actions.set(id, record);
-            return () => actions.get(id) === record && actions.delete(id);
-        },
-
-        removeInspector(id) {
-            return inspectors.delete(String(id));
-        },
-
-        removeAction(id) {
-            return actions.delete(String(id));
-        },
-
-        clear() {
-            inspectors.clear();
-            actions.clear();
-        }
-    };
-
-    function dispatch(method, params) {
-        params = optionsOrEmpty(params);
-
-        if (method === 'list') {
-            return {
-                entities: Array.from(inspectors.values(), (record) => ({
-                    id: record.id,
-                    label: record.label,
-                    kind: record.kind,
-                    description: record.description
-                })).sort(compareById),
-                actions: Array.from(actions.values(), (record) => ({
-                    id: record.id,
-                    description: record.description,
-                    entityId: record.entityId,
-                    inputSchema: record.inputSchema
-                })).sort(compareById)
-            };
-        }
-
-        if (method === 'inspect') {
-            const id = requireId(params.id, 'Inspector');
-            const record = inspectors.get(id);
-            if (!record) throw new Error('Unknown inspector: ' + id);
-            const snapshot = record.inspect(params.input);
-            if (snapshot && typeof snapshot.then === 'function') {
-                throw new Error('Inspector ' + id + ' returned a Promise; inspectors must be synchronous');
-            }
-            return { id, snapshot: snapshot === undefined ? null : snapshot };
-        }
-
-        if (method === 'act') {
-            const id = requireId(params.id, 'Action');
-            const record = actions.get(id);
-            if (!record) throw new Error('Unknown action: ' + id);
-            const result = record.run(params.input);
-            if (result && typeof result.then === 'function') {
-                throw new Error('Action ' + id + ' returned a Promise; agent actions must be synchronous');
-            }
-            return { id, result: result === undefined ? null : result };
-        }
-
-        throw new Error('Unknown agent method: ' + method);
-    }
-
-    Object.defineProperty(api, '__dispatch', { value: dispatch });
-    Object.freeze(api);
-    Object.defineProperty(globalThis, 'mystralAgent', {
-        value: api,
-        writable: false,
-        configurable: false,
-        enumerable: false
-    });
-})();
-)JS";
+        const char* source = js::runtime_sources::agentBridge();
 
         if (!jsEngine_->evalScript(source, "<agent-bridge>")) {
             std::cerr << "[Mystral] Failed to initialize agent bridge" << std::endl;
@@ -2028,6 +1337,12 @@ private:
                 auto result = jsEngine_->newObject();
                 jsEngine_->setProperty(result, "frame", jsEngine_->newNumber(static_cast<double>(frameCount_)));
                 jsEngine_->setProperty(result, "paused", jsEngine_->newBoolean(paused_));
+                const auto gameState = gameLoop_.state();
+                const auto& gameStats = gameLoop_.stats();
+                jsEngine_->setProperty(result, "gameLoopRunning", jsEngine_->newBoolean(gameState.running));
+                jsEngine_->setProperty(result, "gameLoopPaused", jsEngine_->newBoolean(gameState.paused));
+                jsEngine_->setProperty(result, "gameTickCount", jsEngine_->newNumber(static_cast<double>(gameState.tickCount)));
+                jsEngine_->setProperty(result, "gameTicksDropped", jsEngine_->newNumber(static_cast<double>(gameStats.ticksDropped)));
                 jsEngine_->setProperty(result, "heapUsedBytes", jsEngine_->newNumber(static_cast<double>(memory.heapUsedBytes)));
                 jsEngine_->setProperty(result, "heapTotalBytes", jsEngine_->newNumber(static_cast<double>(memory.heapTotalBytes)));
                 jsEngine_->setProperty(result, "heapLimitBytes", jsEngine_->newNumber(static_cast<double>(memory.heapLimitBytes)));
@@ -2185,1093 +1500,11 @@ private:
         );
 
         // JavaScript polyfill that creates localStorage and sessionStorage globals
-        const char* storagePolyfill = R"JS(
-// localStorage - backed by native C++ file storage
-(function() {
-    function createStorage(nativeBacked) {
-        // In-memory store for sessionStorage (or fallback)
-        var memStore = {};
-        var memKeys = [];
-
-        var storage = {
-            getItem: function(key) {
-                key = String(key);
-                if (nativeBacked) {
-                    return __storageGetItem(key);
-                }
-                return memStore.hasOwnProperty(key) ? memStore[key] : null;
-            },
-            setItem: function(key, value) {
-                key = String(key);
-                value = String(value);
-                if (nativeBacked) {
-                    __storageSetItem(key, value);
-                } else {
-                    if (!memStore.hasOwnProperty(key)) {
-                        memKeys.push(key);
-                    }
-                    memStore[key] = value;
-                }
-            },
-            removeItem: function(key) {
-                key = String(key);
-                if (nativeBacked) {
-                    __storageRemoveItem(key);
-                } else {
-                    if (memStore.hasOwnProperty(key)) {
-                        delete memStore[key];
-                        var idx = memKeys.indexOf(key);
-                        if (idx !== -1) memKeys.splice(idx, 1);
-                    }
-                }
-            },
-            clear: function() {
-                if (nativeBacked) {
-                    __storageClear();
-                } else {
-                    memStore = {};
-                    memKeys = [];
-                }
-            },
-            key: function(index) {
-                if (nativeBacked) {
-                    return __storageKey(index);
-                }
-                return index >= 0 && index < memKeys.length ? memKeys[index] : null;
-            },
-            get length() {
-                if (nativeBacked) {
-                    return __storageLength();
-                }
-                return memKeys.length;
-            }
-        };
-
-        // Wrap with Proxy for bracket access (localStorage['key'] and localStorage.key)
-        if (typeof Proxy !== 'undefined') {
-            return new Proxy(storage, {
-                get: function(target, prop) {
-                    // Return own methods/properties first
-                    if (prop in target) return target[prop];
-                    if (typeof prop === 'symbol') return undefined;
-                    // Treat as getItem
-                    return target.getItem(prop);
-                },
-                set: function(target, prop, value) {
-                    // Don't intercept known method names
-                    if (prop === 'getItem' || prop === 'setItem' || prop === 'removeItem' ||
-                        prop === 'clear' || prop === 'key' || prop === 'length') {
-                        return false;
-                    }
-                    if (typeof prop === 'symbol') return false;
-                    target.setItem(prop, value);
-                    return true;
-                },
-                deleteProperty: function(target, prop) {
-                    target.removeItem(prop);
-                    return true;
-                }
-            });
-        }
-
-        return storage;
-    }
-
-    // localStorage: backed by native C++ file storage (persistent)
-    globalThis.localStorage = createStorage(true);
-
-    // sessionStorage: in-memory only (cleared when app closes)
-    globalThis.sessionStorage = createStorage(false);
-})();
-)JS";
+        const char* storagePolyfill = js::runtime_sources::storagePolyfill();
 
         jsEngine_->eval(storagePolyfill, "storage-polyfill.js");
     }
 
-    void setupFetch() {
-        if (!jsEngine_) return;
-
-        // Native file reading function - uses SDL on Android for asset access
-        jsEngine_->setGlobalProperty("__readFileSync",
-            jsEngine_->newFunction("__readFileSync", [this](void* ctx, const std::vector<js::JSValueHandle>& args) {
-                if (args.empty()) {
-                    return jsEngine_->newNull();
-                }
-
-                std::string path = jsEngine_->toString(args[0]);
-
-                // Handle file:// prefix
-                if (path.substr(0, 7) == "file://") {
-                    path = path.substr(7);
-                }
-
-                // Check embedded bundle first (if present)
-                std::vector<uint8_t> embeddedData;
-                if (vfs::readEmbeddedFile(path, embeddedData)) {
-                    std::cout << "[Fetch] Read " << embeddedData.size() << " bytes from bundle: " << path << std::endl;
-                    return jsEngine_->newArrayBuffer(embeddedData.data(), embeddedData.size());
-                }
-
-#if defined(__ANDROID__)
-                // On Android, use SDL_IOFromFile which can read from assets
-                SDL_IOStream* io = SDL_IOFromFile(path.c_str(), "rb");
-                if (!io) {
-                    std::cerr << "[Fetch] Failed to open file (SDL): " << path << " - " << SDL_GetError() << std::endl;
-                    return jsEngine_->newNull();
-                }
-
-                Sint64 size = SDL_GetIOSize(io);
-                if (size < 0) {
-                    std::cerr << "[Fetch] Failed to get file size: " << path << std::endl;
-                    SDL_CloseIO(io);
-                    return jsEngine_->newNull();
-                }
-
-                std::vector<uint8_t> buffer(static_cast<size_t>(size));
-                size_t bytesRead = SDL_ReadIO(io, buffer.data(), static_cast<size_t>(size));
-                SDL_CloseIO(io);
-
-                if (bytesRead != static_cast<size_t>(size)) {
-                    std::cerr << "[Fetch] Failed to read file: " << path << std::endl;
-                    return jsEngine_->newNull();
-                }
-
-                std::cout << "[Fetch] Read " << size << " bytes from (SDL): " << path << std::endl;
-                return jsEngine_->newArrayBuffer(buffer.data(), buffer.size());
-#else
-                // On other platforms, use std::ifstream
-                std::ifstream file(path, std::ios::binary | std::ios::ate);
-                if (!file.is_open()) {
-                    std::cerr << "[Fetch] Failed to open file: " << path << std::endl;
-                    return jsEngine_->newNull();
-                }
-
-                size_t size = file.tellg();
-                file.seekg(0, std::ios::beg);
-
-                std::vector<uint8_t> buffer(size);
-                if (!file.read(reinterpret_cast<char*>(buffer.data()), size)) {
-                    std::cerr << "[Fetch] Failed to read file: " << path << std::endl;
-                    return jsEngine_->newNull();
-                }
-
-                std::cout << "[Fetch] Read " << size << " bytes from: " << path << std::endl;
-                return jsEngine_->newArrayBuffer(buffer.data(), buffer.size());
-#endif
-            })
-        );
-
-        // Async asset file reading through the native priority job system.
-        // Takes (path, callback) where callback receives (data, error)
-        jsEngine_->setGlobalProperty("__readFileAsync",
-            jsEngine_->newFunction("__readFileAsync", [this](void* ctx, const std::vector<js::JSValueHandle>& args) {
-                if (args.size() < 2) {
-                    std::cerr << "[Fetch Async] Missing arguments (need path, callback)" << std::endl;
-                    return jsEngine_->newUndefined();
-                }
-
-                std::string path = jsEngine_->toString(args[0]);
-
-                // Handle file:// prefix
-                if (path.substr(0, 7) == "file://") {
-                    path = path.substr(7);
-                }
-
-                // Get and protect the callback so it survives until we call it
-                auto callback = args[1];
-                jsEngine_->protect(callback);
-
-                const uint64_t generation = jsGeneration_;
-
-                // Check embedded bundle first (synchronously - it's fast)
-                std::vector<uint8_t> embeddedData;
-                if (vfs::readEmbeddedFile(path, embeddedData)) {
-                    std::cout << "[Fetch] Read " << embeddedData.size() << " bytes from bundle: " << path << std::endl;
-                    // Queue callback for next tick instead of calling immediately
-                    // This prevents stack overflow and matches browser async behavior
-                    pendingFileCallbacks_.push({
-                        callback,
-                        std::move(embeddedData),
-                        "" // no error
-                    });
-                    return jsEngine_->newUndefined();
-                }
-
-                // The callback is completed on the main thread when native jobs drain.
-                fs::getAsyncFileReader().readFile(path, [this, callback, generation](std::vector<uint8_t> data, std::string error) {
-                    if (generation != jsGeneration_) return;
-                    // Queue the callback with data for processing in the main loop
-                    pendingFileCallbacks_.push({
-                        callback,
-                        std::move(data),
-                        std::move(error)
-                    });
-                }, generation, async::JobPriority::Streaming);
-
-                return jsEngine_->newUndefined();
-            })
-        );
-
-        // Native HTTP request function
-        jsEngine_->setGlobalProperty("__httpRequest",
-            jsEngine_->newFunction("__httpRequest", [this](void* ctx, const std::vector<js::JSValueHandle>& args) {
-                if (args.empty()) {
-                    return jsEngine_->newNull();
-                }
-
-                std::string url = jsEngine_->toString(args[0]);
-                std::string method = "GET";
-                std::vector<uint8_t> body;
-                http::HttpOptions options;
-
-                // Parse options object if provided
-                if (args.size() > 1 && !jsEngine_->isUndefined(args[1])) {
-                    auto optObj = args[1];
-
-                    auto methodVal = jsEngine_->getProperty(optObj, "method");
-                    if (!jsEngine_->isUndefined(methodVal)) {
-                        method = jsEngine_->toString(methodVal);
-                    }
-
-                    auto headersVal = jsEngine_->getProperty(optObj, "headers");
-                    if (!jsEngine_->isUndefined(headersVal)) {
-                        // Get header keys - this is simplified, real impl would iterate
-                        // For now, just handle common headers
-                    }
-
-                    auto bodyVal = jsEngine_->getProperty(optObj, "body");
-                    if (!jsEngine_->isUndefined(bodyVal)) {
-                        if (jsEngine_->isString(bodyVal)) {
-                            std::string bodyStr = jsEngine_->toString(bodyVal);
-                            body.assign(bodyStr.begin(), bodyStr.end());
-                        } else {
-                            // Try to get as ArrayBuffer
-                            size_t size = 0;
-                            void* data = jsEngine_->getArrayBufferData(bodyVal, &size);
-                            if (data && size > 0) {
-                                body.assign(static_cast<uint8_t*>(data), static_cast<uint8_t*>(data) + size);
-                            }
-                        }
-                    }
-                }
-
-                std::cout << "[HTTP] " << method << " " << url << std::endl;
-
-                // Perform HTTP request
-                auto& client = http::getHttpClient();
-                http::HttpResponse response = client.request(method, url, body, options);
-
-                // Create result object
-                auto result = jsEngine_->newObject();
-                jsEngine_->setProperty(result, "ok", jsEngine_->newBoolean(response.ok));
-                jsEngine_->setProperty(result, "status", jsEngine_->newNumber(response.status));
-                jsEngine_->setProperty(result, "url", jsEngine_->newString(response.url.c_str()));
-
-                if (!response.error.empty()) {
-                    jsEngine_->setProperty(result, "error", jsEngine_->newString(response.error.c_str()));
-                }
-
-                // Set response data as ArrayBuffer
-                if (!response.data.empty()) {
-                    auto arrayBuffer = jsEngine_->newArrayBuffer(response.data.data(), response.data.size());
-                    jsEngine_->setProperty(result, "data", arrayBuffer);
-                } else {
-                    jsEngine_->setProperty(result, "data", jsEngine_->newNull());
-                }
-
-                std::cout << "[HTTP] Response: " << response.status << " (" << response.data.size() << " bytes)" << std::endl;
-
-                return result;
-            })
-        );
-
-        // Async HTTP request function - uses libuv for non-blocking I/O
-        // Takes (url, options, callback) where callback receives the result object
-        jsEngine_->setGlobalProperty("__httpRequestAsync",
-            jsEngine_->newFunction("__httpRequestAsync", [this](void* ctx, const std::vector<js::JSValueHandle>& args) {
-                if (args.size() < 3) {
-                    std::cerr << "[HTTP Async] Missing arguments (need url, options, callback)" << std::endl;
-                    return jsEngine_->newUndefined();
-                }
-
-                std::string url = jsEngine_->toString(args[0]);
-                std::string method = "GET";
-                std::vector<uint8_t> body;
-                http::HttpOptions options;
-
-                // Parse options object
-                if (!jsEngine_->isUndefined(args[1]) && !jsEngine_->isNull(args[1])) {
-                    auto optObj = args[1];
-
-                    auto methodVal = jsEngine_->getProperty(optObj, "method");
-                    if (!jsEngine_->isUndefined(methodVal)) {
-                        method = jsEngine_->toString(methodVal);
-                    }
-
-                    auto bodyVal = jsEngine_->getProperty(optObj, "body");
-                    if (!jsEngine_->isUndefined(bodyVal)) {
-                        if (jsEngine_->isString(bodyVal)) {
-                            std::string bodyStr = jsEngine_->toString(bodyVal);
-                            body.assign(bodyStr.begin(), bodyStr.end());
-                        } else {
-                            size_t size = 0;
-                            void* data = jsEngine_->getArrayBufferData(bodyVal, &size);
-                            if (data && size > 0) {
-                                body.assign(static_cast<uint8_t*>(data), static_cast<uint8_t*>(data) + size);
-                            }
-                        }
-                    }
-                }
-
-                // Get and protect the callback
-                auto callback = args[2];
-                jsEngine_->protect(callback);
-
-                const uint64_t generation = jsGeneration_;
-
-                // Start async request
-                http::getAsyncHttpClient().request(method, url, body,
-                    [this, callback, generation](http::HttpResponse response) {
-                        if (generation != jsGeneration_) return;
-                        auto* engine = jsEngine_.get();
-                        if (!engine) return;
-                        // This runs on the main thread when the response arrives
-                        // Create result object
-                        auto result = engine->newObject();
-                        engine->setProperty(result, "ok", engine->newBoolean(response.ok));
-                        engine->setProperty(result, "status", engine->newNumber(response.status));
-                        engine->setProperty(result, "url", engine->newString(response.url.c_str()));
-
-                        if (!response.error.empty()) {
-                            engine->setProperty(result, "error", engine->newString(response.error.c_str()));
-                        }
-
-                        if (!response.data.empty()) {
-                            auto arrayBuffer = engine->newArrayBuffer(response.data.data(), response.data.size());
-                            engine->setProperty(result, "data", arrayBuffer);
-                        } else {
-                            engine->setProperty(result, "data", engine->newNull());
-                        }
-
-                        // Call the JS callback with the result
-                        std::vector<js::JSValueHandle> callbackArgs = { result };
-                        engine->call(callback, engine->newUndefined(), callbackArgs);
-
-                        // Unprotect the callback now that we're done
-                        engine->unprotect(callback);
-                    },
-                    options
-                );
-
-                return jsEngine_->newUndefined();
-            })
-        );
-
-        // JavaScript fetch polyfill
-        const char* fetchPolyfill = R"(
-// TextDecoder polyfill (if not available)
-if (typeof TextDecoder === 'undefined') {
-    class TextDecoder {
-        constructor(encoding = 'utf-8') {
-            this.encoding = encoding;
-        }
-        decode(input) {
-            if (!input) return '';
-            const bytes = input instanceof Uint8Array ? input : new Uint8Array(input);
-            let result = '';
-            for (let i = 0; i < bytes.length; i++) {
-                result += String.fromCharCode(bytes[i]);
-            }
-            // Handle UTF-8 decoding properly
-            try {
-                return decodeURIComponent(escape(result));
-            } catch (e) {
-                return result;
-            }
-        }
-    }
-    globalThis.TextDecoder = TextDecoder;
-}
-
-// TextEncoder polyfill (if not available)
-if (typeof TextEncoder === 'undefined') {
-    class TextEncoder {
-        constructor() {
-            this.encoding = 'utf-8';
-        }
-        encode(str) {
-            const utf8 = unescape(encodeURIComponent(str));
-            const result = new Uint8Array(utf8.length);
-            for (let i = 0; i < utf8.length; i++) {
-                result[i] = utf8.charCodeAt(i);
-            }
-            return result;
-        }
-    }
-    globalThis.TextEncoder = TextEncoder;
-}
-
-// AbortController / AbortSignal polyfill (Web API standard)
-// Three.js' FileLoader/GLTFLoader (r168+) construct an AbortController to
-// manage fetch cancellation, so these globals must exist or loading throws
-// "ReferenceError: AbortController is not defined". MystralNative's native
-// fetch cannot cancel an in-flight request, but it honors an aborted signal
-// by rejecting the fetch promise (see fetch() below).
-if (typeof AbortSignal === 'undefined') {
-    const makeAbortError = function (name, message) {
-        const error = new Error(message);
-        error.name = name;
-        return error;
-    };
-    class AbortSignal {
-        constructor() {
-            this.aborted = false;
-            this.reason = undefined;
-            this.onabort = null;
-            this._listeners = [];
-        }
-        addEventListener(type, listener) {
-            if (type === 'abort' && typeof listener === 'function') {
-                this._listeners.push(listener);
-            }
-        }
-        removeEventListener(type, listener) {
-            if (type === 'abort') {
-                this._listeners = this._listeners.filter(function (l) { return l !== listener; });
-            }
-        }
-        dispatchEvent(event) {
-            if (event && event.type === 'abort') {
-                if (typeof this.onabort === 'function') this.onabort(event);
-                const listeners = this._listeners.slice();
-                for (let i = 0; i < listeners.length; i++) listeners[i](event);
-            }
-            return true;
-        }
-        throwIfAborted() {
-            if (this.aborted) throw (this.reason !== undefined
-                ? this.reason
-                : makeAbortError('AbortError', 'The operation was aborted'));
-        }
-        _fireAbort(reason) {
-            if (this.aborted) return;
-            this.aborted = true;
-            this.reason = (reason !== undefined
-                ? reason
-                : makeAbortError('AbortError', 'The operation was aborted'));
-            this.dispatchEvent({ type: 'abort', target: this });
-        }
-        static abort(reason) {
-            const signal = new AbortSignal();
-            signal._fireAbort(reason);
-            return signal;
-        }
-        static timeout(ms) {
-            const signal = new AbortSignal();
-            setTimeout(function () {
-                signal._fireAbort(makeAbortError('TimeoutError', 'The operation timed out'));
-            }, ms);
-            return signal;
-        }
-        static any(signals) {
-            const result = new AbortSignal();
-            const list = Array.from(signals || []);
-            for (let i = 0; i < list.length; i++) {
-                const s = list[i];
-                if (!s) continue;
-                if (s.aborted) { result._fireAbort(s.reason); return result; }
-                s.addEventListener('abort', function () { result._fireAbort(s.reason); });
-            }
-            return result;
-        }
-    }
-    globalThis.AbortSignal = AbortSignal;
-}
-
-if (typeof AbortController === 'undefined') {
-    class AbortController {
-        constructor() {
-            this.signal = new AbortSignal();
-        }
-        abort(reason) {
-            this.signal._fireAbort(reason);
-        }
-    }
-    globalThis.AbortController = AbortController;
-}
-
-// Blob class (Web API standard)
-if (typeof Blob === 'undefined') {
-    class Blob {
-        constructor(blobParts = [], options = {}) {
-            this.type = options.type || '';
-
-            // Concatenate all parts into a single ArrayBuffer
-            let totalSize = 0;
-            const parts = [];
-
-            for (const part of blobParts) {
-                if (part instanceof ArrayBuffer) {
-                    parts.push(new Uint8Array(part));
-                    totalSize += part.byteLength;
-                } else if (part instanceof Uint8Array) {
-                    parts.push(part);
-                    totalSize += part.byteLength;
-                } else if (part instanceof Blob) {
-                    // Need to get the Blob's internal data
-                    parts.push(new Uint8Array(part._data));
-                    totalSize += part._data.byteLength;
-                } else if (typeof part === 'string') {
-                    const encoder = new TextEncoder();
-                    const encoded = encoder.encode(part);
-                    parts.push(encoded);
-                    totalSize += encoded.byteLength;
-                }
-            }
-
-            // Create final buffer
-            const buffer = new ArrayBuffer(totalSize);
-            const view = new Uint8Array(buffer);
-            let offset = 0;
-            for (const part of parts) {
-                view.set(part, offset);
-                offset += part.byteLength;
-            }
-
-            this._data = buffer;
-            this.size = totalSize;
-        }
-
-        async arrayBuffer() {
-            return this._data;
-        }
-
-        async text() {
-            const decoder = new TextDecoder();
-            return decoder.decode(new Uint8Array(this._data));
-        }
-
-        slice(start = 0, end = this.size, type = '') {
-            const data = new Uint8Array(this._data, start, end - start);
-            return new Blob([data], { type });
-        }
-
-        async stream() {
-            // ReadableStream not implemented yet
-            throw new Error('Blob.stream() not implemented');
-        }
-    }
-    globalThis.Blob = Blob;
-}
-
-// Headers class - mimics Web Headers API
-class Headers {
-    constructor(init = {}) {
-        this._headers = new Map();
-        if (init) {
-            if (init instanceof Headers) {
-                init.forEach((value, key) => this._headers.set(key.toLowerCase(), value));
-            } else if (Array.isArray(init)) {
-                init.forEach(([key, value]) => this._headers.set(key.toLowerCase(), value));
-            } else if (typeof init === 'object') {
-                Object.entries(init).forEach(([key, value]) => this._headers.set(key.toLowerCase(), value));
-            }
-        }
-    }
-
-    get(name) {
-        return this._headers.get(name.toLowerCase()) || null;
-    }
-
-    set(name, value) {
-        this._headers.set(name.toLowerCase(), value);
-    }
-
-    has(name) {
-        return this._headers.has(name.toLowerCase());
-    }
-
-    delete(name) {
-        this._headers.delete(name.toLowerCase());
-    }
-
-    entries() {
-        return this._headers.entries();
-    }
-
-    keys() {
-        return this._headers.keys();
-    }
-
-    values() {
-        return this._headers.values();
-    }
-
-    forEach(callback) {
-        this._headers.forEach((value, key) => callback(value, key, this));
-    }
-
-    [Symbol.iterator]() {
-        return this._headers.entries();
-    }
-}
-globalThis.Headers = Headers;
-
-// Response class
-class Response {
-    constructor(data, options = {}) {
-        this._data = data;
-        this.ok = options.ok !== undefined ? options.ok : true;
-        this.status = options.status || 200;
-        this.statusText = options.statusText || 'OK';
-        this.url = options.url || '';
-        this.headers = new Headers(options.headers || {});
-    }
-
-    async arrayBuffer() {
-        return this._data;
-    }
-
-    async text() {
-        const decoder = new TextDecoder();
-        return decoder.decode(new Uint8Array(this._data));
-    }
-
-    async json() {
-        const text = await this.text();
-        return JSON.parse(text);
-    }
-
-    async blob() {
-        return new Blob([this._data]);
-    }
-}
-
-// Request class (Web API standard) - Three.js' FileLoader (r168+) wraps the
-// URL in a Request (with headers/credentials/signal) before calling fetch().
-class Request {
-    constructor(input, init = {}) {
-        if (input && typeof input === 'object' && typeof input.url === 'string') {
-            this.url = input.url;
-            this.method = init.method || input.method || 'GET';
-            this.headers = new Headers(init.headers || input.headers || {});
-            this.credentials = init.credentials || input.credentials || 'same-origin';
-            this.signal = init.signal || input.signal || null;
-            this.body = init.body !== undefined ? init.body : (input.body != null ? input.body : null);
-        } else {
-            this.url = String(input);
-            this.method = (init.method || 'GET');
-            this.headers = new Headers(init.headers || {});
-            this.credentials = init.credentials || 'same-origin';
-            this.signal = init.signal || null;
-            this.body = init.body !== undefined ? init.body : null;
-        }
-        this.mode = init.mode || 'cors';
-    }
-}
-globalThis.Request = Request;
-
-// Fetch function - supports file://, http://, and https://
-// HTTP requests are now async via libuv (non-blocking)
-// Accepts either a URL string or a Request object (Three.js passes a Request).
-async function fetch(input, options = {}) {
-    let url;
-    if (input && typeof input === 'object' && typeof input.url === 'string') {
-        // Unwrap a Request object: pull url + per-request fields unless overridden.
-        url = input.url;
-        if (options.signal === undefined && input.signal) options.signal = input.signal;
-        if (options.method === undefined && input.method) options.method = input.method;
-        if (options.headers === undefined && input.headers) options.headers = input.headers;
-        if (options.body === undefined && input.body != null) options.body = input.body;
-    } else {
-        url = String(input);
-    }
-
-    // AbortController support: reject up-front if the signal is already aborted.
-    // The native request itself cannot be cancelled mid-flight, but a late abort
-    // rejects the promise (the in-flight native op simply completes and is ignored).
-    const signal = options && options.signal;
-    const abortError = () => (signal && signal.reason !== undefined ? signal.reason : new Error('AbortError'));
-    if (signal && signal.aborted) {
-        return Promise.reject(abortError());
-    }
-
-    // blob: URLs - created via URL.createObjectURL(). Three.js GLTFLoader uses
-    // these for embedded (GLB) and external textures, fetched by ImageBitmapLoader.
-    if (url.startsWith('blob:')) {
-        const blob = (typeof URL !== 'undefined' && URL._getBlobData) ? URL._getBlobData(url) : null;
-        if (!blob) {
-            return new Response(new ArrayBuffer(0), { ok: false, status: 404, statusText: 'Not Found', url });
-        }
-        let data = blob._data;
-        if (data instanceof Uint8Array) data = data.buffer;
-        if (!(data instanceof ArrayBuffer)) data = new ArrayBuffer(0);
-        return new Response(data, {
-            ok: true, status: 200, statusText: 'OK', url,
-            headers: { 'content-type': blob.type || '' }
-        });
-    }
-
-    // Check URL type
-    if (url.startsWith('http://') || url.startsWith('https://')) {
-        // HTTP/HTTPS request via async libcurl + libuv (non-blocking)
-        return new Promise((resolve, reject) => {
-            if (signal) signal.addEventListener('abort', () => reject(abortError()));
-            __httpRequestAsync(url, options, (result) => {
-                if (result.error) {
-                    reject(new Error('Fetch error: ' + result.error));
-                } else {
-                    resolve(new Response(result.data || new ArrayBuffer(0), {
-                        ok: result.ok,
-                        status: result.status,
-                        statusText: result.ok ? 'OK' : 'Error',
-                        url: result.url || url
-                    }));
-                }
-            });
-        });
-    }
-
-    // File URL or relative path - use async file reading for non-blocking I/O
-    let path = url;
-    if (url.startsWith('file://')) {
-        path = url;
-    } else if (!url.includes('://')) {
-        // Relative path - treat as file
-        path = url;
-    } else {
-        throw new Error('Unsupported URL scheme: ' + url.split('://')[0]);
-    }
-
-    // Use async file reading to avoid blocking the render loop
-    return new Promise((resolve, reject) => {
-        if (signal) signal.addEventListener('abort', () => reject(abortError()));
-        __readFileAsync(path, (data, error) => {
-            if (error) {
-                reject(new Error('File read error: ' + error));
-            } else if (data === null) {
-                resolve(new Response(new ArrayBuffer(0), {
-                    ok: false,
-                    status: 404,
-                    statusText: 'Not Found',
-                    url: url
-                }));
-            } else {
-                resolve(new Response(data, {
-                    ok: true,
-                    status: 200,
-                    statusText: 'OK',
-                    url: url
-                }));
-            }
-        });
-    });
-}
-
-// Also expose globally
-globalThis.fetch = fetch;
-globalThis.Response = Response;
-)";
-
-        jsEngine_->eval(fetchPolyfill, "fetch-polyfill.js");
-        std::cout << "[Mystral] Fetch API initialized (file://, http://, https://)" << std::endl;
-
-        // --- WHATWG Streams -------------------------------------------------
-        // Real (spec-shaped) ReadableStream / WritableStream / TransformStream
-        // plus TextEncoderStream / TextDecoderStream. These back the
-        // WebTransport API (so its readable/writable support pipeTo/pipeThrough,
-        // tee and async iteration) and are also available to user code. Each is
-        // guarded by typeof-undefined so a native engine implementation wins.
-        const char* streamsPolyfill = R"STREAMS(
-(function () {
-  const AS_ITER = Symbol.asyncIterator;
-
-  if (typeof globalThis.ReadableStream === 'undefined') {
-    class ReadableStreamDefaultController {
-      constructor(stream) { this._stream = stream; }
-      enqueue(chunk) { this._stream._enqueue(chunk); }
-      close() { this._stream._close(); }
-      error(e) { this._stream._error(e); }
-      get desiredSize() {
-        const s = this._stream;
-        if (s._state === 'errored') return null;
-        if (s._state === 'closed') return 0;
-        return 1;
-      }
-    }
-
-    class ReadableStreamDefaultReader {
-      constructor(stream) {
-        this._stream = stream;
-        let res, rej;
-        this._closedPromise = new Promise((a, b) => { res = a; rej = b; });
-        this._closedResolve = res; this._closedReject = rej;
-        this._closedPromise.catch(() => {});
-        if (stream._state === 'closed') res();
-        else if (stream._state === 'errored') rej(stream._storedError);
-      }
-      read() {
-        const s = this._stream;
-        if (!s) return Promise.reject(new TypeError('Reader has been released'));
-        if (s._queue.length) return Promise.resolve({ value: s._queue.shift(), done: false });
-        if (s._state === 'errored') return Promise.reject(s._storedError);
-        if (s._state === 'closed') return Promise.resolve({ value: undefined, done: true });
-        return new Promise((resolve, reject) => s._readRequests.push({ resolve, reject }));
-      }
-      cancel(reason) { return this._stream ? this._stream.cancel(reason) : Promise.resolve(); }
-      releaseLock() {
-        if (!this._stream) return;
-        this._stream._reader = null;
-        this._stream = null;
-      }
-      get closed() { return this._closedPromise; }
-    }
-
-    class ReadableStream {
-      constructor(underlyingSource = {}, strategy = {}) {
-        this._queue = [];
-        this._readRequests = [];
-        this._state = 'readable';
-        this._storedError = undefined;
-        this._reader = null;
-        this._source = underlyingSource || {};
-        this._controller = new ReadableStreamDefaultController(this);
-        if (typeof this._source.start === 'function') {
-          try { Promise.resolve(this._source.start(this._controller)).catch((e) => this._error(e)); }
-          catch (e) { this._error(e); }
-        }
-      }
-      _enqueue(chunk) {
-        if (this._state !== 'readable') return;
-        if (this._readRequests.length) this._readRequests.shift().resolve({ value: chunk, done: false });
-        else this._queue.push(chunk);
-      }
-      _close() {
-        if (this._state !== 'readable') return;
-        this._state = 'closed';
-        while (this._readRequests.length) this._readRequests.shift().resolve({ value: undefined, done: true });
-        if (this._reader && this._reader._closedResolve) this._reader._closedResolve();
-      }
-      _error(e) {
-        if (this._state !== 'readable') return;
-        this._state = 'errored';
-        this._storedError = e;
-        while (this._readRequests.length) this._readRequests.shift().reject(e);
-        if (this._reader && this._reader._closedReject) this._reader._closedReject(e);
-      }
-      get locked() { return this._reader !== null; }
-      getReader(opts) {
-        if (opts && opts.mode === 'byob') throw new TypeError('BYOB readers are not supported');
-        if (this._reader) throw new TypeError('ReadableStream is locked to a reader');
-        this._reader = new ReadableStreamDefaultReader(this);
-        return this._reader;
-      }
-      cancel(reason) {
-        if (this._state === 'readable') {
-          this._queue = [];
-          try { if (typeof this._source.cancel === 'function') this._source.cancel(reason); } catch (e) {}
-          this._close();
-        }
-        return Promise.resolve();
-      }
-      async pipeTo(dest, options = {}) {
-        options = options || {};
-        const reader = this.getReader();
-        const writer = dest.getWriter();
-        try {
-          while (true) {
-            const { value, done } = await reader.read();
-            if (done) break;
-            if (writer.ready) { try { await writer.ready; } catch (e) {} }
-            await writer.write(value);
-          }
-          if (!options.preventClose) await writer.close();
-        } catch (e) {
-          if (!options.preventAbort) { try { await writer.abort(e); } catch (_) {} }
-          reader.releaseLock(); writer.releaseLock();
-          throw e;
-        }
-        reader.releaseLock();
-        writer.releaseLock();
-      }
-      pipeThrough(transform, options) {
-        if (!transform || !transform.writable || !transform.readable)
-          throw new TypeError('pipeThrough requires an object with { writable, readable }');
-        this.pipeTo(transform.writable, options).catch(() => {});
-        return transform.readable;
-      }
-      tee() {
-        const reader = this.getReader();
-        const boxA = {}; boxA.stream = new globalThis.ReadableStream({ start(c) { boxA.c = c; } });
-        const boxB = {}; boxB.stream = new globalThis.ReadableStream({ start(c) { boxB.c = c; } });
-        (async () => {
-          try {
-            while (true) {
-              const { value, done } = await reader.read();
-              if (done) { boxA.c.close(); boxB.c.close(); break; }
-              boxA.c.enqueue(value); boxB.c.enqueue(value);
-            }
-          } catch (e) { boxA.c.error(e); boxB.c.error(e); }
-        })();
-        return [boxA.stream, boxB.stream];
-      }
-      [AS_ITER]() {
-        const reader = this.getReader();
-        return {
-          next() { return reader.read(); },
-          return(v) { reader.releaseLock(); return Promise.resolve({ value: v, done: true }); },
-          [AS_ITER]() { return this; },
-        };
-      }
-    }
-    globalThis.ReadableStream = ReadableStream;
-  }
-
-  if (typeof globalThis.WritableStream === 'undefined') {
-    class WritableStreamDefaultWriter {
-      constructor(stream) {
-        this._stream = stream;
-        this.ready = Promise.resolve();
-        let r; this.closed = new Promise((res) => { r = res; }); this._closedResolve = r;
-        this.closed.catch(() => {});
-      }
-      write(chunk) {
-        const s = this._stream;
-        if (!s) return Promise.reject(new TypeError('Writer has been released'));
-        if (s._state === 'errored') return Promise.reject(s._storedError);
-        try { return Promise.resolve(s._sink.write ? s._sink.write(chunk, s._controller) : undefined); }
-        catch (e) { s._error(e); return Promise.reject(e); }
-      }
-      close() {
-        const s = this._stream;
-        if (!s) return Promise.resolve();
-        if (s._state === 'writable') s._state = 'closed';
-        if (this._closedResolve) this._closedResolve();
-        try { return Promise.resolve(s._sink.close ? s._sink.close() : undefined); }
-        catch (e) { return Promise.reject(e); }
-      }
-      abort(reason) {
-        const s = this._stream;
-        if (!s) return Promise.resolve();
-        s._state = 'errored'; s._storedError = reason;
-        try { return Promise.resolve(s._sink.abort ? s._sink.abort(reason) : undefined); }
-        catch (e) { return Promise.reject(e); }
-      }
-      get desiredSize() { return 1; }
-      releaseLock() { if (this._stream) { this._stream._writer = null; this._stream = null; } }
-    }
-
-    class WritableStreamDefaultController {
-      constructor(stream) { this._stream = stream; }
-      error(e) { this._stream._error(e); }
-    }
-
-    class WritableStream {
-      constructor(underlyingSink = {}, strategy = {}) {
-        this._sink = underlyingSink || {};
-        this._state = 'writable';
-        this._storedError = undefined;
-        this._writer = null;
-        this._controller = new WritableStreamDefaultController(this);
-        if (typeof this._sink.start === 'function') {
-          try { this._sink.start(this._controller); } catch (e) { this._error(e); }
-        }
-      }
-      _error(e) { if (this._state === 'writable') { this._state = 'errored'; this._storedError = e; } }
-      get locked() { return this._writer !== null; }
-      getWriter() {
-        if (this._writer) throw new TypeError('WritableStream is locked to a writer');
-        this._writer = new WritableStreamDefaultWriter(this);
-        return this._writer;
-      }
-      abort(reason) {
-        if (this._state === 'writable') {
-          this._state = 'errored'; this._storedError = reason;
-          try { if (this._sink.abort) this._sink.abort(reason); } catch (e) {}
-        }
-        return Promise.resolve();
-      }
-      close() {
-        if (this._state === 'writable') {
-          this._state = 'closed';
-          try { if (this._sink.close) return Promise.resolve(this._sink.close()); } catch (e) { return Promise.reject(e); }
-        }
-        return Promise.resolve();
-      }
-    }
-    globalThis.WritableStream = WritableStream;
-  }
-
-  if (typeof globalThis.TransformStream === 'undefined') {
-    class TransformStream {
-      constructor(transformer = {}, writableStrategy = {}, readableStrategy = {}) {
-        transformer = transformer || {};
-        const box = {};
-        this.readable = new globalThis.ReadableStream({ start(c) { box.c = c; } });
-        const transform = typeof transformer.transform === 'function'
-          ? transformer.transform
-          : (chunk, controller) => controller.enqueue(chunk);
-        const tc = {
-          enqueue: (chunk) => box.c.enqueue(chunk),
-          terminate: () => box.c.close(),
-          error: (e) => box.c.error(e),
-        };
-        this.writable = new globalThis.WritableStream({
-          start() { if (typeof transformer.start === 'function') return transformer.start(tc); },
-          write(chunk) { return transform(chunk, tc); },
-          close() {
-            const done = typeof transformer.flush === 'function' ? transformer.flush(tc) : undefined;
-            return Promise.resolve(done).then(() => box.c.close());
-          },
-          abort(reason) { box.c.error(reason); },
-        });
-      }
-    }
-    globalThis.TransformStream = TransformStream;
-  }
-
-  if (typeof globalThis.TextEncoderStream === 'undefined') {
-    class TextEncoderStream {
-      constructor() {
-        this.encoding = 'utf-8';
-        const encoder = new TextEncoder();
-        const ts = new globalThis.TransformStream({
-          transform(chunk, c) { c.enqueue(encoder.encode(chunk == null ? '' : String(chunk))); },
-        });
-        this.readable = ts.readable;
-        this.writable = ts.writable;
-      }
-    }
-    globalThis.TextEncoderStream = TextEncoderStream;
-  }
-
-  if (typeof globalThis.TextDecoderStream === 'undefined') {
-    class TextDecoderStream {
-      constructor(label = 'utf-8', options = {}) {
-        this.encoding = label || 'utf-8';
-        const decoder = new TextDecoder(this.encoding);
-        const ts = new globalThis.TransformStream({
-          transform(chunk, c) {
-            let bytes;
-            if (chunk instanceof Uint8Array) bytes = chunk;
-            else if (chunk instanceof ArrayBuffer) bytes = new Uint8Array(chunk);
-            else if (ArrayBuffer.isView(chunk)) bytes = new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength);
-            else bytes = chunk;
-            const text = decoder.decode(bytes);
-            if (text) c.enqueue(text);
-          },
-        });
-        this.readable = ts.readable;
-        this.writable = ts.writable;
-      }
-    }
-    globalThis.TextDecoderStream = TextDecoderStream;
-  }
-})();
-)STREAMS";
-        jsEngine_->eval(streamsPolyfill, "streams-polyfill.js");
-        std::cout << "[Mystral] Web Streams API initialized (ReadableStream/WritableStream/TransformStream)" << std::endl;
-    }
 
     void setupURL() {
         if (!jsEngine_) return;
@@ -3286,251 +1519,7 @@ globalThis.Response = Response;
         }
 
         // URL and URLSearchParams polyfills plus the native Worker facade.
-        const char* urlPolyfill = R"JS(
-// URLSearchParams polyfill
-if (typeof URLSearchParams === 'undefined') {
-    class URLSearchParams {
-        constructor(init) {
-            this._params = [];
-            if (typeof init === 'string') {
-                const str = init.startsWith('?') ? init.slice(1) : init;
-                if (str) {
-                    str.split('&').forEach(pair => {
-                        const eq = pair.indexOf('=');
-                        if (eq >= 0) {
-                            this._params.push([decodeURIComponent(pair.slice(0, eq)), decodeURIComponent(pair.slice(eq + 1))]);
-                        } else {
-                            this._params.push([decodeURIComponent(pair), '']);
-                        }
-                    });
-                }
-            } else if (init && typeof init === 'object') {
-                if (Array.isArray(init)) {
-                    init.forEach(([k, v]) => this._params.push([String(k), String(v)]));
-                } else {
-                    Object.entries(init).forEach(([k, v]) => this._params.push([String(k), String(v)]));
-                }
-            }
-        }
-        get(name) {
-            const entry = this._params.find(([k]) => k === name);
-            return entry ? entry[1] : null;
-        }
-        has(name) { return this._params.some(([k]) => k === name); }
-        set(name, value) {
-            const idx = this._params.findIndex(([k]) => k === name);
-            if (idx >= 0) this._params[idx] = [name, String(value)];
-            else this._params.push([name, String(value)]);
-        }
-        append(name, value) { this._params.push([String(name), String(value)]); }
-        delete(name) { this._params = this._params.filter(([k]) => k !== name); }
-        toString() {
-            return this._params.map(([k, v]) => encodeURIComponent(k) + '=' + encodeURIComponent(v)).join('&');
-        }
-        forEach(cb) { this._params.forEach(([k, v]) => cb(v, k, this)); }
-        entries() { return this._params[Symbol.iterator](); }
-        keys() { return this._params.map(([k]) => k)[Symbol.iterator](); }
-        values() { return this._params.map(([, v]) => v)[Symbol.iterator](); }
-        [Symbol.iterator]() { return this.entries(); }
-    }
-    globalThis.URLSearchParams = URLSearchParams;
-}
-
-// URL polyfill
-if (typeof URL === 'undefined') {
-    const _blobStore = new Map();
-    let _blobCounter = 0;
-
-    class URL {
-        constructor(url, base) {
-            if (typeof url !== 'string') url = String(url);
-            let fullUrl = url;
-
-            // Resolve relative URLs against base
-            if (base !== undefined) {
-                const b = typeof base === 'string' ? base : String(base);
-                if (/^[a-z][a-z0-9+.-]*:/i.test(url)) {
-                    // url is already absolute
-                    fullUrl = url;
-                } else if (url.startsWith('//')) {
-                    const proto = b.match(/^([a-z][a-z0-9+.-]*:)/i);
-                    fullUrl = (proto ? proto[1] : 'https:') + url;
-                } else if (url.startsWith('/')) {
-                    const origin = b.match(/^([a-z][a-z0-9+.-]*:\/\/[^/?#]*)/i);
-                    fullUrl = (origin ? origin[1] : '') + url;
-                } else {
-                    const baseNoQuery = b.split('?')[0].split('#')[0];
-                    const lastSlash = baseNoQuery.lastIndexOf('/');
-                    fullUrl = baseNoQuery.slice(0, lastSlash + 1) + url;
-                }
-            }
-
-            // Parse components
-            const match = fullUrl.match(/^([a-z][a-z0-9+.-]*:)?(\/\/([^/?#]*))?([^?#]*)(\?[^#]*)?(#.*)?$/i);
-            if (!match) throw new TypeError('Invalid URL: ' + url);
-
-            this.protocol = match[1] || '';
-            const authority = match[3] || '';
-            this.pathname = match[4] || '/';
-            this.search = match[5] || '';
-            this.hash = match[6] || '';
-
-            // Parse authority (userinfo@host:port)
-            const atIdx = authority.lastIndexOf('@');
-            const hostPart = atIdx >= 0 ? authority.slice(atIdx + 1) : authority;
-            const portMatch = hostPart.match(/:(\d+)$/);
-            this.port = portMatch ? portMatch[1] : '';
-            this.hostname = portMatch ? hostPart.slice(0, -portMatch[0].length) : hostPart;
-            this.host = this.port ? this.hostname + ':' + this.port : this.hostname;
-            this.origin = this.protocol ? this.protocol + '//' + this.host : '';
-            this.href = fullUrl;
-            this.username = '';
-            this.password = '';
-            if (atIdx >= 0) {
-                const userInfo = authority.slice(0, atIdx);
-                const colonIdx = userInfo.indexOf(':');
-                this.username = colonIdx >= 0 ? userInfo.slice(0, colonIdx) : userInfo;
-                this.password = colonIdx >= 0 ? userInfo.slice(colonIdx + 1) : '';
-            }
-            this.searchParams = new URLSearchParams(this.search);
-        }
-
-        toString() { return this.href; }
-        toJSON() { return this.href; }
-
-        static createObjectURL(blob) {
-            const id = 'blob:mystral-native/' + (_blobCounter++);
-            _blobStore.set(id, blob);
-            return id;
-        }
-
-        static revokeObjectURL(url) {
-            _blobStore.delete(url);
-        }
-
-        // Internal: retrieve blob data for Blob-backed Workers.
-        static _getBlobData(url) {
-            return _blobStore.get(url);
-        }
-    }
-
-    globalThis.URL = URL;
-}
-
-// Native Worker facade. Each instance owns an OS thread and a JS engine.
-if (typeof Worker === 'undefined') {
-    const nativeWorkers = new Map();
-
-    globalThis.__mystralDispatchWorkerMessage = function(id, type, payload, transfers) {
-        const worker = nativeWorkers.get(id);
-        if (!worker || worker._terminated) return;
-        if (type === 'ready') {
-            worker._ready = true;
-            return;
-        }
-        if (type === 'exit') {
-            worker._terminated = true;
-            nativeWorkers.delete(id);
-            return;
-        }
-        if (type === 'error') {
-            const event = { type: 'error', message: payload, error: new Error(payload), target: worker };
-            if (worker.onerror) worker.onerror.call(worker, event);
-            for (const listener of worker._errorListeners.slice()) listener.call(worker, event);
-            return;
-        }
-        const event = { type: 'message', data: __mystralParseMessage(payload, transfers), target: worker };
-        if (worker.onmessage) worker.onmessage.call(worker, event);
-        for (const listener of worker._messageListeners.slice()) listener.call(worker, event);
-    };
-
-    class NativeWorker {
-        constructor(url, options = {}) {
-            this.onmessage = null;
-            this.onerror = null;
-            this._terminated = false;
-            this._ready = false;
-            this._messageListeners = [];
-            this._errorListeners = [];
-
-            let kind = 1;
-            let code = '';
-            if (url && url._data) {
-                code = new TextDecoder().decode(new Uint8Array(url._data));
-                kind = 0;
-            } else if (typeof url === 'string' && url.startsWith('blob:')) {
-                const blob = URL._getBlobData(url);
-                if (blob && blob._data) {
-                    code = new TextDecoder().decode(new Uint8Array(blob._data));
-                    kind = 0;
-                }
-            } else {
-                code = String(url);
-            }
-
-            if (!code) throw new TypeError('Worker requires a script URL or Blob');
-            const limit = name => {
-                const value = options && options[name];
-                if (value === undefined) return undefined;
-                if (!Number.isSafeInteger(value) || value <= 0) {
-                    throw new RangeError('Worker ' + name + ' must be a positive safe integer');
-                }
-                return value;
-            };
-            const maxMessages = limit('maxMessages');
-            const maxMessageBytes = limit('maxMessageBytes');
-            const maxQueuedBytes = limit('maxQueuedBytes');
-            if (maxMessageBytes !== undefined && maxQueuedBytes !== undefined &&
-                maxMessageBytes > maxQueuedBytes) {
-                throw new RangeError('Worker maxMessageBytes cannot exceed maxQueuedBytes');
-            }
-            this._id = __mystralWorkerCreate(
-                kind,
-                code,
-                options && options.name ? String(options.name) : '',
-                maxMessages,
-                maxMessageBytes,
-                maxQueuedBytes,
-            );
-            if (this._id < 0) throw new Error('Failed to create Worker');
-            nativeWorkers.set(this._id, this);
-        }
-
-        postMessage(data, transferList = []) {
-            if (this._terminated) return;
-            const prepared = __mystralPrepareMessage(data, transferList);
-            const status = __mystralWorkerPostMessage(this._id, prepared.payload, prepared.transfers);
-            if (status === 0) return;
-            if (status === 2) throw new RangeError('Worker input queue is full');
-            if (status === 3) throw new RangeError('Worker message exceeds the input queue byte limit');
-            if (status === 5) throw new TypeError('Worker transfer list contains an invalid ArrayBuffer');
-            throw new Error('Worker is no longer running');
-        }
-
-        terminate() {
-            if (this._terminated) return;
-            this._terminated = true;
-            nativeWorkers.delete(this._id);
-            __mystralWorkerTerminate(this._id);
-        }
-
-        addEventListener(type, handler) {
-            if (typeof handler !== 'function') return;
-            if (type === 'message') this._messageListeners.push(handler);
-            else if (type === 'error') this._errorListeners.push(handler);
-        }
-
-        removeEventListener(type, handler) {
-            const listeners = type === 'message' ? this._messageListeners : type === 'error' ? this._errorListeners : null;
-            if (!listeners) return;
-            const index = listeners.indexOf(handler);
-            if (index >= 0) listeners.splice(index, 1);
-        }
-    }
-
-    globalThis.Worker = NativeWorker;
-}
-)JS";
+        const char* urlPolyfill = js::runtime_sources::urlPolyfill();
 
         jsEngine_->eval(urlPolyfill, "url-worker-polyfill.js");
         std::cout << "[Mystral] URL and native Worker APIs initialized" << std::endl;
@@ -4070,136 +2059,6 @@ globalThis.__mystralNativeDecodeDracoAsync = function(buffer, attrs) {
 #endif
     }
 
-    void executeTimerCallbacks() {
-#ifdef MYSTRAL_USE_LIBUV_TIMERS
-        // Process pending timer callbacks from libuv
-        std::queue<PendingTimerCallback> toProcess;
-        {
-            std::lock_guard<std::mutex> lock(timerMutex_);
-            std::swap(toProcess, pendingTimerCallbacks_);
-        }
-
-        while (!toProcess.empty()) {
-            auto pending = std::move(toProcess.front());
-            toProcess.pop();
-
-            // Check if cancelled while waiting in queue
-            if (cancelledTimerIds_.count(pending.id) > 0) {
-                cancelledTimerIds_.erase(pending.id);
-                continue;
-            }
-
-            // Call the callback
-            std::vector<js::JSValueHandle> args;
-            jsEngine_->call(pending.callback, jsEngine_->newUndefined(), args);
-
-            // For setTimeout (intervalMs == 0), clean up the timer
-            if (pending.intervalMs == 0) {
-                auto it = uvTimers_.find(pending.id);
-                if (it != uvTimers_.end()) {
-                    if (it->second->callbackProtected) {
-                        jsEngine_->unprotect(it->second->callback);
-                        it->second->callbackProtected = false;
-                    }
-                    // uv_close is async - onTimerClose will erase from map when done
-                    uv_close(reinterpret_cast<uv_handle_t*>(&it->second->handle), onTimerClose);
-                }
-            }
-            // For setInterval, libuv automatically repeats - nothing to do
-        }
-#else
-        // Fallback: std::chrono-based timer processing
-        if (timerCallbacks_.empty()) return;
-
-        auto now = std::chrono::high_resolution_clock::now();
-
-        // Process timers - collect expired ones
-        std::vector<TimerCallback> toExecute;
-        std::vector<TimerCallback> remaining;
-
-        for (auto& timer : timerCallbacks_) {
-            if (timer.cancelled) {
-                continue;  // Skip cancelled timers
-            }
-
-            if (now >= timer.targetTime) {
-                toExecute.push_back(timer);
-            } else {
-                remaining.push_back(timer);
-            }
-        }
-
-        timerCallbacks_ = std::move(remaining);
-
-        // Execute expired timers
-        for (auto& timer : toExecute) {
-            // Call the callback
-            std::vector<js::JSValueHandle> args;
-            jsEngine_->call(timer.callback, jsEngine_->newUndefined(), args);
-
-            if (timer.intervalMs > 0) {
-                // Check if interval was cancelled during callback execution
-                bool wasCancelled = false;
-                for (const auto& t : timerCallbacks_) {
-                    if (t.id == timer.id && t.cancelled) {
-                        wasCancelled = true;
-                        break;
-                    }
-                }
-                // Also check cancelledTimerIds_ set
-                if (cancelledTimerIds_.count(timer.id) > 0) {
-                    wasCancelled = true;
-                }
-
-                if (!wasCancelled) {
-                    // Re-schedule interval
-                    timer.targetTime = now + std::chrono::milliseconds(timer.intervalMs);
-                    timerCallbacks_.push_back(timer);
-                } else {
-                    jsEngine_->unprotect(timer.callback);
-                    cancelledTimerIds_.erase(timer.id);
-                }
-            } else {
-                // setTimeout - unprotect and done
-                jsEngine_->unprotect(timer.callback);
-            }
-        }
-#endif
-    }
-
-    void processPendingFileCallbacks() {
-        // Process pending file callbacks - these come from async file reads
-        // We process them on the main thread to ensure JS context safety
-
-        while (!pendingFileCallbacks_.empty()) {
-            auto pending = std::move(pendingFileCallbacks_.front());
-            pendingFileCallbacks_.pop();
-
-            if (pending.error.empty()) {
-                // Success - create ArrayBuffer and call callback with (data, null)
-                auto dataVal = jsEngine_->newArrayBuffer(pending.data.data(), pending.data.size());
-                auto errorVal = jsEngine_->newNull();
-                std::vector<js::JSValueHandle> callbackArgs = { dataVal, errorVal };
-                jsEngine_->call(pending.callback, jsEngine_->newUndefined(), callbackArgs);
-            } else {
-                // Error - call callback with (null, error)
-                auto nullVal = jsEngine_->newNull();
-                auto errorVal = jsEngine_->newString(pending.error.c_str());
-                std::vector<js::JSValueHandle> callbackArgs = { nullVal, errorVal };
-                jsEngine_->call(pending.callback, jsEngine_->newUndefined(), callbackArgs);
-            }
-
-            // Unprotect the callback now that we're done with it
-            jsEngine_->unprotect(pending.callback);
-        }
-    }
-
-    void clearPendingFileCallbacks() {
-        while (!pendingFileCallbacks_.empty()) {
-            if (jsEngine_) jsEngine_->unprotect(pendingFileCallbacks_.front().callback);
-            pendingFileCallbacks_.pop();
-        }
-    }
 
     void processWorkerMessages() {
         if (!workerRegistry_ || !jsEngine_) return;
@@ -4220,14 +2079,6 @@ globalThis.__mystralNativeDecodeDracoAsync = function(buffer, attrs) {
     bool paused_ = false;
     uint32_t stepFramesRemaining_ = 0;
     uint64_t frameCount_ = 0;
-    bool profilerActive_ = false;
-    uint64_t profilerExpectedFrames_ = 0;
-    std::chrono::steady_clock::time_point profilerStartedAt_;
-    RuntimeMemorySnapshot profilerMemoryStart_;
-    workers::WorkerRegistryStats profilerWorkerStart_;
-    uint64_t profilerSharedMemoryStartBytes_ = 0;
-    async::JobSystemStats profilerJobStart_;
-    std::vector<FrameProfileSample> profilerSamples_;
     int width_;
     int height_;
 
@@ -4239,59 +2090,15 @@ globalThis.__mystralNativeDecodeDracoAsync = function(buffer, attrs) {
     std::unique_ptr<workers::WorkerRegistry> workerRegistry_;
     storage::LocalStorage localStorage_;
 
-    // requestAnimationFrame state
-    struct RAFCallback {
-        int id;
-        js::JSValueHandle callback;
-    };
-    std::vector<RAFCallback> rafCallbacks_;
-    int nextRafId_ = 1;
+    js::AnimationFrameScheduler animationFrames_;
+    game::GameLoopController gameLoop_;
+    dom::DomEventSystem domEvents_;
+    js::RuntimeTimers timers_;
+    js::RuntimeIOBindings ioBindings_;
+    debug::RuntimeProfiler profiler_;
 
     // setTimeout/setInterval state
     uint64_t jsGeneration_ = 1;
-
-#ifdef MYSTRAL_USE_LIBUV_TIMERS
-    // libuv-based timer context
-    struct UvTimerContext {
-        uv_timer_t handle;
-        int id;
-        js::JSValueHandle callback;
-        int intervalMs;  // 0 for setTimeout, >0 for setInterval
-        bool cancelled;
-        bool callbackProtected;
-        RuntimeImpl* runtime;  // Back-reference for callback
-    };
-    std::map<int, std::unique_ptr<UvTimerContext>> uvTimers_;
-
-    // Pending timer callbacks (fired by libuv, processed on main thread)
-    struct PendingTimerCallback {
-        int id;
-        js::JSValueHandle callback;
-        int intervalMs;  // >0 means reschedule
-    };
-    std::queue<PendingTimerCallback> pendingTimerCallbacks_;
-    std::mutex timerMutex_;
-#else
-    // Fallback: std::chrono-based timers (for platforms without libuv)
-    struct TimerCallback {
-        int id;
-        js::JSValueHandle callback;
-        std::chrono::high_resolution_clock::time_point targetTime;
-        int intervalMs;  // 0 for setTimeout, >0 for setInterval
-        bool cancelled;
-    };
-    std::vector<TimerCallback> timerCallbacks_;
-#endif
-    std::unordered_set<int> cancelledTimerIds_;  // Track IDs cancelled during callback execution
-    int nextTimerId_ = 1;
-
-    // Pending async file read callbacks (processed on main thread)
-    struct PendingFileCallback {
-        js::JSValueHandle callback;
-        std::vector<uint8_t> data;
-        std::string error;
-    };
-    std::queue<PendingFileCallback> pendingFileCallbacks_;
 
 #ifdef MYSTRAL_HAS_DRACO
     // Context for async Draco decode work (libuv thread pool)
@@ -4319,21 +2126,6 @@ globalThis.__mystralNativeDecodeDracoAsync = function(buffer, attrs) {
     std::mutex dracoMutex_;
 #endif
 
-    // DOM Event system
-    struct EventListener {
-        js::JSValueHandle callback;
-        bool useCapture;
-    };
-    // Event listeners: target -> eventType -> list of listeners
-    // Targets: "document", "window", "canvas"
-    std::map<std::string, std::map<std::string, std::vector<EventListener>>> eventListeners_;
-
-    // Cached canvas element (created once, returned by getElementById)
-    js::JSValueHandle canvasElement_;
-
-    // Currently focused input/textarea. Protected while SDL text input is active.
-    js::JSValueHandle activeTextElement_;
-
     // Hot reload state
     std::string scriptPath_;  // Path to the currently loaded script
     std::string watchedScriptName_;
@@ -4345,1015 +2137,6 @@ globalThis.__mystralNativeDecodeDracoAsync = function(buffer, attrs) {
     std::filesystem::file_time_type reloadCandidateWriteTime_{};
     std::chrono::steady_clock::time_point reloadCandidateSince_{};
 
-    void clearDOMEventListeners() {
-        if (activeTextElement_.ptr) {
-            if (jsEngine_) {
-                jsEngine_->unprotect(activeTextElement_);
-            }
-            activeTextElement_ = {};
-            if (!config_.noSdl) {
-                platform::stopTextInput();
-            }
-        }
-        if (!jsEngine_) {
-            eventListeners_.clear();
-            return;
-        }
-        size_t count = 0;
-        for (auto& [target, byType] : eventListeners_) {
-            for (auto& [type, listeners] : byType) {
-                for (auto& listener : listeners) {
-                    if (listener.callback.ptr) {
-                        jsEngine_->unprotect(listener.callback);
-                        count++;
-                    }
-                }
-            }
-        }
-        eventListeners_.clear();
-        if (count > 0) {
-            std::cout << "[HotReload] Released " << count << " DOM listeners" << std::endl;
-        }
-    }
-
-    bool listenerUsesCapture(const std::vector<js::JSValueHandle>& args) {
-        if (args.size() < 3 || jsEngine_->isUndefined(args[2]) || jsEngine_->isNull(args[2])) {
-            return false;
-        }
-        if (jsEngine_->isBoolean(args[2])) {
-            return jsEngine_->toBoolean(args[2]);
-        }
-        if (jsEngine_->isObject(args[2])) {
-            return jsEngine_->toBoolean(jsEngine_->getProperty(args[2], "capture"));
-        }
-        return false;
-    }
-
-    void setupDOMEvents() {
-        if (!jsEngine_) return;
-
-        // ========================================================================
-        // Create canvas element FIRST (before document) so getElementById can return it
-        // ========================================================================
-        auto canvas = jsEngine_->newObject();
-
-        // Canvas properties
-        jsEngine_->setProperty(canvas, "id", jsEngine_->newString("canvas"));
-        jsEngine_->setProperty(canvas, "tagName", jsEngine_->newString("CANVAS"));
-        jsEngine_->setProperty(canvas, "width", jsEngine_->newNumber(width_));
-        jsEngine_->setProperty(canvas, "height", jsEngine_->newNumber(height_));
-        jsEngine_->setProperty(canvas, "clientWidth", jsEngine_->newNumber(width_));
-        jsEngine_->setProperty(canvas, "clientHeight", jsEngine_->newNumber(height_));
-
-        // canvas.addEventListener - SAME PATTERN AS document and window
-        jsEngine_->setProperty(canvas, "addEventListener",
-            jsEngine_->newFunction("addEventListener", [this](void* ctx, const std::vector<js::JSValueHandle>& args) {
-                if (args.size() < 2) return jsEngine_->newUndefined();
-
-                std::string eventType = jsEngine_->toString(args[0]);
-                js::JSValueHandle callback = args[1];
-                bool useCapture = listenerUsesCapture(args);
-
-                jsEngine_->protect(callback);
-                eventListeners_["canvas"][eventType].push_back({callback, useCapture});
-
-                // std::cout << "[DOM] canvas.addEventListener('" << eventType << "')" << std::endl;
-
-                return jsEngine_->newUndefined();
-            })
-        );
-
-        // canvas.removeEventListener
-        jsEngine_->setProperty(canvas, "removeEventListener",
-            jsEngine_->newFunction("removeEventListener", [this](void* ctx, const std::vector<js::JSValueHandle>& args) {
-                return jsEngine_->newUndefined();
-            })
-        );
-
-        // canvas.getBoundingClientRect
-        jsEngine_->setProperty(canvas, "getBoundingClientRect",
-            jsEngine_->newFunction("getBoundingClientRect", [this](void* ctx, const std::vector<js::JSValueHandle>& args) {
-                auto rect = jsEngine_->newObject();
-                jsEngine_->setProperty(rect, "x", jsEngine_->newNumber(0));
-                jsEngine_->setProperty(rect, "y", jsEngine_->newNumber(0));
-                jsEngine_->setProperty(rect, "width", jsEngine_->newNumber(width_));
-                jsEngine_->setProperty(rect, "height", jsEngine_->newNumber(height_));
-                jsEngine_->setProperty(rect, "top", jsEngine_->newNumber(0));
-                jsEngine_->setProperty(rect, "left", jsEngine_->newNumber(0));
-                jsEngine_->setProperty(rect, "right", jsEngine_->newNumber(width_));
-                jsEngine_->setProperty(rect, "bottom", jsEngine_->newNumber(height_));
-                return rect;
-            })
-        );
-
-        // canvas.style
-        auto style = jsEngine_->newObject();
-        jsEngine_->setProperty(style, "touchAction", jsEngine_->newString(""));
-        jsEngine_->setProperty(style, "cursor", jsEngine_->newString(""));
-        jsEngine_->setProperty(style, "width", jsEngine_->newString(""));
-        jsEngine_->setProperty(style, "height", jsEngine_->newString(""));
-        jsEngine_->protect(style);
-        jsEngine_->setProperty(canvas, "style", style);
-
-        // canvas.setPointerCapture (stub)
-        jsEngine_->setProperty(canvas, "setPointerCapture",
-            jsEngine_->newFunction("setPointerCapture", [](void* ctx, const std::vector<js::JSValueHandle>& args) {
-                return js::JSValueHandle{nullptr, nullptr};
-            })
-        );
-
-        // canvas.releasePointerCapture (stub)
-        jsEngine_->setProperty(canvas, "releasePointerCapture",
-            jsEngine_->newFunction("releasePointerCapture", [](void* ctx, const std::vector<js::JSValueHandle>& args) {
-                return js::JSValueHandle{nullptr, nullptr};
-            })
-        );
-
-        // canvas.getContext (stub - WebGPU context is set up separately)
-        jsEngine_->setProperty(canvas, "getContext",
-            jsEngine_->newFunction("getContext", [this](void* ctx, const std::vector<js::JSValueHandle>& args) {
-                return jsEngine_->newNull();
-            })
-        );
-
-        // canvas.toDataURL - Returns a data URL for the specified image type.
-        // This is used by @loaders.gl to detect WebP support. We return proper
-        // data URLs for formats we support (including WebP via libwebp).
-        jsEngine_->setProperty(canvas, "toDataURL",
-            jsEngine_->newFunction("toDataURL", [this](void* ctx, const std::vector<js::JSValueHandle>& args) {
-                std::string mimeType = "image/png";  // Default
-                if (!args.empty()) {
-                    mimeType = jsEngine_->toString(args[0]);
-                }
-
-                // Return a minimal valid data URL for supported formats
-                // This tells @loaders.gl that we support these formats
-                if (mimeType == "image/png" || mimeType == "image/jpeg" || mimeType == "image/gif") {
-                    // These are always supported via stb_image
-                    return jsEngine_->newString(("data:" + mimeType + ";base64,").c_str());
-                }
-#ifdef MYSTRAL_HAS_WEBP
-                if (mimeType == "image/webp") {
-                    // WebP is supported when libwebp is compiled in
-                    return jsEngine_->newString("data:image/webp;base64,");
-                }
-#endif
-                // Unsupported format - return empty data URL
-                return jsEngine_->newString("data:,");
-            })
-        );
-
-        // Cache and protect the canvas element
-        canvasElement_ = canvas;
-        jsEngine_->protect(canvasElement_);
-
-        std::cout << "[DOM] Canvas element created with addEventListener, style, etc." << std::endl;
-
-        // ========================================================================
-        // Create document object
-        // ========================================================================
-        auto document = jsEngine_->newObject();
-
-        // document.addEventListener
-        jsEngine_->setProperty(document, "addEventListener",
-            jsEngine_->newFunction("addEventListener", [this](void* ctx, const std::vector<js::JSValueHandle>& args) {
-                if (args.size() < 2) return jsEngine_->newUndefined();
-
-                std::string eventType = jsEngine_->toString(args[0]);
-                js::JSValueHandle callback = args[1];
-                bool useCapture = listenerUsesCapture(args);
-
-                jsEngine_->protect(callback);
-                eventListeners_["document"][eventType].push_back({callback, useCapture});
-
-                return jsEngine_->newUndefined();
-            })
-        );
-
-        // document.removeEventListener
-        jsEngine_->setProperty(document, "removeEventListener",
-            jsEngine_->newFunction("removeEventListener", [this](void* ctx, const std::vector<js::JSValueHandle>& args) {
-                if (args.size() < 2) return jsEngine_->newUndefined();
-
-                std::string eventType = jsEngine_->toString(args[0]);
-                js::JSValueHandle callback = args[1];
-
-                auto& listeners = eventListeners_["document"][eventType];
-                for (auto it = listeners.begin(); it != listeners.end(); ++it) {
-                    // Note: Comparing function handles is tricky. For now, we don't properly compare.
-                    // A full implementation would need to track callback identity.
-                }
-
-                return jsEngine_->newUndefined();
-            })
-        );
-
-        // document.getElementById - returns our pre-created canvas element
-        jsEngine_->setProperty(document, "getElementById",
-            jsEngine_->newFunction("getElementById", [this](void* ctx, const std::vector<js::JSValueHandle>& args) {
-                // std::cout << "[DOM] getElementById called with " << args.size() << " args" << std::endl;
-
-                if (args.empty()) return jsEngine_->newNull();
-
-                std::string id = jsEngine_->toString(args[0]);
-                // std::cout << "[DOM] getElementById('" << id << "')" << std::endl;
-
-                // Return canvas element for "canvas" or any canvas-like id
-                // Also handle '#canvas' prefix (common in jQuery-style code)
-                if (id == "canvas" || id == "#canvas" || id == "engine-canvas" || id == "game-canvas") {
-                    return canvasElement_;
-                }
-
-                return jsEngine_->newNull();
-            })
-        );
-
-        // Global helper for canvas.toDataURL.
-        jsEngine_->setGlobalProperty("__nativeCanvasToDataURL",
-            jsEngine_->newFunction("__nativeCanvasToDataURL", [this](void* ctx, const std::vector<js::JSValueHandle>& args) {
-                std::string mimeType = "image/png";
-                if (!args.empty()) {
-                    mimeType = jsEngine_->toString(args[0]);
-                }
-
-                // Return proper data URLs for supported formats
-                if (mimeType == "image/png" || mimeType == "image/jpeg" || mimeType == "image/gif") {
-                    return jsEngine_->newString(("data:" + mimeType + ";base64,").c_str());
-                }
-#ifdef MYSTRAL_HAS_WEBP
-                if (mimeType == "image/webp") {
-                    return jsEngine_->newString("data:image/webp;base64,");
-                }
-#endif
-                return jsEngine_->newString("data:,");
-            })
-        );
-
-        // document.body (for compatibility)
-        auto body = jsEngine_->newObject();
-        jsEngine_->setProperty(body, "tagName", jsEngine_->newString("BODY"));
-        jsEngine_->setProperty(body, "appendChild", jsEngine_->newFunction("appendChild", [this](void*, const std::vector<js::JSValueHandle>&) {
-            return jsEngine_->newUndefined();
-        }));
-        jsEngine_->setProperty(body, "style", jsEngine_->newObject());
-        jsEngine_->setProperty(document, "body", body);
-
-        // document.head (for script loading)
-        auto head = jsEngine_->newObject();
-        jsEngine_->setProperty(head, "tagName", jsEngine_->newString("HEAD"));
-        jsEngine_->setProperty(head, "appendChild", jsEngine_->newFunction("appendChild", [this](void*, const std::vector<js::JSValueHandle>& args) {
-            // For script loading, call onload callback asynchronously
-            if (!args.empty()) {
-                auto el = args[0];
-                auto onload = jsEngine_->getProperty(el, "onload");
-                if (!jsEngine_->isUndefined(onload) && !jsEngine_->isNull(onload)) {
-                    // Call onload via setTimeout to simulate async loading
-                    jsEngine_->eval("setTimeout(() => { arguments[0] && arguments[0](); }, 0);", "onload-trigger");
-                }
-            }
-            return jsEngine_->newUndefined();
-        }));
-        jsEngine_->setProperty(document, "head", head);
-
-        // document.location (for URL information)
-        auto location = jsEngine_->newObject();
-        jsEngine_->setProperty(location, "href", jsEngine_->newString("file:///game.html"));
-        jsEngine_->setProperty(location, "protocol", jsEngine_->newString("file:"));
-        jsEngine_->setProperty(location, "host", jsEngine_->newString(""));
-        jsEngine_->setProperty(location, "hostname", jsEngine_->newString(""));
-        jsEngine_->setProperty(location, "pathname", jsEngine_->newString("/game.html"));
-        jsEngine_->setProperty(location, "origin", jsEngine_->newString("file://"));
-        jsEngine_->setProperty(document, "location", location);
-
-        jsEngine_->setGlobalProperty("document", document);
-
-        jsEngine_->setGlobalProperty("__nativeFocusTextInput",
-            jsEngine_->newMethod("__nativeFocusTextInput", [this](void*, js::JSValueHandle receiver,
-                                                                  const std::vector<js::JSValueHandle>&) {
-                if (activeTextElement_.ptr) {
-                    jsEngine_->unprotect(activeTextElement_);
-                }
-                activeTextElement_ = receiver;
-                jsEngine_->protect(activeTextElement_);
-
-                auto document = jsEngine_->getGlobalProperty("document");
-                jsEngine_->setProperty(document, "activeElement", receiver);
-                const bool started = config_.noSdl ? false : platform::startTextInput();
-                return jsEngine_->newBoolean(started);
-            }));
-
-        jsEngine_->setGlobalProperty("__nativeBlurTextInput",
-            jsEngine_->newMethod("__nativeBlurTextInput", [this](void*, js::JSValueHandle,
-                                                                 const std::vector<js::JSValueHandle>&) {
-                if (!config_.noSdl) {
-                    platform::stopTextInput();
-                }
-                if (activeTextElement_.ptr) {
-                    jsEngine_->unprotect(activeTextElement_);
-                    activeTextElement_ = {};
-                }
-                auto document = jsEngine_->getGlobalProperty("document");
-                jsEngine_->setProperty(document, "activeElement", jsEngine_->getProperty(document, "body"));
-                return jsEngine_->newUndefined();
-            }));
-
-        jsEngine_->setGlobalProperty("__nativeSetTextInputArea",
-            jsEngine_->newFunction("__nativeSetTextInputArea", [this](void*, const std::vector<js::JSValueHandle>& args) {
-                if (config_.noSdl || args.size() < 4) return jsEngine_->newBoolean(false);
-                const int cursor = args.size() > 4 ? static_cast<int>(jsEngine_->toNumber(args[4])) : 0;
-                return jsEngine_->newBoolean(platform::setTextInputArea(
-                    static_cast<int>(jsEngine_->toNumber(args[0])),
-                    static_cast<int>(jsEngine_->toNumber(args[1])),
-                    static_cast<int>(jsEngine_->toNumber(args[2])),
-                    static_cast<int>(jsEngine_->toNumber(args[3])), cursor));
-            }));
-
-        jsEngine_->setGlobalProperty("__nativeClipboardReadText",
-            jsEngine_->newFunction("__nativeClipboardReadText", [this](void*, const std::vector<js::JSValueHandle>&) {
-                if (config_.noSdl) return jsEngine_->newString("");
-                const std::string text = platform::getClipboardText();
-                return jsEngine_->newString(text.c_str());
-            }));
-
-        jsEngine_->setGlobalProperty("__nativeClipboardWriteText",
-            jsEngine_->newFunction("__nativeClipboardWriteText", [this](void*, const std::vector<js::JSValueHandle>& args) {
-                if (config_.noSdl || args.empty()) return jsEngine_->newBoolean(false);
-                return jsEngine_->newBoolean(platform::setClipboardText(jsEngine_->toString(args[0])));
-            }));
-
-        // Set up document.createElement entirely in JavaScript for proper value handling
-        // This must run AFTER document is set as a global
-        const char* createElementSetup = R"(
-            function installEventTarget(target) {
-                const listeners = Object.create(null);
-                target.addEventListener = function(type, callback, options) {
-                    if (typeof callback !== 'function' && !callback?.handleEvent) return;
-                    const capture = typeof options === 'boolean' ? options : !!options?.capture;
-                    (listeners[String(type)] ??= []).push({ callback, capture });
-                };
-                target.removeEventListener = function(type, callback, options) {
-                    const capture = typeof options === 'boolean' ? options : !!options?.capture;
-                    const entries = listeners[String(type)];
-                    if (!entries) return;
-                    const index = entries.findIndex(entry => entry.callback === callback && entry.capture === capture);
-                    if (index >= 0) entries.splice(index, 1);
-                };
-                target.__dispatchListeners = function(event, capture) {
-                    const entries = (listeners[event.type] || []).slice();
-                    for (const entry of entries) {
-                        if (entry.capture !== capture) continue;
-                        if (typeof entry.callback === 'function') entry.callback.call(this, event);
-                        else entry.callback.handleEvent.call(entry.callback, event);
-                        if (event.__immediatePropagationStopped) break;
-                    }
-                    if (!capture && !event.__immediatePropagationStopped) {
-                        const handler = this['on' + event.type];
-                        if (typeof handler === 'function') handler.call(this, event);
-                    }
-                };
-                target.dispatchEvent = function(event) {
-                    if (!event || !event.type) throw new TypeError('Invalid event');
-                    event.target = this;
-                    event.currentTarget = this;
-                    event.eventPhase = Event.AT_TARGET;
-                    this.__dispatchListeners(event, true);
-                    if (!event.__immediatePropagationStopped) this.__dispatchListeners(event, false);
-                    event.currentTarget = null;
-                    event.eventPhase = Event.NONE;
-                    return !event.defaultPrevented;
-                };
-                return target;
-            }
-
-            function createTextControl(tagName) {
-                const element = installEventTarget({
-                    tagName: tagName.toUpperCase(),
-                    type: tagName === 'input' ? 'text' : undefined,
-                    value: '',
-                    defaultValue: '',
-                    disabled: false,
-                    readOnly: false,
-                    placeholder: '',
-                    selectionStart: 0,
-                    selectionEnd: 0,
-                    selectionDirection: 'none',
-                    style: {},
-                    className: '',
-                    id: ''
-                });
-                element.focus = function() {
-                    if (this.disabled || this.readOnly) return;
-                    if (document.activeElement === this) return;
-                    if (document.activeElement && document.activeElement !== document.body &&
-                        typeof document.activeElement.blur === 'function') {
-                        document.activeElement.blur();
-                    }
-                    __nativeFocusTextInput.call(this);
-                    this.dispatchEvent(new Event('focus'));
-                };
-                element.blur = function() {
-                    if (document.activeElement !== this) return;
-                    __nativeBlurTextInput.call(this);
-                    this.dispatchEvent(new Event('blur'));
-                };
-                element.select = function() {
-                    this.selectionStart = 0;
-                    this.selectionEnd = this.value.length;
-                    this.selectionDirection = 'none';
-                };
-                element.setSelectionRange = function(start, end, direction) {
-                    const length = this.value.length;
-                    this.selectionStart = Math.max(0, Math.min(length, Number(start) || 0));
-                    this.selectionEnd = Math.max(this.selectionStart, Math.min(length, Number(end) || 0));
-                    this.selectionDirection = direction || 'none';
-                };
-                element.setTextInputArea = function(x, y, width, height, cursor) {
-                    return __nativeSetTextInputArea(x, y, width, height, cursor || 0);
-                };
-                element.__applyTextInput = function(text) {
-                    if (this.disabled || this.readOnly) return;
-                    text = String(text);
-                    const start = this.selectionStart == null ? this.value.length : this.selectionStart;
-                    const end = this.selectionEnd == null ? start : this.selectionEnd;
-                    this.value = this.value.slice(0, start) + text + this.value.slice(end);
-                    this.selectionStart = this.selectionEnd = start + text.length;
-                    this.selectionDirection = 'none';
-                };
-                return element;
-            }
-
-            document.createElement = function(tagName) {
-                tagName = String(tagName || '').toLowerCase();
-                if (tagName === 'canvas') {
-                    return {
-                        tagName: 'CANVAS',
-                        width: 64,
-                        height: 64,
-                        style: {},
-                        toDataURL: function(mimeType) {
-                            return __nativeCanvasToDataURL(mimeType || 'image/png');
-                        },
-                        getContext: function(type) { return null; }
-                    };
-                }
-                if (tagName === 'script') {
-                    return {
-                        tagName: 'SCRIPT',
-                        src: '',
-                        type: '',
-                        async: false,
-                        onload: null,
-                        onerror: null
-                    };
-                }
-                if (tagName === 'style') {
-                    return {
-                        tagName: 'STYLE',
-                        type: 'text/css',
-                        textContent: ''
-                    };
-                }
-                if (tagName === 'input' || tagName === 'textarea') {
-                    return createTextControl(tagName);
-                }
-                if (tagName === 'div' || tagName === 'span' || tagName === 'img') {
-                    return {
-                        tagName: (tagName || '').toUpperCase(),
-                        style: {},
-                        className: '',
-                        id: ''
-                    };
-                }
-                return { tagName: (tagName || '').toUpperCase(), style: {} };
-            };
-            // Namespaced variant — libraries (e.g. three.js loaders) create
-            // elements via createElementNS('http://www.w3.org/1999/xhtml', tag)
-            document.createElementNS = function(namespaceURI, tagName) {
-                return document.createElement(tagName);
-            };
-            // DOM event class globals — browser code type-checks events with
-            // `instanceof PointerEvent` etc.; without these constructors that
-            // check is a ReferenceError. Dispatched events are still plain
-            // objects (instanceof yields false) — code should duck-type until
-            // dispatch constructs real instances.
-            if (typeof globalThis.Event === 'undefined') {
-                globalThis.Event = class Event {
-                    constructor(type, init) {
-                        this.type = String(type || '');
-                        this.bubbles = !!init?.bubbles;
-                        this.cancelable = !!init?.cancelable;
-                        this.defaultPrevented = false;
-                        this.cancelBubble = false;
-                        this.target = null;
-                        this.currentTarget = null;
-                        this.eventPhase = 0;
-                        this.__immediatePropagationStopped = false;
-                        Object.assign(this, init || {});
-                    }
-                    preventDefault() { if (this.cancelable) this.defaultPrevented = true; }
-                    stopPropagation() { this.cancelBubble = true; }
-                    stopImmediatePropagation() {
-                        this.cancelBubble = true;
-                        this.__immediatePropagationStopped = true;
-                    }
-                };
-                Object.assign(globalThis.Event, { NONE: 0, CAPTURING_PHASE: 1, AT_TARGET: 2, BUBBLING_PHASE: 3 });
-                Object.assign(globalThis.Event.prototype, { NONE: 0, CAPTURING_PHASE: 1, AT_TARGET: 2, BUBBLING_PHASE: 3 });
-            }
-            globalThis.UIEvent ??= class UIEvent extends globalThis.Event {};
-            globalThis.MouseEvent ??= class MouseEvent extends globalThis.UIEvent {};
-            globalThis.PointerEvent ??= class PointerEvent extends globalThis.MouseEvent {};
-            globalThis.WheelEvent ??= class WheelEvent extends globalThis.MouseEvent {};
-            globalThis.KeyboardEvent ??= class KeyboardEvent extends globalThis.UIEvent {};
-            globalThis.InputEvent ??= class InputEvent extends globalThis.UIEvent {};
-            globalThis.CompositionEvent ??= class CompositionEvent extends globalThis.UIEvent {};
-            document.activeElement = document.body;
-        )";
-        jsEngine_->eval(createElementSetup, "createElement-setup");
-
-        // Create window object with event listeners
-        // Note: We use the global object as window, and also set 'window' as a global property
-        auto window = jsEngine_->getGlobal();
-        jsEngine_->setGlobalProperty("window", window);
-
-        // Set 'self' to point to global object (required by Three.js and other libs)
-        // In browsers, 'self' refers to the global object (same as 'this' at global scope)
-        jsEngine_->setGlobalProperty("self", window);
-
-        // Also set document as window.document (browsers have both)
-        jsEngine_->setProperty(window, "document", document);
-
-        // window.addEventListener
-        jsEngine_->setProperty(window, "addEventListener",
-            jsEngine_->newFunction("addEventListener", [this](void* ctx, const std::vector<js::JSValueHandle>& args) {
-                if (args.size() < 2) return jsEngine_->newUndefined();
-
-                std::string eventType = jsEngine_->toString(args[0]);
-                js::JSValueHandle callback = args[1];
-                bool useCapture = listenerUsesCapture(args);
-
-                jsEngine_->protect(callback);
-                eventListeners_["window"][eventType].push_back({callback, useCapture});
-
-                return jsEngine_->newUndefined();
-            })
-        );
-
-        // window.removeEventListener
-        jsEngine_->setProperty(window, "removeEventListener",
-            jsEngine_->newFunction("removeEventListener", [this](void* ctx, const std::vector<js::JSValueHandle>& args) {
-                return jsEngine_->newUndefined();
-            })
-        );
-
-        // window.innerWidth / window.innerHeight
-        jsEngine_->setProperty(window, "innerWidth", jsEngine_->newNumber(width_));
-        jsEngine_->setProperty(window, "innerHeight", jsEngine_->newNumber(height_));
-
-        // window.devicePixelRatio
-        jsEngine_->setProperty(window, "devicePixelRatio", jsEngine_->newNumber(1.0));
-
-        // Set up input event callbacks
-        platform::setKeyboardCallback([this](const platform::KeyboardEventData& e) {
-            dispatchKeyboardEvent(e);
-        });
-
-        platform::setTextInputCallback([this](const platform::TextInputEventData& e) {
-            dispatchTextInputEvent(e);
-        });
-
-        platform::setCompositionCallback([this](const platform::CompositionEventData& e) {
-            dispatchCompositionEvent(e);
-        });
-
-        platform::setMouseCallback([this](const platform::MouseEventData& e) {
-            dispatchMouseEvent(e);
-        });
-
-        platform::setPointerCallback([this](const platform::PointerEventData& e) {
-            dispatchPointerEvent(e);
-        });
-
-        platform::setWheelCallback([this](const platform::WheelEventData& e) {
-            dispatchWheelEvent(e);
-        });
-
-        platform::setGamepadCallback([this](const platform::GamepadEventData& e) {
-            dispatchGamepadEvent(e);
-        });
-
-        platform::setResizeCallback([this](const platform::ResizeEventData& e) {
-            dispatchResizeEvent(e);
-        });
-
-        // Set up navigator.getGamepads()
-        auto navigator = jsEngine_->getGlobalProperty("navigator");
-        if (jsEngine_->isUndefined(navigator)) {
-            navigator = jsEngine_->newObject();
-            jsEngine_->setGlobalProperty("navigator", navigator);
-        }
-
-        const char* clipboardSetup = R"(
-            navigator.clipboard ??= {
-                readText() {
-                    return Promise.resolve(__nativeClipboardReadText());
-                },
-                writeText(text) {
-                    if (__nativeClipboardWriteText(String(text))) return Promise.resolve();
-                    return Promise.reject(new Error('System clipboard is unavailable'));
-                }
-            };
-        )";
-        jsEngine_->eval(clipboardSetup, "clipboard-setup");
-
-        jsEngine_->setProperty(navigator, "getGamepads",
-            jsEngine_->newFunction("getGamepads", [this](void* ctx, const std::vector<js::JSValueHandle>& args) {
-                int count = platform::getGamepadCount();
-                auto gamepads = jsEngine_->newArray(4);  // Standard says 4 slots
-
-                for (int i = 0; i < 4; i++) {
-                    platform::GamepadState state;
-                    if (platform::getGamepadState(i, &state)) {
-                        auto gamepad = jsEngine_->newObject();
-                        jsEngine_->setProperty(gamepad, "index", jsEngine_->newNumber(state.index));
-                        jsEngine_->setProperty(gamepad, "id", jsEngine_->newString(state.id.c_str()));
-                        jsEngine_->setProperty(gamepad, "connected", jsEngine_->newBoolean(state.connected));
-
-                        // Axes
-                        auto axes = jsEngine_->newArray(state.numAxes);
-                        for (int a = 0; a < state.numAxes; a++) {
-                            jsEngine_->setPropertyIndex(axes, a, jsEngine_->newNumber(state.axes[a]));
-                        }
-                        jsEngine_->setProperty(gamepad, "axes", axes);
-
-                        // Buttons
-                        auto buttons = jsEngine_->newArray(state.numButtons);
-                        for (int b = 0; b < state.numButtons; b++) {
-                            auto btn = jsEngine_->newObject();
-                            jsEngine_->setProperty(btn, "pressed", jsEngine_->newBoolean(state.buttons[b]));
-                            jsEngine_->setProperty(btn, "value", jsEngine_->newNumber(state.buttonValues[b]));
-                            jsEngine_->setPropertyIndex(buttons, b, btn);
-                        }
-                        jsEngine_->setProperty(gamepad, "buttons", buttons);
-
-                        jsEngine_->setPropertyIndex(gamepads, i, gamepad);
-                    } else {
-                        jsEngine_->setPropertyIndex(gamepads, i, jsEngine_->newNull());
-                    }
-                }
-
-                return gamepads;
-            })
-        );
-
-        // Pre-cache image format support for @loaders.gl
-        // This must run before any user script that uses the GLTF loader
-        const char* imageSupportInit = R"(
-            // Pre-cache WebP support so @loaders.gl knows we can decode it
-            // The library checks document.createElement('canvas').toDataURL('image/webp')
-            (function() {
-                try {
-                    var canvas = document.createElement('canvas');
-                    if (canvas && canvas.toDataURL) {
-                        // Test WebP support - this caches the result
-                        var webpResult = canvas.toDataURL('image/webp');
-                        var webpSupported = webpResult.indexOf('data:image/webp') === 0;
-                        console.log('[Mystral] WebP format support: ' + (webpSupported ? 'YES' : 'NO'));
-                    }
-                } catch (e) {
-                    console.log('[Mystral] Error checking image format support: ' + e);
-                }
-            })();
-        )";
-        jsEngine_->eval(imageSupportInit, "image-support-init");
-
-        std::cout << "[Mystral] DOM event system initialized" << std::endl;
-    }
-
-    void installEventMethods(js::JSValueHandle event, bool bubbles, bool cancelable) {
-        jsEngine_->setProperty(event, "bubbles", jsEngine_->newBoolean(bubbles));
-        jsEngine_->setProperty(event, "cancelable", jsEngine_->newBoolean(cancelable));
-        jsEngine_->setProperty(event, "defaultPrevented", jsEngine_->newBoolean(false));
-        jsEngine_->setProperty(event, "cancelBubble", jsEngine_->newBoolean(false));
-        jsEngine_->setProperty(event, "eventPhase", jsEngine_->newNumber(0));
-        jsEngine_->setProperty(event, "target", jsEngine_->newNull());
-        jsEngine_->setProperty(event, "currentTarget", jsEngine_->newNull());
-        jsEngine_->setProperty(event, "__immediatePropagationStopped", jsEngine_->newBoolean(false));
-
-        jsEngine_->setProperty(event, "preventDefault",
-            jsEngine_->newMethod("preventDefault", [this](void*, js::JSValueHandle receiver,
-                                                          const std::vector<js::JSValueHandle>&) {
-                if (jsEngine_->toBoolean(jsEngine_->getProperty(receiver, "cancelable"))) {
-                    jsEngine_->setProperty(receiver, "defaultPrevented", jsEngine_->newBoolean(true));
-                }
-                return jsEngine_->newUndefined();
-            }));
-        jsEngine_->setProperty(event, "stopPropagation",
-            jsEngine_->newMethod("stopPropagation", [this](void*, js::JSValueHandle receiver,
-                                                            const std::vector<js::JSValueHandle>&) {
-                jsEngine_->setProperty(receiver, "cancelBubble", jsEngine_->newBoolean(true));
-                return jsEngine_->newUndefined();
-            }));
-        jsEngine_->setProperty(event, "stopImmediatePropagation",
-            jsEngine_->newMethod("stopImmediatePropagation", [this](void*, js::JSValueHandle receiver,
-                                                                     const std::vector<js::JSValueHandle>&) {
-                jsEngine_->setProperty(receiver, "cancelBubble", jsEngine_->newBoolean(true));
-                jsEngine_->setProperty(receiver, "__immediatePropagationStopped", jsEngine_->newBoolean(true));
-                return jsEngine_->newUndefined();
-            }));
-    }
-
-    bool eventFlag(js::JSValueHandle event, const char* name) {
-        return jsEngine_->toBoolean(jsEngine_->getProperty(event, name));
-    }
-
-    js::JSValueHandle eventTargetObject(const std::string& target) {
-        if (target == "window") return jsEngine_->getGlobal();
-        if (target == "document") return jsEngine_->getGlobalProperty("document");
-        return canvasElement_;
-    }
-
-    void dispatchToListeners(const std::string& target, const std::string& eventType,
-                             js::JSValueHandle event, bool capture, int eventPhase) {
-        auto targetIt = eventListeners_.find(target);
-        if (targetIt == eventListeners_.end()) return;
-
-        auto typeIt = targetIt->second.find(eventType);
-        if (typeIt == targetIt->second.end()) return;
-
-        const auto currentTarget = eventTargetObject(target);
-        jsEngine_->setProperty(event, "currentTarget", currentTarget);
-        jsEngine_->setProperty(event, "eventPhase", jsEngine_->newNumber(eventPhase));
-
-        // Copy listeners in case a callback changes the registration list.
-        const auto listeners = typeIt->second;
-        for (const auto& listener : listeners) {
-            if (listener.useCapture != capture) continue;
-            jsEngine_->call(listener.callback, currentTarget, {event});
-            if (eventFlag(event, "__immediatePropagationStopped")) break;
-        }
-    }
-
-    void dispatchToTextElement(js::JSValueHandle target, js::JSValueHandle event, bool capture) {
-        jsEngine_->setProperty(event, "currentTarget", target);
-        jsEngine_->setProperty(event, "eventPhase", jsEngine_->newNumber(2));
-        auto dispatch = jsEngine_->getProperty(target, "__dispatchListeners");
-        if (jsEngine_->isFunction(dispatch)) {
-            jsEngine_->call(dispatch, target, {event, jsEngine_->newBoolean(capture)});
-        }
-    }
-
-    void finishEventDispatch(js::JSValueHandle event) {
-        jsEngine_->setProperty(event, "currentTarget", jsEngine_->newNull());
-        jsEngine_->setProperty(event, "eventPhase", jsEngine_->newNumber(0));
-    }
-
-    void dispatchEventPath(const std::string& eventType, js::JSValueHandle event,
-                           const std::string& targetName,
-                           js::JSValueHandle textTarget = {}) {
-        const auto target = textTarget.ptr ? textTarget : eventTargetObject(targetName);
-        jsEngine_->setProperty(event, "target", target);
-
-        if (targetName != "window") {
-            dispatchToListeners("window", eventType, event, true, 1);
-            if (eventFlag(event, "cancelBubble")) {
-                finishEventDispatch(event);
-                return;
-            }
-        }
-        if (targetName != "window" && targetName != "document") {
-            dispatchToListeners("document", eventType, event, true, 1);
-            if (eventFlag(event, "cancelBubble")) {
-                finishEventDispatch(event);
-                return;
-            }
-        }
-
-        if (textTarget.ptr) {
-            dispatchToTextElement(textTarget, event, true);
-            if (!eventFlag(event, "__immediatePropagationStopped")) {
-                dispatchToTextElement(textTarget, event, false);
-            }
-        } else {
-            dispatchToListeners(targetName, eventType, event, true, 2);
-            if (!eventFlag(event, "__immediatePropagationStopped")) {
-                dispatchToListeners(targetName, eventType, event, false, 2);
-            }
-        }
-
-        if (!eventFlag(event, "bubbles") || eventFlag(event, "cancelBubble")) {
-            finishEventDispatch(event);
-            return;
-        }
-
-        if (targetName != "window" && targetName != "document") {
-            dispatchToListeners("document", eventType, event, false, 3);
-            if (eventFlag(event, "cancelBubble")) {
-                finishEventDispatch(event);
-                return;
-            }
-        }
-        if (targetName != "window") {
-            dispatchToListeners("window", eventType, event, false, 3);
-        }
-        finishEventDispatch(event);
-    }
-
-    void dispatchKeyboardEvent(const platform::KeyboardEventData& e) {
-        auto event = jsEngine_->newObject();
-        jsEngine_->setProperty(event, "type", jsEngine_->newString(e.type.c_str()));
-        jsEngine_->setProperty(event, "key", jsEngine_->newString(e.key.c_str()));
-        jsEngine_->setProperty(event, "code", jsEngine_->newString(e.code.c_str()));
-        jsEngine_->setProperty(event, "keyCode", jsEngine_->newNumber(e.keyCode));
-        jsEngine_->setProperty(event, "repeat", jsEngine_->newBoolean(e.repeat));
-        jsEngine_->setProperty(event, "ctrlKey", jsEngine_->newBoolean(e.ctrlKey));
-        jsEngine_->setProperty(event, "shiftKey", jsEngine_->newBoolean(e.shiftKey));
-        jsEngine_->setProperty(event, "altKey", jsEngine_->newBoolean(e.altKey));
-        jsEngine_->setProperty(event, "metaKey", jsEngine_->newBoolean(e.metaKey));
-
-        installEventMethods(event, true, true);
-        if (activeTextElement_.ptr) {
-            dispatchEventPath(e.type, event, "text", activeTextElement_);
-        } else {
-            dispatchEventPath(e.type, event, "canvas");
-        }
-    }
-
-    void dispatchTextInputEvent(const platform::TextInputEventData& e) {
-        if (!activeTextElement_.ptr) return;
-        const auto target = activeTextElement_;
-        const char* inputType = e.fromComposition ? "insertCompositionText" : "insertText";
-
-        auto beforeInput = jsEngine_->newObject();
-        jsEngine_->setProperty(beforeInput, "type", jsEngine_->newString("beforeinput"));
-        jsEngine_->setProperty(beforeInput, "data", jsEngine_->newString(e.text.c_str()));
-        jsEngine_->setProperty(beforeInput, "inputType", jsEngine_->newString(inputType));
-        jsEngine_->setProperty(beforeInput, "isComposing", jsEngine_->newBoolean(false));
-        installEventMethods(beforeInput, true, true);
-        dispatchEventPath("beforeinput", beforeInput, "text", target);
-        if (eventFlag(beforeInput, "defaultPrevented")) return;
-
-        auto applyText = jsEngine_->getProperty(target, "__applyTextInput");
-        if (jsEngine_->isFunction(applyText)) {
-            jsEngine_->call(applyText, target, {jsEngine_->newString(e.text.c_str())});
-        }
-
-        auto input = jsEngine_->newObject();
-        jsEngine_->setProperty(input, "type", jsEngine_->newString("input"));
-        jsEngine_->setProperty(input, "data", jsEngine_->newString(e.text.c_str()));
-        jsEngine_->setProperty(input, "inputType", jsEngine_->newString(inputType));
-        jsEngine_->setProperty(input, "isComposing", jsEngine_->newBoolean(false));
-        installEventMethods(input, true, false);
-        dispatchEventPath("input", input, "text", target);
-    }
-
-    void dispatchCompositionEvent(const platform::CompositionEventData& e) {
-        if (!activeTextElement_.ptr) return;
-        auto event = jsEngine_->newObject();
-        jsEngine_->setProperty(event, "type", jsEngine_->newString(e.type.c_str()));
-        jsEngine_->setProperty(event, "data", jsEngine_->newString(e.data.c_str()));
-        jsEngine_->setProperty(event, "start", jsEngine_->newNumber(e.start));
-        jsEngine_->setProperty(event, "length", jsEngine_->newNumber(e.length));
-        jsEngine_->setProperty(event, "isComposing", jsEngine_->newBoolean(e.type != "compositionend"));
-        installEventMethods(event, true, false);
-        dispatchEventPath(e.type, event, "text", activeTextElement_);
-    }
-
-    void dispatchMouseEvent(const platform::MouseEventData& e) {
-        auto event = jsEngine_->newObject();
-        jsEngine_->setProperty(event, "type", jsEngine_->newString(e.type.c_str()));
-        jsEngine_->setProperty(event, "clientX", jsEngine_->newNumber(e.clientX));
-        jsEngine_->setProperty(event, "clientY", jsEngine_->newNumber(e.clientY));
-        jsEngine_->setProperty(event, "pageX", jsEngine_->newNumber(e.clientX));
-        jsEngine_->setProperty(event, "pageY", jsEngine_->newNumber(e.clientY));
-        jsEngine_->setProperty(event, "offsetX", jsEngine_->newNumber(e.clientX));
-        jsEngine_->setProperty(event, "offsetY", jsEngine_->newNumber(e.clientY));
-        jsEngine_->setProperty(event, "movementX", jsEngine_->newNumber(e.movementX));
-        jsEngine_->setProperty(event, "movementY", jsEngine_->newNumber(e.movementY));
-        jsEngine_->setProperty(event, "button", jsEngine_->newNumber(e.button));
-        jsEngine_->setProperty(event, "buttons", jsEngine_->newNumber(e.buttons));
-        jsEngine_->setProperty(event, "ctrlKey", jsEngine_->newBoolean(e.ctrlKey));
-        jsEngine_->setProperty(event, "shiftKey", jsEngine_->newBoolean(e.shiftKey));
-        jsEngine_->setProperty(event, "altKey", jsEngine_->newBoolean(e.altKey));
-        jsEngine_->setProperty(event, "metaKey", jsEngine_->newBoolean(e.metaKey));
-
-        installEventMethods(event, true, true);
-        dispatchEventPath(e.type, event, "canvas");
-    }
-
-    void dispatchPointerEvent(const platform::PointerEventData& e) {
-        auto event = jsEngine_->newObject();
-        jsEngine_->setProperty(event, "type", jsEngine_->newString(e.type.c_str()));
-        jsEngine_->setProperty(event, "clientX", jsEngine_->newNumber(e.clientX));
-        jsEngine_->setProperty(event, "clientY", jsEngine_->newNumber(e.clientY));
-        jsEngine_->setProperty(event, "pageX", jsEngine_->newNumber(e.clientX));
-        jsEngine_->setProperty(event, "pageY", jsEngine_->newNumber(e.clientY));
-        jsEngine_->setProperty(event, "offsetX", jsEngine_->newNumber(e.clientX));
-        jsEngine_->setProperty(event, "offsetY", jsEngine_->newNumber(e.clientY));
-        jsEngine_->setProperty(event, "movementX", jsEngine_->newNumber(e.movementX));
-        jsEngine_->setProperty(event, "movementY", jsEngine_->newNumber(e.movementY));
-        jsEngine_->setProperty(event, "button", jsEngine_->newNumber(e.button));
-        jsEngine_->setProperty(event, "buttons", jsEngine_->newNumber(e.buttons));
-        jsEngine_->setProperty(event, "ctrlKey", jsEngine_->newBoolean(e.ctrlKey));
-        jsEngine_->setProperty(event, "shiftKey", jsEngine_->newBoolean(e.shiftKey));
-        jsEngine_->setProperty(event, "altKey", jsEngine_->newBoolean(e.altKey));
-        jsEngine_->setProperty(event, "metaKey", jsEngine_->newBoolean(e.metaKey));
-        // PointerEvent specific properties
-        jsEngine_->setProperty(event, "pointerId", jsEngine_->newNumber(e.pointerId));
-        jsEngine_->setProperty(event, "pointerType", jsEngine_->newString(e.pointerType.c_str()));
-        jsEngine_->setProperty(event, "isPrimary", jsEngine_->newBoolean(e.isPrimary));
-        jsEngine_->setProperty(event, "width", jsEngine_->newNumber(e.width));
-        jsEngine_->setProperty(event, "height", jsEngine_->newNumber(e.height));
-        jsEngine_->setProperty(event, "pressure", jsEngine_->newNumber(e.pressure));
-
-        installEventMethods(event, true, true);
-        dispatchEventPath(e.type, event, "canvas");
-    }
-
-    void dispatchWheelEvent(const platform::WheelEventData& e) {
-        auto event = jsEngine_->newObject();
-        jsEngine_->setProperty(event, "type", jsEngine_->newString(e.type.c_str()));
-        jsEngine_->setProperty(event, "clientX", jsEngine_->newNumber(e.clientX));
-        jsEngine_->setProperty(event, "clientY", jsEngine_->newNumber(e.clientY));
-        jsEngine_->setProperty(event, "deltaX", jsEngine_->newNumber(e.deltaX));
-        jsEngine_->setProperty(event, "deltaY", jsEngine_->newNumber(e.deltaY));
-        jsEngine_->setProperty(event, "deltaZ", jsEngine_->newNumber(e.deltaZ));
-        jsEngine_->setProperty(event, "deltaMode", jsEngine_->newNumber(e.deltaMode));
-        jsEngine_->setProperty(event, "ctrlKey", jsEngine_->newBoolean(e.ctrlKey));
-        jsEngine_->setProperty(event, "shiftKey", jsEngine_->newBoolean(e.shiftKey));
-        jsEngine_->setProperty(event, "altKey", jsEngine_->newBoolean(e.altKey));
-        jsEngine_->setProperty(event, "metaKey", jsEngine_->newBoolean(e.metaKey));
-
-        installEventMethods(event, true, true);
-        dispatchEventPath(e.type, event, "canvas");
-    }
-
-    void dispatchGamepadEvent(const platform::GamepadEventData& e) {
-        auto event = jsEngine_->newObject();
-        jsEngine_->setProperty(event, "type", jsEngine_->newString(e.type.c_str()));
-
-        // Create gamepad object
-        auto gamepad = jsEngine_->newObject();
-        jsEngine_->setProperty(gamepad, "index", jsEngine_->newNumber(e.gamepad.index));
-        jsEngine_->setProperty(gamepad, "id", jsEngine_->newString(e.gamepad.id.c_str()));
-        jsEngine_->setProperty(gamepad, "connected", jsEngine_->newBoolean(e.gamepad.connected));
-
-        jsEngine_->setProperty(event, "gamepad", gamepad);
-
-        installEventMethods(event, false, false);
-        dispatchEventPath(e.type, event, "window");
-    }
-
-    void dispatchResizeEvent(const platform::ResizeEventData& e) {
-        // Update internal dimensions
-        width_ = e.width;
-        height_ = e.height;
-
-        // Update window.innerWidth/innerHeight
-        auto window = jsEngine_->getGlobal();
-        jsEngine_->setProperty(window, "innerWidth", jsEngine_->newNumber(e.width));
-        jsEngine_->setProperty(window, "innerHeight", jsEngine_->newNumber(e.height));
-
-        auto event = jsEngine_->newObject();
-        jsEngine_->setProperty(event, "type", jsEngine_->newString("resize"));
-
-        installEventMethods(event, false, false);
-        dispatchEventPath("resize", event, "window");
-    }
-
-    // Test function to send a mock pointer event - call this after script evaluation
-    void sendMockPointerEvent() {
-        // Debug output disabled to reduce log spam
-        // std::cout << "[Input] Sending mock pointerdown event for testing..." << std::endl;
-        // std::cout << "[Input] Registered event listeners:" << std::endl;
-        // for (const auto& targetPair : eventListeners_) {
-        //     std::cout << "  Target: " << targetPair.first << std::endl;
-        //     for (const auto& typePair : targetPair.second) {
-        //         std::cout << "    Event: " << typePair.first << " (" << typePair.second.size() << " listeners)" << std::endl;
-        //     }
-        // }
-
-        platform::PointerEventData e;
-        e.type = "pointerdown";
-        e.clientX = 640;
-        e.clientY = 360;
-        e.movementX = 0;
-        e.movementY = 0;
-        e.button = 0;
-        e.buttons = 1;
-        e.ctrlKey = false;
-        e.shiftKey = false;
-        e.altKey = false;
-        e.metaKey = false;
-        e.pointerId = 1;
-        e.pointerType = "mouse";
-        e.isPrimary = true;
-        e.width = 1;
-        e.height = 1;
-        e.pressure = 0.5;
-
-        dispatchPointerEvent(e);
-    }
 };
 
 // ============================================================================

@@ -25,9 +25,7 @@ android {
             cmake {
                 // CMake arguments for the Mystral native build
                 arguments.addAll(listOf(
-                    "-DANDROID=ON",
-                    "-DMYSTRAL_USE_WGPU=ON",
-                    "-DMYSTRAL_USE_DAWN=OFF"
+                    "-DANDROID=ON"
                 ))
                 // C/C++ flags
                 cppFlags.add("-std=c++17")

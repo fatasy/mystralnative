@@ -18,11 +18,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # macOS ARM64 - V8 configurations
-          - os: macos-15
-            arch: arm64
-            webgpu: wgpu
-            name: macOS-arm64-v8-wgpu
+          # macOS ARM64 - V8 + Dawn
           - os: macos-15
             arch: arm64
             webgpu: dawn
@@ -69,11 +65,6 @@ jobs:
       - name: Configure CMake
         run: |
           CMAKE_ARGS="-B build -DCMAKE_BUILD_TYPE=Release"
-          if [ "${{ matrix.webgpu }}" == "wgpu" ]; then
-            CMAKE_ARGS="$CMAKE_ARGS -DMYSTRAL_USE_WGPU=ON -DMYSTRAL_USE_DAWN=OFF"
-          elif [ "${{ matrix.webgpu }}" == "dawn" ]; then
-            CMAKE_ARGS="$CMAKE_ARGS -DMYSTRAL_USE_WGPU=OFF -DMYSTRAL_USE_DAWN=ON"
-          fi
           cmake $CMAKE_ARGS
 
       - name: Build
@@ -114,8 +105,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - webgpu: wgpu
-            name: linux-x64-v8-wgpu
           - webgpu: dawn
             name: linux-x64-v8-dawn
 
@@ -179,11 +168,6 @@ jobs:
       - name: Configure CMake
         run: |
           CMAKE_ARGS="-B build -DCMAKE_BUILD_TYPE=Release"
-          if [ "${{ matrix.webgpu }}" == "wgpu" ]; then
-            CMAKE_ARGS="$CMAKE_ARGS -DMYSTRAL_USE_WGPU=ON -DMYSTRAL_USE_DAWN=OFF"
-          elif [ "${{ matrix.webgpu }}" == "dawn" ]; then
-            CMAKE_ARGS="$CMAKE_ARGS -DMYSTRAL_USE_WGPU=OFF -DMYSTRAL_USE_DAWN=ON"
-          fi
           cmake $CMAKE_ARGS
 
       - name: Build
@@ -221,8 +205,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - webgpu: wgpu
-            name: windows-x64-v8-wgpu
           - webgpu: dawn
             name: windows-x64-v8-dawn
 
@@ -269,18 +251,13 @@ jobs:
 
       - name: Install vcpkg dependencies
         run: |
-          # Both wgpu and dawn builds use static CRT (/MT) to match Skia
+          # Use static CRT (/MT) to match Skia and Dawn.
           vcpkg install curl:x64-windows-static zlib:x64-windows-static
           vcpkg integrate install
 
       - name: Configure CMake
         run: |
           $CMAKE_ARGS = @("-B", "build", "-DCMAKE_BUILD_TYPE=Release")
-          if ("${{ matrix.webgpu }}" -eq "wgpu") {
-            $CMAKE_ARGS += "-DMYSTRAL_USE_WGPU=ON", "-DMYSTRAL_USE_DAWN=OFF"
-          } elseif ("${{ matrix.webgpu }}" -eq "dawn") {
-            $CMAKE_ARGS += "-DMYSTRAL_USE_WGPU=OFF", "-DMYSTRAL_USE_DAWN=ON"
-          }
           # Use static CRT (/MT) to match Skia prebuilt libraries
           $CMAKE_ARGS += "-DVCPKG_TARGET_TRIPLET=x64-windows-static"
           $CMAKE_ARGS += "-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded"
@@ -388,26 +365,21 @@ jobs:
             **macOS (Apple Silicon - ARM64):**
             | JS Engine | WebGPU Backend | Download |
             |-----------|----------------|----------|
-            | V8 | wgpu | `mystral-macOS-arm64-v8-wgpu.zip` |
             | V8 | Dawn | `mystral-macOS-arm64-v8-dawn.zip` |
 
             **Linux (x64):**
             | JS Engine | WebGPU Backend | Download |
             |-----------|----------------|----------|
-            | V8 | wgpu | `mystral-linux-x64-v8-wgpu.zip` |
             | V8 | Dawn | `mystral-linux-x64-v8-dawn.zip` |
 
             **Windows (x64):**
             | JS Engine | WebGPU Backend | Download |
             |-----------|----------------|----------|
-            | V8 | wgpu | `mystral-windows-x64-v8-wgpu.zip` |
             | V8 | Dawn | `mystral-windows-x64-v8-dawn.zip` |
 
             ### Recommended Configurations
 
-            - **macOS**: `v8-wgpu` (best JavaScript performance)
-            - **Linux**: `v8-wgpu` (best JavaScript performance)
-            - **Windows**: `v8-wgpu` (best JS performance)
+            - **macOS, Linux, Windows**: V8 + Dawn
 
             ### Quick Start
 

@@ -67,23 +67,13 @@ CMake option is needed.
 
 ### WebGPU Backend
 
-Choose your WebGPU implementation:
-
-```bash
-# Dawn (recommended) - Chrome's implementation, best shader compatibility
-cmake -B build -DMYSTRAL_USE_DAWN=ON -DMYSTRAL_USE_WGPU=OFF
-
-# wgpu-native - Rust WebGPU implementation
-cmake -B build -DMYSTRAL_USE_WGPU=ON
-```
+Dawn is the runtime's WebGPU implementation; no backend-selection option is needed.
 
 ### Combined Example
 
 ```bash
-# V8 + Dawn (recommended for desktop development)
+# V8 + Dawn desktop build
 cmake -B build \
-    -DMYSTRAL_USE_DAWN=ON \
-    -DMYSTRAL_USE_WGPU=OFF \
     -DCMAKE_BUILD_TYPE=Release
 
 cmake --build build --config Release

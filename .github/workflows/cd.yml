@@ -68,10 +68,6 @@ jobs:
         include:
           - os: macos-15
             arch: arm64
-            webgpu: wgpu
-            name: macOS-arm64-v8-wgpu
-          - os: macos-15
-            arch: arm64
             webgpu: dawn
             name: macOS-arm64-v8-dawn
 
@@ -108,11 +104,6 @@ jobs:
       - name: Configure CMake
         run: |
           CMAKE_ARGS="-B build -DCMAKE_BUILD_TYPE=Release"
-          if [ "${{ matrix.webgpu }}" == "wgpu" ]; then
-            CMAKE_ARGS="$CMAKE_ARGS -DMYSTRAL_USE_WGPU=ON -DMYSTRAL_USE_DAWN=OFF"
-          elif [ "${{ matrix.webgpu }}" == "dawn" ]; then
-            CMAKE_ARGS="$CMAKE_ARGS -DMYSTRAL_USE_WGPU=OFF -DMYSTRAL_USE_DAWN=ON"
-          fi
           cmake $CMAKE_ARGS
 
       - name: Build
@@ -161,8 +152,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - webgpu: wgpu
-            name: linux-x64-v8-wgpu
           - webgpu: dawn
             name: linux-x64-v8-dawn
 
@@ -209,11 +198,6 @@ jobs:
         run: |
           # SDL3 is built from source via add_subdirectory (static linking)
           CMAKE_ARGS="-B build -DCMAKE_BUILD_TYPE=Release"
-          if [ "${{ matrix.webgpu }}" == "wgpu" ]; then
-            CMAKE_ARGS="$CMAKE_ARGS -DMYSTRAL_USE_WGPU=ON -DMYSTRAL_USE_DAWN=OFF"
-          elif [ "${{ matrix.webgpu }}" == "dawn" ]; then
-            CMAKE_ARGS="$CMAKE_ARGS -DMYSTRAL_USE_WGPU=OFF -DMYSTRAL_USE_DAWN=ON"
-          fi
           cmake $CMAKE_ARGS
 
       - name: Build
@@ -244,95 +228,6 @@ jobs:
           cp examples/assets/DamagedHelmet.glb artifacts/examples/assets/ || true
           cp examples/assets/environment.hdr artifacts/examples/assets/ || true
           cd artifacts && zip -r ../mystral-${{ matrix.name }}.zip .
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: mystral-${{ matrix.name }}
-          path: mystral-${{ matrix.name }}.zip
-
-  # =============================================================================
-  # Windows Builds - wgpu
-  # =============================================================================
-  build-windows-wgpu:
-    needs: [prepare]
-    runs-on: windows-2022
-    timeout-minutes: 15
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: windows-x64-v8-wgpu
-
-    name: Build - ${{ matrix.name }}
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-
-      - name: Set version
-        shell: bash
-        run: |
-          echo "Setting version to ${{ needs.prepare.outputs.version }}"
-          node scripts/set-version.mjs "${{ needs.prepare.outputs.version }}"
-
-      - name: Cache dependencies
-        uses: actions/cache@v4
-        id: cache-deps
-        with:
-          path: third_party
-          key: deps-windows-x64-wgpu-v10-${{ hashFiles('scripts/download-deps.mjs') }}
-
-      - name: Download base dependencies
-        if: steps.cache-deps.outputs.cache-hit != 'true'
-        shell: bash
-        run: |
-          export PATH="/c/Program Files/7-Zip:$PATH"
-          node scripts/download-deps.mjs
-
-      - name: Install vcpkg dependencies
-        run: |
-          vcpkg install curl:x64-windows-static zlib:x64-windows-static
-          vcpkg integrate install
-
-      - name: Configure CMake
-        run: |
-          $CMAKE_ARGS = @("-B", "build", "-DCMAKE_BUILD_TYPE=Release")
-          $CMAKE_ARGS += "-DMYSTRAL_USE_WGPU=ON", "-DMYSTRAL_USE_DAWN=OFF"
-          $CMAKE_ARGS += "-DVCPKG_TARGET_TRIPLET=x64-windows-static"
-          $CMAKE_ARGS += "-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded"
-          $CMAKE_ARGS += "-DCMAKE_TOOLCHAIN_FILE=$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
-          cmake @CMAKE_ARGS
-
-      - name: Build
-        run: cmake --build build --config Release
-
-      - name: Test CLI
-        shell: bash
-        run: ./build/Release/mystral.exe --version || echo "Build complete"
-
-      - name: Package artifacts
-        shell: bash
-        run: |
-          mkdir -p artifacts
-          cp build/Release/mystral.exe artifacts/ || cp build/mystral.exe artifacts/
-          cp build/Release/mystral-runtime.lib artifacts/ || cp build/mystral-runtime.lib artifacts/ || true
-          cp build/Release/*.dll artifacts/ 2>/dev/null || true
-          # Include examples so users can try them immediately
-          mkdir -p artifacts/examples/assets
-          cp examples/triangle.js artifacts/examples/
-          cp examples/simple-cube.js artifacts/examples/
-          cp examples/test-audio.js artifacts/examples/
-          cp examples/test-gamepad.js artifacts/examples/
-          cp examples/mystral-helmet.js artifacts/examples/ || true
-          cp examples/threejs-cube-src.js artifacts/examples/ || true
-          cp examples/assets/DamagedHelmet.glb artifacts/examples/assets/ || true
-          cp examples/assets/environment.hdr artifacts/examples/assets/ || true
-          cd artifacts && 7z a ../mystral-${{ matrix.name }}.zip .
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -422,7 +317,6 @@ jobs:
       - name: Configure CMake
         run: |
           $CMAKE_ARGS = @("-B", "build", "-DCMAKE_BUILD_TYPE=Release")
-          $CMAKE_ARGS += "-DMYSTRAL_USE_WGPU=OFF", "-DMYSTRAL_USE_DAWN=ON"
           $CMAKE_ARGS += "-DVCPKG_TARGET_TRIPLET=x64-windows-static"
           $CMAKE_ARGS += "-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded"
           $CMAKE_ARGS += "-DCMAKE_TOOLCHAIN_FILE=$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
@@ -466,7 +360,7 @@ jobs:
   create-release:
     name: Create Release
     runs-on: ubuntu-latest
-    needs: [prepare, build-macos, build-linux, build-windows-wgpu, build-windows-dawn]
+    needs: [prepare, build-macos, build-linux, build-windows-dawn]
     if: success()
 
     steps:

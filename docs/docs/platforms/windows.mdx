@@ -96,7 +96,6 @@ cmake --build build --config Release
 | JS Engine | WebGPU Backend | Notes |
 |-----------|----------------|-------|
 | V8 | Dawn | Recommended, best compatibility |
-| V8 | wgpu-native | Alternative backend |
 
 ## GPU Drivers
 
@@ -130,7 +129,7 @@ Some antivirus software may flag unsigned executables. Add an exception for the 
 
 - **Fullscreen**: Exclusive fullscreen may improve performance
 - **V8 JIT**: Provides significant speedup for complex JS
-- **Dawn**: Generally better Windows support than wgpu-native
+- **Dawn**: Uses the native D3D12 backend on Windows
 
 ## Next Steps
 

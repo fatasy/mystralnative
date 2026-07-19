@@ -20,17 +20,7 @@ static uint32_t alignedBytesPerRow(uint32_t width) {
     return (bytesPerRow + 255) & ~255;  // Align to 256 bytes
 }
 
-// Buffer map callback (wgpu-native style)
-#if !WGPU_BUFFER_MAP_USES_CALLBACK_INFO
-static void onBufferMapped(WGPUBufferMapAsyncStatus_Compat status, void* userdata) {
-    auto* buffer = static_cast<ReadbackBuffer*>(userdata);
-    buffer->mapStatus = (status == WGPUBufferMapAsyncStatus_Success_Compat) ? 0 : 1;
-    buffer->mapComplete.store(true, std::memory_order_release);
-}
-#endif
-
-// Buffer map callback (Dawn style with callback info)
-#if WGPU_BUFFER_MAP_USES_CALLBACK_INFO
+// Dawn buffer map callback.
 static void onBufferMappedInfo(WGPUMapAsyncStatus status, WGPUStringView message, void* userdata1, void* userdata2) {
     auto* buffer = static_cast<ReadbackBuffer*>(userdata1);
     buffer->mapStatus = (status == WGPUMapAsyncStatus_Success) ? 0 : static_cast<int>(status);
@@ -40,7 +30,6 @@ static void onBufferMappedInfo(WGPUMapAsyncStatus status, WGPUStringView message
                   << ": status=" << static_cast<int>(status) << std::endl;
     }
 }
-#endif
 
 AsyncCapture::AsyncCapture() = default;
 
@@ -210,16 +199,12 @@ bool AsyncCapture::submitCapture(WGPUTexture sourceTexture, uint32_t width, uint
     buffer->mapComplete.store(false, std::memory_order_release);
     buffer->state = BufferState::MapPending;
 
-#if WGPU_BUFFER_MAP_USES_CALLBACK_INFO
     WGPUBufferMapCallbackInfo mapCallbackInfo = {};
     mapCallbackInfo.mode = WGPUCallbackMode_AllowProcessEvents;
     mapCallbackInfo.callback = onBufferMappedInfo;
     mapCallbackInfo.userdata1 = buffer;
     mapCallbackInfo.userdata2 = nullptr;
     wgpuBufferMapAsync(buffer->buffer, WGPUMapMode_Read, 0, buffer->size, mapCallbackInfo);
-#else
-    wgpuBufferMapAsync(buffer->buffer, WGPUMapMode_Read, 0, buffer->size, onBufferMapped, buffer);
-#endif
 
     return true;
 }
@@ -273,16 +258,12 @@ bool AsyncCapture::submitCaptureSync(WGPUTexture sourceTexture, uint32_t width, 
     buffer->mapComplete.store(false, std::memory_order_release);
     buffer->state = BufferState::MapPending;
 
-#if WGPU_BUFFER_MAP_USES_CALLBACK_INFO
     WGPUBufferMapCallbackInfo mapCallbackInfo = {};
     mapCallbackInfo.mode = WGPUCallbackMode_AllowProcessEvents;
     mapCallbackInfo.callback = onBufferMappedInfo;
     mapCallbackInfo.userdata1 = buffer;
     mapCallbackInfo.userdata2 = nullptr;
     wgpuBufferMapAsync(buffer->buffer, WGPUMapMode_Read, 0, buffer->size, mapCallbackInfo);
-#else
-    wgpuBufferMapAsync(buffer->buffer, WGPUMapMode_Read, 0, buffer->size, onBufferMapped, buffer);
-#endif
 
     // Wait for the map to complete (synchronous wait)
     int maxIterations = 1000;  // Prevent infinite loop
@@ -304,12 +285,7 @@ bool AsyncCapture::submitCaptureSync(WGPUTexture sourceTexture, uint32_t width, 
         return false;
     }
 
-    // Check map status (Dawn uses 1 for Success)
-#if WGPU_BUFFER_MAP_USES_CALLBACK_INFO
-    if (buffer->mapStatus != 1) {  // WGPUMapAsyncStatus_Success = 1
-#else
-    if (buffer->mapStatus != 0) {  // WGPUBufferMapAsyncStatus_Success = 0
-#endif
+    if (buffer->mapStatus != static_cast<int>(WGPUMapAsyncStatus_Success)) {
         std::cerr << "[AsyncCapture] Sync capture map failed with status " << buffer->mapStatus << std::endl;
         wgpuBufferDestroy(buffer->buffer);
         wgpuBufferRelease(buffer->buffer);
@@ -390,12 +366,7 @@ void AsyncCapture::processBuffer(ReadbackBuffer& buffer) {
         return;
     }
 
-    // Map completed - check status (Dawn uses 1 for Success, wgpu-native uses 0)
-#if WGPU_BUFFER_MAP_USES_CALLBACK_INFO
-    if (buffer.mapStatus != 1) {  // WGPUMapAsyncStatus_Success = 1
-#else
-    if (buffer.mapStatus != 0) {  // WGPUBufferMapAsyncStatus_Success = 0
-#endif
+    if (buffer.mapStatus != static_cast<int>(WGPUMapAsyncStatus_Success)) {
         std::cerr << "[AsyncCapture] Buffer map failed with status " << buffer.mapStatus << std::endl;
         releaseBuffer(&buffer);
         droppedFrames_++;

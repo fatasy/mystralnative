@@ -47,23 +47,14 @@ V8_FLAGS="--max-old-space-size=4096" mystral run game.js
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `MYSTRAL_USE_DAWN` | ON | Use Dawn (recommended for desktop) |
-| `MYSTRAL_USE_WGPU` | OFF | Use wgpu-native |
 | `MYSTRAL_BUILD_EXAMPLES` | ON | Build example files |
 | `MYSTRAL_BUILD_TESTS` | OFF | Build test suite |
 
 ### Example Configurations
 
 ```bash
-# wgpu-native build
-cmake -B build \
-    -DMYSTRAL_USE_WGPU=ON \
-    -DMYSTRAL_USE_DAWN=OFF \
-    -DMYSTRAL_BUILD_EXAMPLES=OFF
-
 # Full-featured desktop build
 cmake -B build \
-    -DMYSTRAL_USE_DAWN=ON \
     -DCMAKE_BUILD_TYPE=Release
 ```
 

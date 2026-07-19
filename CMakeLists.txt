@@ -21,9 +21,7 @@ endif()
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-# WebGPU Implementation (choose one)
-option(MYSTRAL_USE_DAWN "Use Dawn WebGPU implementation" ON)  # Default - best compatibility
-option(MYSTRAL_USE_WGPU "Use wgpu-native WebGPU implementation" OFF)  # Alternative - has iOS support
+# WebGPU implementation: Dawn is the single supported backend.
 
 # Ray Tracing (optional - hardware RT via DXR/Vulkan/Metal)
 option(MYSTRAL_USE_RAYTRACING "Enable hardware ray tracing support" OFF)
@@ -48,7 +46,7 @@ endif()
 
 message(STATUS "Mystral Platform: ${MYSTRAL_PLATFORM}")
 message(STATUS "JS Engine: V8")
-message(STATUS "WebGPU: Dawn=${MYSTRAL_USE_DAWN} wgpu=${MYSTRAL_USE_WGPU}")
+message(STATUS "WebGPU: Dawn")
 
 # ============================================================================
 # Third Party Dependencies
@@ -127,105 +125,11 @@ if(NOT SDL3_FOUND)
     message(WARNING "SDL3 not found. Run 'node scripts/download-deps.mjs' first.")
 endif()
 
-# wgpu-native
-if(MYSTRAL_USE_WGPU)
-    # Platform-specific wgpu-native directories
-    if(MYSTRAL_PLATFORM STREQUAL "ios")
-        set(WGPU_DIR ${THIRD_PARTY_DIR}/wgpu-ios)
-        # Determine target subdirectory based on CMAKE_OSX_SYSROOT
-        if(CMAKE_OSX_SYSROOT MATCHES "simulator")
-            if(CMAKE_OSX_ARCHITECTURES STREQUAL "x86_64")
-                set(WGPU_TARGET_DIR ${WGPU_DIR}/simulatorX64)
-            else()
-                set(WGPU_TARGET_DIR ${WGPU_DIR}/simulatorArm64)
-            endif()
-        else()
-            set(WGPU_TARGET_DIR ${WGPU_DIR}/device)
-        endif()
-    elseif(MYSTRAL_PLATFORM STREQUAL "android")
-        set(WGPU_DIR ${THIRD_PARTY_DIR}/wgpu-android)
-        # Determine target subdirectory based on ANDROID_ABI
-        if(ANDROID_ABI STREQUAL "arm64-v8a")
-            set(WGPU_TARGET_DIR ${WGPU_DIR}/aarch64)
-        elseif(ANDROID_ABI STREQUAL "x86_64")
-            set(WGPU_TARGET_DIR ${WGPU_DIR}/x86_64)
-        else()
-            # Default to aarch64 (most common on modern Android)
-            set(WGPU_TARGET_DIR ${WGPU_DIR}/aarch64)
-        endif()
-    else()
-        set(WGPU_DIR ${THIRD_PARTY_DIR}/wgpu)
-        set(WGPU_TARGET_DIR ${WGPU_DIR})
-    endif()
-
-    if(EXISTS ${WGPU_TARGET_DIR})
-        # wgpu-native provides libwgpu_native.a (Unix) or wgpu_native.dll.lib (Windows)
-        # Structure: wgpu/lib/libwgpu_native.a, wgpu/include/webgpu/webgpu.h
-        # Prefer static library to avoid runtime linking issues
-        if(WIN32)
-            # Windows uses .dll.lib or .lib extension
-            if(EXISTS ${WGPU_TARGET_DIR}/lib/wgpu_native.dll.lib)
-                set(WGPU_LIBRARY ${WGPU_TARGET_DIR}/lib/wgpu_native.dll.lib)
-            elseif(EXISTS ${WGPU_TARGET_DIR}/lib/wgpu_native.lib)
-                set(WGPU_LIBRARY ${WGPU_TARGET_DIR}/lib/wgpu_native.lib)
-            endif()
-        else()
-            # Unix uses .a for static
-            if(EXISTS ${WGPU_TARGET_DIR}/lib/libwgpu_native.a)
-                set(WGPU_LIBRARY ${WGPU_TARGET_DIR}/lib/libwgpu_native.a)
-            else()
-                find_library(WGPU_LIBRARY
-                    NAMES wgpu_native
-                    PATHS ${WGPU_TARGET_DIR}/lib
-                    NO_DEFAULT_PATH
-                )
-            endif()
-        endif()
-        # Headers are in include/webgpu/ and include/wgpu/
-        if(EXISTS ${WGPU_TARGET_DIR}/include)
-            set(WGPU_INCLUDE_DIR ${WGPU_TARGET_DIR}/include)
-        endif()
-
-        if(WGPU_LIBRARY AND WGPU_INCLUDE_DIR)
-            if(WIN32)
-                add_library(wgpu::wgpu SHARED IMPORTED)
-            else()
-                add_library(wgpu::wgpu STATIC IMPORTED)
-            endif()
-            set_target_properties(wgpu::wgpu PROPERTIES
-                IMPORTED_LOCATION ${WGPU_LIBRARY}
-                INTERFACE_INCLUDE_DIRECTORIES ${WGPU_INCLUDE_DIR}
-            )
-            if(WIN32)
-                # Windows needs the DLL at runtime
-                set_target_properties(wgpu::wgpu PROPERTIES
-                    IMPORTED_IMPLIB ${WGPU_LIBRARY}
-                )
-            endif()
-            add_compile_definitions(MYSTRAL_WEBGPU_WGPU)
-            set(MYSTRAL_WEBGPU_BACKEND_SET ON)
-            message(STATUS "Found wgpu-native: ${WGPU_LIBRARY}")
-            message(STATUS "wgpu-native includes: ${WGPU_INCLUDE_DIR}")
-        else()
-            message(WARNING "wgpu-native not found:")
-            message(WARNING "  Library: ${WGPU_LIBRARY}")
-            message(WARNING "  Include: ${WGPU_INCLUDE_DIR}")
-        endif()
-    else()
-        if(MYSTRAL_PLATFORM STREQUAL "ios")
-            message(WARNING "wgpu-native iOS not found. Run 'node scripts/download-deps.mjs --only wgpu-ios' first.")
-        else()
-            message(WARNING "wgpu-native not found. Run 'npm run deps:download:wgpu' first.")
-        endif()
-    endif()
-endif()
-
 # Dawn WebGPU Implementation
 # Windows: Uses dawn_combined.lib from Skia build (library-builder), built with /MT static CRT
 #          and full D3D11/D3D12 WebGPU implementation (not just proc stubs)
 # Other platforms: Uses official Dawn releases from https://github.com/google/dawn/releases
-if(MYSTRAL_USE_DAWN)
-    set(DAWN_FOUND OFF)
+set(DAWN_FOUND OFF)
 
     if(WIN32)
         # Windows: Look for dawn_combined.lib in the Skia build directory
@@ -349,29 +253,21 @@ if(MYSTRAL_USE_DAWN)
             IMPORTED_LOCATION "${DAWN_LIBRARY}"
             INTERFACE_INCLUDE_DIRECTORIES "${DAWN_INCLUDE_DIR}"
         )
-        # Only define MYSTRAL_WEBGPU_DAWN if wgpu-native wasn't already set up
-        # (can't have both WebGPU backends active)
-        if(NOT MYSTRAL_WEBGPU_BACKEND_SET)
-            add_compile_definitions(MYSTRAL_WEBGPU_DAWN)
-            if(DAWN_REQUIRES_PROC_TABLE)
-                add_compile_definitions(MYSTRAL_DAWN_USE_PROC_TABLE)
-            endif()
-            set(MYSTRAL_WEBGPU_BACKEND_SET ON)
-            message(STATUS "Using Dawn as WebGPU backend")
-        else()
-            message(STATUS "Dawn found but wgpu-native already configured as WebGPU backend")
+        add_compile_definitions(MYSTRAL_WEBGPU_DAWN)
+        if(DAWN_REQUIRES_PROC_TABLE)
+            add_compile_definitions(MYSTRAL_DAWN_USE_PROC_TABLE)
         endif()
+        message(STATUS "Using Dawn as WebGPU backend")
         message(STATUS "Found Dawn: ${DAWN_LIBRARY}")
         message(STATUS "Dawn includes: ${DAWN_INCLUDE_DIR}")
     else()
-        message(WARNING "Dawn library or headers not found")
+        message(STATUS "Dawn library or headers not found")
         if(WIN32)
-            message(WARNING "  Run 'node scripts/download-deps.mjs --only skia-win-static'")
+            message(FATAL_ERROR "Run 'node scripts/download-deps.mjs --only skia-win-static'")
         else()
-            message(WARNING "  Run 'node scripts/download-deps.mjs --only dawn'")
+            message(FATAL_ERROR "Run 'node scripts/download-deps.mjs --only dawn'")
         endif()
     endif()
-endif()
 
 # V8
 # Prebuilts from kuoruan/libv8: https://github.com/kuoruan/libv8/releases
@@ -886,6 +782,14 @@ endif()
 # Android requires shared library for JNI/SDL loading
 set(MYSTRAL_SOURCES
     src/runtime.cpp
+    src/game/game_loop.cpp
+    src/game/game_loop_controller.cpp
+    src/js/animation_frame.cpp
+    src/js/runtime_sources.cpp
+    src/js/runtime_timers.cpp
+    src/js/runtime_io_bindings.cpp
+    src/dom/dom_event_system.cpp
+    src/debug/runtime_profiler.cpp
     src/js/engine_factory.cpp
     src/js/agent_module.cpp
     src/js/module_resolver.cpp
@@ -896,6 +800,25 @@ set(MYSTRAL_SOURCES
     src/workers/worker_thread.cpp
     src/workers/worker_registry.cpp
     src/webgpu/bindings.cpp
+    src/webgpu/binding_context.cpp
+    src/webgpu/async_bridge.cpp
+    src/webgpu/bridge_profiler.cpp
+    src/webgpu/buffer_bindings.cpp
+    src/webgpu/capabilities.cpp
+    src/webgpu/canvas_compositor.cpp
+    src/webgpu/canvas_bindings.cpp
+    src/webgpu/command_encoder_state.cpp
+    src/webgpu/command_bindings.cpp
+    src/webgpu/constants.cpp
+    src/webgpu/diagnostics_bindings.cpp
+    src/webgpu/format_conversions.cpp
+    src/webgpu/frame_queue.cpp
+    src/webgpu/image_decoder.cpp
+    src/webgpu/navigator_bindings.cpp
+    src/webgpu/pipeline_bindings.cpp
+    src/webgpu/queue_bindings.cpp
+    src/webgpu/resource_bindings.cpp
+    src/webgpu/screenshot_state.cpp
     src/webgpu/context.cpp
     src/webgpu/context_device_helpers.cpp
     src/webgpu/context_surface.cpp
@@ -971,6 +894,7 @@ target_include_directories(mystral-runtime PUBLIC
 )
 
 target_include_directories(mystral-runtime PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${THIRD_PARTY_DIR}/stb
     ${THIRD_PARTY_DIR}/cgltf
 )
@@ -978,12 +902,7 @@ target_include_directories(mystral-runtime PRIVATE
 # Pass build configuration to source code
 set(MYSTRAL_JS_ENGINE_NAME "v8")
 
-# Determine WebGPU backend name
-if(MYSTRAL_USE_DAWN)
-    set(MYSTRAL_WEBGPU_NAME "dawn")
-else()
-    set(MYSTRAL_WEBGPU_NAME "wgpu-native")
-endif()
+set(MYSTRAL_WEBGPU_NAME "dawn")
 
 target_compile_definitions(mystral-runtime PUBLIC
     MYSTRAL_VERSION="${PROJECT_VERSION}"
@@ -1050,7 +969,7 @@ if(TARGET v8::v8)
     endif()
     # On macOS with Dawn, V8 is linked specially in the Dawn section with -force_load
     # to handle Abseil symbol conflicts. Skip normal linking here but keep include dirs.
-    if(APPLE AND MYSTRAL_USE_DAWN)
+    if(APPLE)
         # Only add include directories, actual linking happens in Dawn section
         target_include_directories(mystral-runtime PRIVATE ${V8_INCLUDE_DIR})
     else()
@@ -1077,24 +996,7 @@ elseif(SDL3_LIBRARY)
 endif()
 
 # WebGPU linkage
-if(MYSTRAL_USE_WGPU AND TARGET wgpu::wgpu)
-    # wgpu-native is a Rust library. If SWC (also Rust) is enabled, they share
-    # Rust runtime symbols. On macOS, use -force_load on wgpu to ensure its symbols
-    # are used first, then swc's duplicates will be ignored.
-    if(APPLE AND TARGET swc::swc)
-        get_target_property(WGPU_LOCATION wgpu::wgpu IMPORTED_LOCATION)
-        get_target_property(WGPU_INCLUDES wgpu::wgpu INTERFACE_INCLUDE_DIRECTORIES)
-        target_include_directories(mystral-runtime PRIVATE ${WGPU_INCLUDES})
-        target_link_libraries(mystral-runtime PRIVATE
-            "-Wl,-force_load,${WGPU_LOCATION}"
-        )
-        target_link_options(mystral-runtime PUBLIC "-Wl,-dead_strip")
-    else()
-        target_link_libraries(mystral-runtime PRIVATE wgpu::wgpu)
-    endif()
-endif()
-
-if(MYSTRAL_USE_DAWN AND TARGET dawn::webgpu)
+if(TARGET dawn::webgpu)
     # Dawn and V8 both include Abseil library, causing duplicate symbol errors.
     # On macOS, we need to handle the link order and flags carefully.
     if(APPLE)
@@ -1162,8 +1064,6 @@ elseif(ANDROID)
     target_link_libraries(mystral-runtime PRIVATE
         android        # ANativeWindow, AAssetManager
         log            # __android_log_print
-        GLESv3         # OpenGL ES (required by wgpu-native)
-        EGL            # EGL (required by wgpu-native)
     )
 endif()
 
@@ -1270,7 +1170,7 @@ endif()
 if(WIN32)
     set(MYSTRAL_WINDOWS_D3D_REDIST_DIR "" CACHE PATH
         "Directory containing the Windows SDK D3D shader compiler redistributables")
-    if(MYSTRAL_USE_DAWN AND NOT MYSTRAL_WINDOWS_D3D_REDIST_DIR)
+    if(NOT MYSTRAL_WINDOWS_D3D_REDIST_DIR)
         find_path(_MYSTRAL_WINDOWS_D3D_REDIST_DIR
             NAMES dxcompiler.dll
             PATHS
@@ -1288,16 +1188,7 @@ if(WIN32)
     endif()
 
     function(mystral_copy_windows_gpu_runtime target)
-        if(MYSTRAL_USE_WGPU AND EXISTS "${WGPU_TARGET_DIR}/lib/wgpu_native.dll")
-            add_custom_command(TARGET ${target} POST_BUILD
-                COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                    "${WGPU_TARGET_DIR}/lib/wgpu_native.dll"
-                    "$<TARGET_FILE_DIR:${target}>/wgpu_native.dll"
-                COMMENT "Copying wgpu-native runtime for ${target}"
-            )
-        endif()
-
-        if(MYSTRAL_USE_DAWN AND MYSTRAL_WINDOWS_D3D_REDIST_DIR)
+        if(MYSTRAL_WINDOWS_D3D_REDIST_DIR)
             foreach(_dll dxcompiler.dll dxil.dll d3dcompiler_47.dll)
                 if(EXISTS "${MYSTRAL_WINDOWS_D3D_REDIST_DIR}/${_dll}")
                     add_custom_command(TARGET ${target} POST_BUILD
@@ -1345,11 +1236,9 @@ if(NOT MYSTRAL_PLATFORM STREQUAL "ios" AND NOT MYSTRAL_PLATFORM STREQUAL "androi
 
     # On Linux, the GNU linker needs help finding zlib (curl's transitive dependency).
     # Use --copy-dt-needed-entries to pull in dependencies from shared libraries.
-    # Also allow multiple definitions because wgpu-native and swc both contain Rust runtime symbols.
     if(UNIX AND NOT APPLE)
         target_link_options(mystral PRIVATE
             "LINKER:--copy-dt-needed-entries"
-            "LINKER:--allow-multiple-definition"
         )
     endif()
 
@@ -1357,10 +1246,7 @@ if(NOT MYSTRAL_PLATFORM STREQUAL "ios" AND NOT MYSTRAL_PLATFORM STREQUAL "androi
     install(TARGETS mystral
         RUNTIME DESTINATION bin
     )
-    if(WIN32 AND MYSTRAL_USE_WGPU AND EXISTS "${WGPU_TARGET_DIR}/lib/wgpu_native.dll")
-        install(FILES "${WGPU_TARGET_DIR}/lib/wgpu_native.dll" DESTINATION bin)
-    endif()
-    if(WIN32 AND MYSTRAL_USE_DAWN AND MYSTRAL_WINDOWS_D3D_REDIST_DIR)
+    if(WIN32 AND MYSTRAL_WINDOWS_D3D_REDIST_DIR)
         foreach(_dll dxcompiler.dll dxil.dll d3dcompiler_47.dll)
             if(EXISTS "${MYSTRAL_WINDOWS_D3D_REDIST_DIR}/${_dll}")
                 install(FILES "${MYSTRAL_WINDOWS_D3D_REDIST_DIR}/${_dll}" DESTINATION bin)
@@ -1390,11 +1276,9 @@ if(NOT MYSTRAL_PLATFORM STREQUAL "ios" AND NOT MYSTRAL_PLATFORM STREQUAL "androi
     endif()
 
     # On Linux, the GNU linker needs help finding zlib (curl's transitive dependency).
-    # Also allow multiple definitions because wgpu-native and swc both contain Rust runtime symbols.
     if(UNIX AND NOT APPLE)
         target_link_options(embed-example PRIVATE
             "LINKER:--copy-dt-needed-entries"
-            "LINKER:--allow-multiple-definition"
         )
     endif()
 endif()
@@ -1430,4 +1314,9 @@ if(MYSTRAL_BUILD_NATIVE_TESTS)
     set_tests_properties(mystral-worker-shared-smoke PROPERTIES
         TIMEOUT 30
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+    add_executable(mystral-game-loop-smoke tests/native/game-loop-smoke.cpp)
+    target_link_libraries(mystral-game-loop-smoke PRIVATE mystral-runtime)
+    add_test(NAME mystral-game-loop-smoke COMMAND mystral-game-loop-smoke)
+    set_tests_properties(mystral-game-loop-smoke PROPERTIES TIMEOUT 30)
 endif()

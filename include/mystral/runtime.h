@@ -56,6 +56,7 @@ struct RuntimeProfileReport {
     RuntimeProfileStatistics events;
     RuntimeProfileStatistics asyncWork;
     RuntimeProfileStatistics callbacks;
+    RuntimeProfileStatistics simulation;
     RuntimeProfileStatistics animationFrame;
     RuntimeProfileStatistics cleanup;
     uint64_t framesOver8_33Ms = 0;
@@ -97,6 +98,12 @@ struct RuntimeProfileReport {
     uint32_t cpuBudgetThreads = 0;
     uint32_t cpuBudgetActiveEnd = 0;
     uint32_t cpuBudgetPeakActive = 0;
+    uint64_t gameTicksExecuted = 0;
+    uint64_t gameTicksDropped = 0;
+    uint64_t gameCatchUpFrames = 0;
+    uint64_t gameClockClampFrames = 0;
+    uint64_t gameTickHandlerFailures = 0;
+    uint32_t gameMaxTicksPerFrame = 0;
     RuntimeProfileStatistics jobQueueWait;
     RuntimeProfileStatistics jobExecution;
 };
@@ -309,7 +316,7 @@ inline const char* getVersion() {
 #endif
 
 #ifndef MYSTRAL_WEBGPU_BACKEND
-#define MYSTRAL_WEBGPU_BACKEND "wgpu-native"
+#define MYSTRAL_WEBGPU_BACKEND "dawn"
 #endif
 
 inline const char* getJSEngine() {

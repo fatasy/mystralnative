@@ -12,8 +12,7 @@ import org.libsdl.app.SDLActivity;
  * - Input events (touch, keyboard, gamepad)
  * - Lifecycle management (pause/resume)
  *
- * The SDL3 Android backend provides the native window to wgpu-native
- * for Vulkan surface creation.
+ * The SDL3 Android backend provides the native window for surface creation.
  */
 public class MystralActivity extends SDLActivity {
 
